@@ -176,7 +176,7 @@ crates/
       theme/             Theme struct and the Gruvbox / One Dark palettes
       title_bar/         Custom titlebar and window controls (Windows and Linux)
       window_frame.rs    Client-side decorations and native border color
-      workspace/         Main window, window options and theme switching
+      workspace/         Main window: sidebar, screens (Files, Messages, Peers, Storage, Settings) and the status bar
     build.rs             Embeds the icon in the Windows executable
 assets/
   icons/                 App icon: app-icon.svg (source), PNG sizes and app-icon.ico

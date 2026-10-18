@@ -22,6 +22,13 @@ impl Spinner {
     }
 }
 
+impl Spinner {
+    pub fn size(mut self, size: Pixels) -> Self {
+        self.size = size;
+        self
+    }
+}
+
 impl RenderOnce for Spinner {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().text_muted;
