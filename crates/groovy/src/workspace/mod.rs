@@ -13,6 +13,7 @@ use crate::{
     APP_NAME,
     data::AppData,
     onboarding::{self, Onboarding, OnboardingEvent},
+    settings_profile::ProfileEditor,
     theme::{self, ActiveTheme},
     title_bar::TitleBar,
     window_frame::{client_side_decorations, set_native_border_color},
@@ -32,6 +33,7 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     /// Shown instead of the shell until onboarding is finished.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
+    profile: Entity<ProfileEditor>,
     _appearance_subscription: Subscription,
 }
 
@@ -75,11 +77,14 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
+        let profile = cx.new(|cx| ProfileEditor::new(database.clone(), cx));
+
         Self {
             current,
             database,
             focus_handle,
             onboarding,
+            profile,
             _appearance_subscription,
         }
     }
@@ -91,14 +96,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let OnboardingEvent::Finished { display_name } = event;
-        save_settings(
-            self.database.clone(),
-            vec![
-                (onboarding::DISPLAY_NAME_KEY, display_name.clone()),
-                (onboarding::COMPLETED_KEY, "true".to_owned()),
-            ],
-            cx,
-        );
+        save_onboarding(self.database.clone(), display_name.clone(), cx);
         self.onboarding = None;
         cx.notify();
     }
@@ -145,13 +143,16 @@ fn window_decorations() -> WindowDecorations {
     }
 }
 
-/// Writes settings on the background executor, so the UI thread never waits on the database.
-fn save_settings(database: Arc<Database>, entries: Vec<(&'static str, String)>, cx: &App) {
+/// Saves the profile name and marks onboarding finished, on the background
+/// executor so the UI thread never waits on the database.
+fn save_onboarding(database: Arc<Database>, display_name: String, cx: &App) {
     cx.background_spawn(async move {
-        for (key, value) in entries {
-            if let Err(error) = database.set_setting(key, &value) {
-                tracing::warn!(%error, key, "could not save a setting");
-            }
+        if let Err(error) = database.save_display_name(&display_name) {
+            tracing::warn!(%error, "could not save the display name");
+            return;
+        }
+        if let Err(error) = database.set_setting(onboarding::COMPLETED_KEY, "true") {
+            tracing::warn!(%error, "could not mark onboarding finished");
         }
     })
     .detach();
@@ -223,19 +224,24 @@ impl Workspace {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(self.current.label()),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .child(self.current.description()),
-                    )
-                    .child(
-                        div()
-                            .mt_4()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .child("This screen is not built yet."),
-                    ),
+                    .when(self.current == Screen::Settings, |d| {
+                        d.child(self.profile.clone())
+                    })
+                    .when(self.current != Screen::Settings, |d| {
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.text_muted)
+                                .child(self.current.description()),
+                        )
+                        .child(
+                            div()
+                                .mt_4()
+                                .text_sm()
+                                .text_color(theme.text_muted)
+                                .child("This screen is not built yet."),
+                        )
+                    }),
             )
     }
 }

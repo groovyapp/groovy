@@ -4,6 +4,7 @@
 mod data;
 mod node;
 mod onboarding;
+mod settings_profile;
 mod theme;
 mod title_bar;
 mod ui;

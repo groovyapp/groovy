@@ -21,6 +21,16 @@ const MIGRATIONS: &[&str] = &[
         key   TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL
     );",
+    // The local profile, a single row. The display name saved during
+    // onboarding moves here from the settings table.
+    "CREATE TABLE profile (
+        id           INTEGER PRIMARY KEY CHECK (id = 1),
+        display_name TEXT NOT NULL,
+        avatar_png   BLOB
+    );
+    INSERT INTO profile (id, display_name)
+        SELECT 1, value FROM settings WHERE key = 'profile.display_name';
+    DELETE FROM settings WHERE key = 'profile.display_name';",
 ];
 
 /// The schema version this build writes.
@@ -108,7 +118,7 @@ impl Database {
         })
     }
 
-    fn with_conn<T>(
+    pub(crate) fn with_conn<T>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, DbError> {
@@ -244,6 +254,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1, "migration 1 is kept");
+    }
+
+    #[test]
+    fn a_name_saved_before_profiles_existed_moves_into_the_profile() {
+        let (_tmp, path) = db_path();
+        // Version 1 of the schema, as shipped before profiles.
+        let v1 = Database::open_with(&path, &MIGRATIONS[..1]).unwrap();
+        v1.set_setting("profile.display_name", "Ada").unwrap();
+        drop(v1);
+
+        let upgraded = Database::open(&path).unwrap();
+
+        let profile = upgraded.profile().unwrap().expect("profile migrated");
+        assert_eq!(profile.display_name, "Ada");
+        assert_eq!(upgraded.get_setting("profile.display_name").unwrap(), None);
     }
 
     #[test]
