@@ -165,6 +165,7 @@ crates/
     src/config.rs        Versioned config.toml with unknown keys preserved
     src/logging.rs       Daily log file, stderr output and panic logging
     src/db.rs            SQLite database with versioned migrations
+    src/identity.rs      Ed25519 identity in the OS credential store, with a file fallback
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
   groovy/                Desktop app (GPUI)
     src/
