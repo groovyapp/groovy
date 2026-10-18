@@ -35,7 +35,7 @@ pub fn override_env_var(app_name: &str) -> String {
 /// config.toml
 /// identity/
 /// blobs/
-/// db/
+/// db/groovy.sqlite
 /// logs/
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +85,11 @@ impl DataDir {
 
     pub fn db_dir(&self) -> PathBuf {
         self.root.join("db")
+    }
+
+    /// The SQLite database file inside [`Self::db_dir`].
+    pub fn database_file(&self) -> PathBuf {
+        self.db_dir().join("groovy.sqlite")
     }
 
     pub fn logs_dir(&self) -> PathBuf {

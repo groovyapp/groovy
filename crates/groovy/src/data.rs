@@ -2,15 +2,16 @@
 
 use anyhow::Context;
 use gpui::Global;
-use groovy_core::{Config, DataDir};
+use groovy_core::{Config, DataDir, Database};
 
 use crate::APP_NAME;
 
-/// The data directory and config, shared with the rest of the app.
-#[expect(dead_code, reason = "read by settings (#14)")]
+/// The data directory, config and database, shared with the rest of the app.
+#[expect(dead_code, reason = "read by settings (#14) and the node (#7)")]
 pub struct AppData {
     pub dir: DataDir,
     pub config: Config,
+    pub database: Database,
 }
 
 impl Global for AppData {}
@@ -23,10 +24,15 @@ pub fn prepare() -> anyhow::Result<DataDir> {
     Ok(dir)
 }
 
-/// Loads the config from an existing data directory.
+/// Loads the config and opens the database, migrating it if needed.
 pub fn load(dir: DataDir) -> anyhow::Result<AppData> {
     let config = Config::load_or_create(&dir).context("failed to load the config")?;
-    Ok(AppData { dir, config })
+    let database = Database::open(&dir.database_file()).context("failed to open the database")?;
+    Ok(AppData {
+        dir,
+        config,
+        database,
+    })
 }
 
 /// Makes the opened data available to the rest of the app.
