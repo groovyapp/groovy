@@ -9,7 +9,9 @@ repository = "https://github.com/thenewkenya/groovy"
 # Pinned to a Zed commit rather than a crates.io release, for the latest GPUI.
 # Bump the rev deliberately; `cargo update -p gpui` will not move it.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca" }
+# The Wayland and X11 backends are off unless enabled here; without them the app
+# starts headless and never opens a window.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca", features = ["wayland", "x11"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
