@@ -117,6 +117,12 @@ cargo build --release
 
 The binary is `target/release/groovy` (`groovy.exe` on Windows).
 
+Groovy keeps its config and data in a per-user directory: `~/.local/share/groovy` on Linux, and the platform's equivalent elsewhere. To use a different directory, for example to run two instances on one machine, set `GROOVY_DATA_DIR`:
+
+```bash
+GROOVY_DATA_DIR=/tmp/groovy-b cargo run
+```
+
 Release builds on Windows run without a console window; debug builds keep one for logs.
 
 ### Test
@@ -154,9 +160,12 @@ This is a Cargo workspace. `groovy-core` holds the UI-free services and must not
 ```
 crates/
   groovy-core/           Core services (networking, storage, messaging). No GPUI dependency.
+    src/config.rs        Versioned config.toml with unknown keys preserved
+    src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point
+      data.rs            Opens the data directory and config at startup
       node.rs            Runs the Groovy node and forwards its events to the UI
       theme/             Theme struct and the Gruvbox / One Dark palettes
       title_bar/         Custom titlebar and window controls (Windows and Linux)

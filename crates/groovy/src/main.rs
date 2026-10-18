@@ -1,6 +1,7 @@
 // Release builds are GUI-only; debug builds keep a console for logs (same as Zed).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod data;
 mod node;
 mod theme;
 mod title_bar;
@@ -19,6 +20,7 @@ pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 fn main() {
     application().run(|cx: &mut App| {
         theme::init(cx);
+        data::init(cx);
         node::init(cx);
         quit_when_last_window_closes(cx);
 
