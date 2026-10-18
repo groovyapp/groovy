@@ -165,6 +165,8 @@ crates/
     src/config.rs        Versioned config.toml with unknown keys preserved
     src/logging.rs       Daily log file, stderr output and panic logging
     src/db.rs            SQLite database with versioned migrations
+    src/profile.rs       Local profile: display name and avatar, stored in the database
+    src/avatar.rs        Avatar pictures reduced to 128px PNG thumbnails, with input limits
     src/identity.rs      Ed25519 identity in the OS credential store, with a file fallback
       ui/                  Component kit (buttons, inputs, dialogs, toasts, menus, icons); see ui/mod.rs
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
@@ -178,6 +180,7 @@ crates/
       window_frame.rs    Client-side decorations and native border color
       workspace/         Main window: sidebar, screens (Files, Messages, Peers, Storage, Settings) and the status bar
       onboarding.rs      First-run flow: welcome, display name, endpoint ID, backup note
+      settings_profile.rs  Profile section of Settings: display name and picture
     build.rs             Embeds the icon in the Windows executable
 assets/
   icons/                 App icon: app-icon.svg (source), PNG sizes and app-icon.ico

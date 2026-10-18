@@ -2640,6 +2640,7 @@ name = "groovy-core"
 version = "0.0.1"
 dependencies = [
  "directories",
+ "image",
  "iroh",
  "keyring",
  "rusqlite",

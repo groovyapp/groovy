@@ -7,7 +7,7 @@
 use gpui::{
     App, Context, Entity, EventEmitter, FontWeight, Subscription, Window, div, prelude::*, px,
 };
-use groovy_core::Database;
+use groovy_core::{Database, validate_display_name};
 use tracing::warn;
 
 use crate::{
@@ -22,9 +22,6 @@ use crate::{
 
 /// Settings-table keys written when onboarding finishes.
 pub const COMPLETED_KEY: &str = "onboarding.completed";
-pub const DISPLAY_NAME_KEY: &str = "profile.display_name";
-
-const MAX_NAME_CHARS: usize = 64;
 const CONTENT_WIDTH: gpui::Pixels = px(480.);
 
 /// Whether onboarding has been finished on this machine.
@@ -36,14 +33,6 @@ pub fn is_completed(database: &Database) -> bool {
             false
         }
     }
-}
-
-/// The display name to keep: trimmed, and between 1 and 64 characters.
-pub fn validate_name(raw: &str) -> Option<String> {
-    let name = raw.trim();
-    (1..=MAX_NAME_CHARS)
-        .contains(&name.chars().count())
-        .then(|| name.to_owned())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,7 +94,7 @@ impl Onboarding {
     }
 
     fn valid_name(&self, cx: &App) -> Option<String> {
-        validate_name(self.name.read(cx).text())
+        validate_display_name(self.name.read(cx).text())
     }
 
     fn go_to(&mut self, step: Step, cx: &mut Context<Self>) {
@@ -285,15 +274,6 @@ impl Render for Onboarding {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn names_are_trimmed_and_bounded() {
-        assert_eq!(validate_name("  Ada  "), Some("Ada".to_owned()));
-        assert_eq!(validate_name("   "), None);
-        assert_eq!(validate_name(""), None);
-        assert_eq!(validate_name(&"a".repeat(64)).map(|n| n.len()), Some(64));
-        assert_eq!(validate_name(&"a".repeat(65)), None);
-    }
 
     #[test]
     fn steps_run_in_order_and_stop_at_the_ends() {

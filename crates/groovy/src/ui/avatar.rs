@@ -1,6 +1,8 @@
 //! A circle with someone's initials, colored from their name so it stays the same between launches.
 
-use gpui::{App, Hsla, Pixels, SharedString, Window, div, prelude::*, px};
+use std::sync::Arc;
+
+use gpui::{App, Hsla, Image, Pixels, SharedString, Window, div, img, prelude::*, px};
 
 use crate::theme::ActiveTheme;
 
@@ -8,6 +10,7 @@ use crate::theme::ActiveTheme;
 pub struct Avatar {
     name: SharedString,
     size: Pixels,
+    image: Option<Arc<Image>>,
 }
 
 impl Avatar {
@@ -15,11 +18,18 @@ impl Avatar {
         Self {
             name: name.into(),
             size: px(32.),
+            image: None,
         }
     }
 
     pub fn size(mut self, size: Pixels) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Shows this picture instead of the initials, when there is one.
+    pub fn image(mut self, image: Option<Arc<Image>>) -> Self {
+        self.image = image;
         self
     }
 }
@@ -48,6 +58,13 @@ fn background(name: &str, cx: &gpui::App) -> Hsla {
 
 impl RenderOnce for Avatar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if let Some(image) = self.image {
+            return img(image)
+                .size(self.size)
+                .flex_none()
+                .rounded_full()
+                .into_any_element();
+        }
         let theme = cx.theme();
         div()
             .flex()
@@ -61,6 +78,7 @@ impl RenderOnce for Avatar {
             .text_size(self.size * 0.4)
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .child(initials(&self.name))
+            .into_any_element()
     }
 }
 
