@@ -4,6 +4,7 @@
 //! tests can all share it.
 
 mod avatar;
+pub mod backup;
 mod config;
 pub mod db;
 pub mod identity;
@@ -16,7 +17,7 @@ pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
 pub use config::{CURRENT_VERSION, Config, ConfigError};
 pub use db::{Database, DbError, SCHEMA_VERSION};
 pub use identity::{Identity, IdentityError, Location};
-pub use iroh::{EndpointAddr, EndpointId};
+pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 pub use node::{
     EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeError, NodeEvent, NodeHandle,
     relay_url,

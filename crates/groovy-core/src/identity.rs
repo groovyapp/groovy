@@ -209,6 +209,45 @@ impl Identity {
         )
     }
 
+    /// Replaces the stored identity with `secret`, for restoring a backup. The
+    /// user asks for this explicitly, so it overwrites whatever was there. The
+    /// node must restart before the new identity takes effect.
+    pub fn restore(
+        dir: &DataDir,
+        app_name: &str,
+        secret: SecretKey,
+    ) -> Result<Self, IdentityError> {
+        let identity_dir = dir.identity_dir();
+        Self::restore_with(
+            &KeyringStore::new(app_name),
+            &FileStore::new(identity_dir.join(KEY_FILE)),
+            &identity_dir.join(LOCATION_FILE),
+            secret,
+        )
+    }
+
+    fn restore_with(
+        store: &dyn SecretStore,
+        file: &FileStore,
+        marker: &Path,
+        secret: SecretKey,
+    ) -> Result<Self, IdentityError> {
+        let key = secret.to_bytes();
+        let location = match store.save(&key) {
+            Ok(()) => {
+                file.remove()?;
+                Location::Keyring
+            }
+            Err(error) => {
+                warn!(%error, "OS credential store is unavailable; keeping the restored identity in a file");
+                file.save(&key)?;
+                Location::File
+            }
+        };
+        write_location(marker, location)?;
+        Ok(Self { secret, location })
+    }
+
     pub fn secret_key(&self) -> &SecretKey {
         &self.secret
     }
@@ -527,6 +566,78 @@ mod tests {
         let err = load(&FakeStore::broken(), &p).unwrap_err();
 
         assert!(matches!(err, IdentityError::InvalidFile { .. }), "{err}");
+    }
+
+    #[test]
+    fn restoring_replaces_the_stored_identity() {
+        let p = paths();
+        let store = FakeStore::working(None);
+        let first = load(&store, &p).unwrap();
+        let restored_key = SecretKey::generate();
+
+        let restored =
+            Identity::restore_with(&store, &p.file, &p.marker, restored_key.clone()).unwrap();
+
+        assert_ne!(first.public_key(), restored.public_key());
+        assert_eq!(restored.public_key(), restored_key.public());
+        assert_eq!(
+            load(&store, &p).unwrap().public_key(),
+            restored_key.public()
+        );
+    }
+
+    #[test]
+    fn a_restored_backup_gives_the_same_endpoint_id_on_a_fresh_install() {
+        // The original device, with its identity backed up.
+        let original_device = paths();
+        let original = load(&FakeStore::working(None), &original_device).unwrap();
+        let backup = crate::backup::export_with_work_factor(
+            original.secret_key(),
+            "correct horse battery",
+            Some(4),
+        )
+        .unwrap();
+
+        // A fresh install, which has created its own identity on first launch.
+        let fresh_install = paths();
+        let fresh_store = FakeStore::working(None);
+        let fresh = load(&fresh_store, &fresh_install).unwrap();
+        assert_ne!(fresh.public_key(), original.public_key());
+
+        let secret = crate::backup::import(&backup, "correct horse battery").unwrap();
+        let restored = Identity::restore_with(
+            &fresh_store,
+            &fresh_install.file,
+            &fresh_install.marker,
+            secret,
+        )
+        .unwrap();
+
+        assert_eq!(restored.public_key(), original.public_key());
+        assert_eq!(
+            load(&fresh_store, &fresh_install).unwrap().public_key(),
+            original.public_key()
+        );
+    }
+
+    #[test]
+    fn restoring_with_an_unavailable_store_writes_the_file() {
+        let p = paths();
+
+        let restored_key = SecretKey::generate();
+        let restored = Identity::restore_with(
+            &FakeStore::broken(),
+            &p.file,
+            &p.marker,
+            restored_key.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.location(), Location::File);
+        assert_eq!(
+            load(&FakeStore::broken(), &p).unwrap().public_key(),
+            restored_key.public()
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use groovy_core::Database;
 
 use crate::{
     APP_NAME,
+    backup::BackupSection,
     data::AppData,
     onboarding::{self, Onboarding, OnboardingEvent},
     settings_profile::ProfileEditor,
@@ -34,6 +35,7 @@ pub struct Workspace {
     /// Shown instead of the shell until onboarding is finished.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     profile: Entity<ProfileEditor>,
+    backup: Entity<BackupSection>,
     _appearance_subscription: Subscription,
 }
 
@@ -78,6 +80,7 @@ impl Workspace {
         window.focus(&focus_handle, cx);
 
         let profile = cx.new(|cx| ProfileEditor::new(database.clone(), cx));
+        let backup = cx.new(BackupSection::new);
 
         Self {
             current,
@@ -85,6 +88,7 @@ impl Workspace {
             focus_handle,
             onboarding,
             profile,
+            backup,
             _appearance_subscription,
         }
     }
@@ -97,6 +101,8 @@ impl Workspace {
     ) {
         let OnboardingEvent::Finished { display_name } = event;
         save_onboarding(self.database.clone(), display_name.clone(), cx);
+        // The identity is final now, so the node can start with it.
+        crate::node::start(cx);
         self.onboarding = None;
         cx.notify();
     }
@@ -217,7 +223,8 @@ impl Workspace {
                     .min_w_0()
                     .p_6()
                     .gap_2()
-                    .overflow_hidden()
+                    .id("screen-content")
+                    .overflow_y_scroll()
                     .child(
                         div()
                             .text_xl()
@@ -225,7 +232,7 @@ impl Workspace {
                             .child(self.current.label()),
                     )
                     .when(self.current == Screen::Settings, |d| {
-                        d.child(self.profile.clone())
+                        d.child(self.profile.clone()).child(self.backup.clone())
                     })
                     .when(self.current != Screen::Settings, |d| {
                         d.child(

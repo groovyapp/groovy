@@ -44,6 +44,8 @@ pub struct TextInput {
     /// Byte offset of the caret. Always on a character boundary.
     cursor: usize,
     placeholder: SharedString,
+    /// Shows each character as a dot, for passphrases.
+    masked: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -55,7 +57,14 @@ impl TextInput {
             content: String::new(),
             cursor: 0,
             placeholder: placeholder.into(),
+            masked: false,
         }
+    }
+
+    /// Hides the text behind dots, for passphrases.
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -244,10 +253,21 @@ impl Render for TextInput {
         let font_size = text_style.font_size.to_pixels(window.rem_size());
 
         let empty = self.content.is_empty();
+        let shown = if self.masked {
+            "•".repeat(self.content.chars().count())
+        } else {
+            self.content.clone()
+        };
         let display: SharedString = if empty {
             self.placeholder.clone()
         } else {
-            self.content.clone().into()
+            shown.into()
+        };
+        // The caret's byte offset in what is displayed, which differs when masked.
+        let caret = if self.masked {
+            self.content[..self.cursor].chars().count() * '•'.len_utf8()
+        } else {
+            self.cursor
         };
         let color = if empty { theme.text_muted } else { theme.text };
 
@@ -266,7 +286,7 @@ impl Render for TextInput {
             window
                 .text_system()
                 .shape_line(display.clone(), font_size, &[run], None)
-                .x_for_index(self.cursor)
+                .x_for_index(caret)
         };
 
         let entity = cx.entity();
