@@ -1,6 +1,7 @@
 // Release builds are GUI-only; debug builds keep a console for logs (same as Zed).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod node;
 mod theme;
 mod title_bar;
 mod window_frame;
@@ -18,6 +19,7 @@ pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 fn main() {
     application().run(|cx: &mut App| {
         theme::init(cx);
+        node::init(cx);
         quit_when_last_window_closes(cx);
 
         Workspace::open_window(cx).expect("failed to open main window");

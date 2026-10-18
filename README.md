@@ -157,6 +157,7 @@ crates/
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point
+      node.rs            Runs the Groovy node and forwards its events to the UI
       theme/             Theme struct and the Gruvbox / One Dark palettes
       title_bar/         Custom titlebar and window controls (Windows and Linux)
       window_frame.rs    Client-side decorations and native border color
