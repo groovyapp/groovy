@@ -2,16 +2,18 @@
 
 use anyhow::Context;
 use gpui::Global;
-use groovy_core::{Config, DataDir, Database};
+use groovy_core::{Config, DataDir, Database, Identity, Location};
+use tracing::{info, warn};
 
 use crate::APP_NAME;
 
-/// The data directory, config and database, shared with the rest of the app.
-#[expect(dead_code, reason = "read by settings (#14) and the node (#7)")]
+/// The data directory, config, database and identity, shared with the rest of the app.
+#[expect(dead_code, reason = "read by settings (#14) and the endpoint (#8)")]
 pub struct AppData {
     pub dir: DataDir,
     pub config: Config,
     pub database: Database,
+    pub identity: Identity,
 }
 
 impl Global for AppData {}
@@ -24,14 +26,24 @@ pub fn prepare() -> anyhow::Result<DataDir> {
     Ok(dir)
 }
 
-/// Loads the config and opens the database, migrating it if needed.
+/// Loads the config, opens the database (migrating it if needed) and loads the identity.
 pub fn load(dir: DataDir) -> anyhow::Result<AppData> {
     let config = Config::load_or_create(&dir).context("failed to load the config")?;
     let database = Database::open(&dir.database_file()).context("failed to open the database")?;
+    let identity =
+        Identity::load_or_create(&dir, APP_NAME).context("failed to load the identity")?;
+    match identity.location() {
+        Location::Keyring => info!(public_key = %identity.public_key(), "identity loaded"),
+        Location::File => warn!(
+            public_key = %identity.public_key(),
+            "identity is kept in a file because the OS credential store is unavailable"
+        ),
+    }
     Ok(AppData {
         dir,
         config,
         database,
+        identity,
     })
 }
 

@@ -5,11 +5,13 @@
 
 mod config;
 pub mod db;
+pub mod identity;
 pub mod logging;
 mod node;
 mod paths;
 
 pub use config::{CURRENT_VERSION, Config, ConfigError};
 pub use db::{Database, DbError, SCHEMA_VERSION};
+pub use identity::{Identity, IdentityError, Location};
 pub use node::{EventStream, Node, NodeError, NodeEvent, NodeHandle};
 pub use paths::{DataDir, PathsError, override_env_var};
