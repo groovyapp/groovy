@@ -166,6 +166,7 @@ crates/
     src/logging.rs       Daily log file, stderr output and panic logging
     src/db.rs            SQLite database with versioned migrations
     src/identity.rs      Ed25519 identity in the OS credential store, with a file fallback
+      ui/                  Component kit (buttons, inputs, dialogs, toasts, menus, icons); see ui/mod.rs
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
   groovy/                Desktop app (GPUI)
     src/
@@ -179,6 +180,7 @@ crates/
     build.rs             Embeds the icon in the Windows executable
 assets/
   icons/                 App icon: app-icon.svg (source), PNG sizes and app-icon.ico
+  icons/tabler/          Tabler outline icons used by the UI (MIT, see its LICENSE)
   groovy.desktop         Linux desktop entry
 scripts/
   generate_icons.py      Regenerates the PNGs and .ico from app-icon.svg
