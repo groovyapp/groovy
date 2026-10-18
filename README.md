@@ -164,6 +164,7 @@ crates/
   groovy-core/           Core services (networking, storage, messaging). No GPUI dependency.
     src/config.rs        Versioned config.toml with unknown keys preserved
     src/logging.rs       Daily log file, stderr output and panic logging
+    src/db.rs            SQLite database with versioned migrations
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
   groovy/                Desktop app (GPUI)
     src/
@@ -181,6 +182,8 @@ assets/
 scripts/
   generate_icons.py      Regenerates the PNGs and .ico from app-icon.svg
 .github/workflows/       CI: fmt, clippy and release build on Windows and Linux
+docs/
+  decisions/             Architecture decision records (0001: SQLite for local state)
 ```
 
 ### Linux desktop entry
