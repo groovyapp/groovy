@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=gpui-template
+Exec=gpui-template
+Icon=gpui-template
+Terminal=false
+StartupWMClass=gpui-template
+Categories=Utility;
