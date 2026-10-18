@@ -131,7 +131,15 @@ mod tests {
     #[test]
     fn empty_override_falls_back_to_platform_directory() {
         let dir = DataDir::resolve_with_override("groovy", Some(OsString::new())).unwrap();
-        assert!(dir.root().ends_with("groovy"), "{:?}", dir.root());
+        // The platform layout differs (Linux ends in `groovy`, Windows in `groovy\data`),
+        // so check for the app name as a path component.
+        assert!(
+            dir.root()
+                .components()
+                .any(|part| part.as_os_str() == "groovy"),
+            "{:?}",
+            dir.root()
+        );
     }
 
     #[test]
