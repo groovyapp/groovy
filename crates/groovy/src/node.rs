@@ -9,6 +9,15 @@ use tracing::{info, warn};
 /// How long quitting waits for the node to stop before exiting anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Shortens an endpoint ID for display: its first and last few characters.
+pub fn abbreviate_id(id: &str) -> String {
+    const KEEP: usize = 8;
+    if id.len() <= KEEP * 2 + 1 {
+        return id.to_owned();
+    }
+    format!("{}…{}", &id[..KEEP], &id[id.len() - KEEP..])
+}
+
 /// Where the node is in its lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeStatus {

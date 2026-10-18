@@ -3,21 +3,12 @@
 use gpui::{App, ClipboardItem, Window, div, prelude::*, px};
 
 use crate::{
-    node::{NodeState, NodeStatus},
+    node::{NodeState, NodeStatus, abbreviate_id},
     theme::ActiveTheme,
     ui::{button::Button, icon::Icon, spinner::Spinner},
 };
 
 const HEIGHT: gpui::Pixels = px(26.);
-
-/// Shortens an endpoint ID for display: the first and last few characters.
-pub fn abbreviate(id: &str) -> String {
-    const KEEP: usize = 8;
-    if id.len() <= KEEP * 2 + 1 {
-        return id.to_owned();
-    }
-    format!("{}…{}", &id[..KEEP], &id[id.len() - KEEP..])
-}
 
 #[derive(IntoElement)]
 pub struct StatusBar;
@@ -64,7 +55,7 @@ impl RenderOnce for StatusBar {
             .items_center()
             .gap_1()
             .child(div().text_color(theme.text_muted).child("Endpoint"))
-            .child(abbreviate(&endpoint_id))
+            .child(abbreviate_id(&endpoint_id))
             .child(
                 Button::icon_only("copy-endpoint-id", Icon::Copy)
                     .variant(crate::ui::button::Variant::Ghost)
