@@ -8,8 +8,12 @@ mod title_bar;
 mod window_frame;
 mod workspace;
 
+use std::process::ExitCode;
+
+use anyhow::Context;
 use gpui::App;
 use gpui_platform::application;
+use groovy_core::{DataDir, Node};
 
 use workspace::Workspace;
 
@@ -17,21 +21,48 @@ use workspace::Workspace;
 /// desktop entry matching.
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
-fn main() {
-    let data = data::open();
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Logging may not have started, so stderr is the fallback. Release
+            // builds on Windows have no console, so there the log file is the
+            // only record.
+            eprintln!("Groovy could not start: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let dir = data::prepare()?;
     let _log_guard =
-        groovy_core::logging::init(&data.dir.logs_dir()).expect("failed to start logging");
+        groovy_core::logging::init(&dir.logs_dir()).context("failed to start logging")?;
     groovy_core::logging::install_panic_hook();
+
+    // Errors from here on also go to the log file.
+    let result = start_app(dir);
+    if let Err(error) = &result {
+        tracing::error!("Groovy could not start: {error:#}");
+    }
+    result
+}
+
+fn start_app(dir: DataDir) -> anyhow::Result<()> {
+    let data = data::load(dir)?;
+    let (node, events) = Node::start().context("failed to start the Groovy node")?;
 
     application().run(move |cx: &mut App| {
         theme::init(cx);
         data::init(cx, data);
-        node::init(cx);
+        node::init(cx, node, events);
         quit_when_last_window_closes(cx);
 
+        // Failing to open the first window leaves nothing to show, so it stays a hard failure.
         Workspace::open_window(cx).expect("failed to open main window");
         cx.activate(true);
     });
+    Ok(())
 }
 
 /// Windows already exits when the last window closes; macOS and Linux don't.

@@ -1,5 +1,6 @@
 //! Opens the data directory and config before the app starts.
 
+use anyhow::Context;
 use gpui::Global;
 use groovy_core::{Config, DataDir};
 
@@ -14,13 +15,18 @@ pub struct AppData {
 
 impl Global for AppData {}
 
-/// Creates the data directory and config on first run, then loads them.
-pub fn open() -> AppData {
-    let dir = DataDir::resolve(APP_NAME).expect("failed to locate the Groovy data directory");
+/// Locates the data directory and creates it on first run.
+pub fn prepare() -> anyhow::Result<DataDir> {
+    let dir = DataDir::resolve(APP_NAME).context("failed to locate the data directory")?;
     dir.create_all()
-        .expect("failed to create the Groovy data directory");
-    let config = Config::load_or_create(&dir).expect("failed to load the Groovy config");
-    AppData { dir, config }
+        .context("failed to create the data directory")?;
+    Ok(dir)
+}
+
+/// Loads the config from an existing data directory.
+pub fn load(dir: DataDir) -> anyhow::Result<AppData> {
+    let config = Config::load_or_create(&dir).context("failed to load the config")?;
+    Ok(AppData { dir, config })
 }
 
 /// Makes the opened data available to the rest of the app.

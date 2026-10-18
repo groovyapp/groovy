@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use gpui::{App, Global};
-use groovy_core::{Node, NodeEvent};
+use groovy_core::{EventStream, NodeEvent, NodeHandle};
 use tracing::{info, warn};
 
 /// How long quitting waits for the node to stop before exiting anyway.
@@ -24,9 +24,9 @@ impl NodeState {
     }
 }
 
-/// Starts the node, registers it as a global and stops it when the app quits.
-pub fn init(cx: &mut App) {
-    let (handle, mut events) = Node::start().expect("failed to start the Groovy node");
+/// Registers the started node as a global, forwards its events to the UI, and
+/// stops it when the app quits.
+pub fn init(cx: &mut App, handle: NodeHandle, mut events: EventStream) {
     cx.set_global(NodeState { running: false });
 
     cx.spawn(async move |cx| {
