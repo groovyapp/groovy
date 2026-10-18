@@ -12,6 +12,7 @@ use groovy_core::Database;
 use crate::{
     APP_NAME,
     data::AppData,
+    onboarding::{self, Onboarding, OnboardingEvent},
     theme::{self, ActiveTheme},
     title_bar::TitleBar,
     window_frame::{client_side_decorations, set_native_border_color},
@@ -29,16 +30,23 @@ pub struct Workspace {
     current: Screen,
     database: Arc<Database>,
     focus_handle: FocusHandle,
+    /// Shown instead of the shell until onboarding is finished.
+    onboarding: Option<(Entity<Onboarding>, Subscription)>,
     _appearance_subscription: Subscription,
 }
 
 impl Workspace {
-    /// Opens the main window on `screen`. Needs the data opened at startup.
-    pub fn open_window(cx: &mut App, screen: Screen) -> Result<WindowHandle<Self>> {
+    /// Opens the main window on `screen`, or on onboarding if it has not been
+    /// finished. Needs the data opened at startup.
+    pub fn open_window(
+        cx: &mut App,
+        screen: Screen,
+        onboarded: bool,
+    ) -> Result<WindowHandle<Self>> {
         let database = cx.global::<AppData>().database.clone();
         cx.open_window(window_options(cx), |window, cx| {
             set_native_border_color(window, cx);
-            cx.new(|cx| Self::new(window, cx, screen, database))
+            cx.new(|cx| Self::new(window, cx, screen, database, onboarded))
         })
     }
 
@@ -47,7 +55,14 @@ impl Workspace {
         cx: &mut Context<Self>,
         current: Screen,
         database: Arc<Database>,
+        onboarded: bool,
     ) -> Self {
+        let onboarding = (!onboarded).then(|| {
+            let onboarding = cx.new(Onboarding::new);
+            let subscription = cx.subscribe(&onboarding, Self::on_onboarding_event);
+            (onboarding, subscription)
+        });
+
         // Follow the system's light/dark setting while the app is running.
         let _appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
             theme::sync_with_appearance(window.appearance(), cx);
@@ -64,8 +79,28 @@ impl Workspace {
             current,
             database,
             focus_handle,
+            onboarding,
             _appearance_subscription,
         }
+    }
+
+    fn on_onboarding_event(
+        &mut self,
+        _onboarding: Entity<Onboarding>,
+        event: &OnboardingEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let OnboardingEvent::Finished { display_name } = event;
+        save_settings(
+            self.database.clone(),
+            vec![
+                (onboarding::DISPLAY_NAME_KEY, display_name.clone()),
+                (onboarding::COMPLETED_KEY, "true".to_owned()),
+            ],
+            cx,
+        );
+        self.onboarding = None;
+        cx.notify();
     }
 
     fn select(&mut self, screen: Screen, cx: &mut Context<Self>) {
@@ -110,16 +145,64 @@ fn window_decorations() -> WindowDecorations {
     }
 }
 
+/// Writes settings on the background executor, so the UI thread never waits on the database.
+fn save_settings(database: Arc<Database>, entries: Vec<(&'static str, String)>, cx: &App) {
+    cx.background_spawn(async move {
+        for (key, value) in entries {
+            if let Err(error) = database.set_setting(key, &value) {
+                tracing::warn!(%error, key, "could not save a setting");
+            }
+        }
+    })
+    .detach();
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match &self.onboarding {
+            Some((onboarding, _)) => div().flex_1().min_h_0().child(onboarding.clone()),
+            None => self.shell_body(cx),
+        };
+        let theme = cx.theme();
+
+        let content = div()
+            .key_context("Workspace")
+            .track_focus(&self.focus_handle)
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.editor_background)
+            .text_color(theme.text)
+            .on_action(cx.listener(|this, _: &ShowFiles, _, cx| this.select(Screen::Files, cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowMessages, _, cx| this.select(Screen::Messages, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ShowPeers, _, cx| this.select(Screen::Peers, cx)))
+            .on_action(cx.listener(|this, _: &ShowStorage, _, cx| this.select(Screen::Storage, cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowSettings, _, cx| this.select(Screen::Settings, cx)),
+            )
+            .when(TitleBar::is_visible(window), |d| {
+                d.child(TitleBar::new(APP_NAME))
+            })
+            .child(body)
+            // The status bar is part of the shell, not onboarding.
+            .when(self.onboarding.is_none(), |d| d.child(StatusBar));
+
+        client_side_decorations(content, window, cx)
+    }
+}
+
+impl Workspace {
+    /// The sidebar and the selected screen, between the titlebar and the status bar.
+    fn shell_body(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme();
         let workspace = cx.entity().clone();
-
         let sidebar = Sidebar::new(self.current, move |screen, _, cx| {
             workspace.update(cx, |workspace, cx| workspace.select(screen, cx));
         });
 
-        let body = div()
+        div()
             .flex()
             .flex_row()
             .flex_1()
@@ -153,31 +236,6 @@ impl Render for Workspace {
                             .text_color(theme.text_muted)
                             .child("This screen is not built yet."),
                     ),
-            );
-
-        let content = div()
-            .key_context("Workspace")
-            .track_focus(&self.focus_handle)
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(theme.editor_background)
-            .text_color(theme.text)
-            .on_action(cx.listener(|this, _: &ShowFiles, _, cx| this.select(Screen::Files, cx)))
-            .on_action(
-                cx.listener(|this, _: &ShowMessages, _, cx| this.select(Screen::Messages, cx)),
             )
-            .on_action(cx.listener(|this, _: &ShowPeers, _, cx| this.select(Screen::Peers, cx)))
-            .on_action(cx.listener(|this, _: &ShowStorage, _, cx| this.select(Screen::Storage, cx)))
-            .on_action(
-                cx.listener(|this, _: &ShowSettings, _, cx| this.select(Screen::Settings, cx)),
-            )
-            .when(TitleBar::is_visible(window), |d| {
-                d.child(TitleBar::new(APP_NAME))
-            })
-            .child(body)
-            .child(StatusBar);
-
-        client_side_decorations(content, window, cx)
     }
 }

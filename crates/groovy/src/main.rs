@@ -3,6 +3,7 @@
 
 mod data;
 mod node;
+mod onboarding;
 mod theme;
 mod title_bar;
 mod ui;
@@ -52,6 +53,7 @@ fn run() -> anyhow::Result<()> {
 fn start_app(dir: DataDir) -> anyhow::Result<()> {
     let data = data::load(dir)?;
     let last_screen = workspace::Screen::load(&data.database);
+    let onboarded = onboarding::is_completed(&data.database);
     let (node, events) = Node::start(NodeConfig {
         secret_key: data.identity.secret_key().clone(),
         network: Network::Public,
@@ -71,7 +73,7 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
             quit_when_last_window_closes(cx);
 
             // Failing to open the first window leaves nothing to show, so it stays a hard failure.
-            Workspace::open_window(cx, last_screen).expect("failed to open main window");
+            Workspace::open_window(cx, last_screen, onboarded).expect("failed to open main window");
             cx.activate(true);
         });
     Ok(())
