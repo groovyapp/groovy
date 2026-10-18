@@ -2163,6 +2163,7 @@ dependencies = [
 name = "groovy"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "gpui",
  "gpui_platform",
  "groovy-core",
