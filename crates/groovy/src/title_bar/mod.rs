@@ -20,7 +20,7 @@ const APP_ICON_SIZE: Pixels = px(16.);
 static APP_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
     Arc::new(Image::from_bytes(
         ImageFormat::Png,
-        include_bytes!("../../assets/icons/app-icon-32.png").to_vec(),
+        include_bytes!("../../../../assets/icons/app-icon-32.png").to_vec(),
     ))
 });
 

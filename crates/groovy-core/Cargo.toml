@@ -1,0 +1,9 @@
+[package]
+name = "groovy-core"
+description = "Groovy's UI-free core: networking, storage and messaging services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

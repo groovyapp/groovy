@@ -149,21 +149,24 @@ The following crates are the intended dependencies. They are not yet in `Cargo.t
 
 ## Project layout
 
-The current code is the desktop UI scaffold that the clients will be built on. It uses [GPUI](https://www.gpui.rs), the UI framework behind Zed.
+This is a Cargo workspace. `groovy-core` holds the UI-free services and must not depend on GPUI. `groovy` is the desktop app, built on [GPUI](https://www.gpui.rs), the UI framework behind Zed.
 
 ```
+crates/
+  groovy-core/           Core services (networking, storage, messaging). No GPUI dependency.
+  groovy/                Desktop app (GPUI)
+    src/
+      main.rs            Entry point
+      theme/             Theme struct and the Gruvbox / One Dark palettes
+      title_bar/         Custom titlebar and window controls (Windows and Linux)
+      window_frame.rs    Client-side decorations and native border color
+      workspace/         Main window, window options and theme switching
+    build.rs             Embeds the icon in the Windows executable
 assets/
   icons/                 App icon: app-icon.svg (source), PNG sizes and app-icon.ico
   groovy.desktop         Linux desktop entry
 scripts/
   generate_icons.py      Regenerates the PNGs and .ico from app-icon.svg
-src/
-  main.rs                Entry point
-  theme/                 Theme struct and the Gruvbox / One Dark palettes
-  title_bar/             Custom titlebar and window controls (Windows and Linux)
-  window_frame.rs        Client-side decorations and native border color
-  workspace/             Main window, window options and theme switching
-build.rs                 Embeds the icon in the Windows executable
 .github/workflows/       CI: fmt, clippy and release build on Windows and Linux
 ```
 
