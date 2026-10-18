@@ -98,7 +98,7 @@ These follow from [iroh's security model](https://docs.iroh.computer/concepts/se
 - [Rust](https://www.rust-lang.org/tools/install) **1.91 or newer** (the minimum supported version of iroh 1.3 and its protocol crates), with edition 2024 support. Development is done on Rust 1.99.0.
 - Windows or Linux. CI builds both.
 - `git`, because GPUI is pulled from the [Zed repository](https://github.com/zed-industries/zed) at a pinned commit.
-- On Linux, the system libraries listed in [CI](.github/workflows/ci.yml) (ALSA, fontconfig, Wayland, X11/xcb, xkbcommon, Vulkan, OpenSSL, zstd).
+- On Linux, the system libraries listed in [CI](.github/workflows/ci.yml) (ALSA, fontconfig, Wayland, X11/xcb, xkbcommon, Vulkan, OpenSSL, zstd, D-Bus and pkg-config).
 
 ### Build and run
 
