@@ -181,6 +181,7 @@ crates/
       window_frame.rs    Client-side decorations and native border color
       workspace/         Main window: sidebar, screens (Files, Messages, Peers, Storage, Settings) and the status bar
       onboarding.rs      First-run flow: welcome, display name, endpoint ID, backup note
+      settings.rs          Settings screen: profile, appearance, network, identity, storage, advanced
       settings_profile.rs  Profile section of Settings: display name and picture
       backup.rs            Identity backup and restore: restore form and Settings section
     build.rs             Embeds the icon in the Windows executable

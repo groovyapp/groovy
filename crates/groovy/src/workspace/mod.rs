@@ -11,10 +11,9 @@ use groovy_core::Database;
 
 use crate::{
     APP_NAME,
-    backup::BackupSection,
     data::AppData,
     onboarding::{self, Onboarding, OnboardingEvent},
-    settings_profile::ProfileEditor,
+    settings::SettingsScreen,
     theme::{self, ActiveTheme},
     title_bar::TitleBar,
     window_frame::{client_side_decorations, set_native_border_color},
@@ -34,8 +33,7 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     /// Shown instead of the shell until onboarding is finished.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
-    profile: Entity<ProfileEditor>,
-    backup: Entity<BackupSection>,
+    settings: Entity<SettingsScreen>,
     _appearance_subscription: Subscription,
 }
 
@@ -79,16 +77,14 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
-        let profile = cx.new(|cx| ProfileEditor::new(database.clone(), cx));
-        let backup = cx.new(BackupSection::new);
+        let settings = cx.new(|cx| SettingsScreen::new(database.clone(), cx));
 
         Self {
             current,
             database,
             focus_handle,
             onboarding,
-            profile,
-            backup,
+            settings,
             _appearance_subscription,
         }
     }
@@ -232,7 +228,7 @@ impl Workspace {
                             .child(self.current.label()),
                     )
                     .when(self.current == Screen::Settings, |d| {
-                        d.child(self.profile.clone()).child(self.backup.clone())
+                        d.child(self.settings.clone())
                     })
                     .when(self.current != Screen::Settings, |d| {
                         d.child(

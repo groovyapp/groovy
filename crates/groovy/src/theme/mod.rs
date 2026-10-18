@@ -7,6 +7,9 @@ mod gruvbox_light_hard;
 mod one_dark;
 
 use gpui::{App, Global, Hsla, WindowAppearance};
+use groovy_core::Appearance;
+
+use crate::data::AppData;
 
 pub struct Theme {
     pub title_bar_background: Hsla,
@@ -49,8 +52,19 @@ pub struct ModeOverride(pub Option<Mode>);
 
 impl Global for ModeOverride {}
 
+/// The mode a saved appearance choice means: `None` follows the system.
+pub fn mode_for(appearance: Appearance) -> Option<Mode> {
+    match appearance {
+        Appearance::System => None,
+        Appearance::Light => Some(Mode::Light),
+        Appearance::Dark => Some(Mode::Dark),
+    }
+}
+
+/// Applies the appearance saved in the config. Needs [`crate::data::AppData`].
 pub fn init(cx: &mut App) {
-    cx.set_global(ModeOverride::default());
+    let appearance = cx.global::<AppData>().config.appearance;
+    cx.set_global(ModeOverride(mode_for(appearance)));
     sync_with_appearance(cx.window_appearance(), cx);
 }
 
