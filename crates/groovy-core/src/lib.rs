@@ -13,8 +13,9 @@ mod paths;
 pub use config::{CURRENT_VERSION, Config, ConfigError};
 pub use db::{Database, DbError, SCHEMA_VERSION};
 pub use identity::{Identity, IdentityError, Location};
-pub use iroh::EndpointAddr;
+pub use iroh::{EndpointAddr, EndpointId};
 pub use node::{
     EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeError, NodeEvent, NodeHandle,
+    relay_url,
 };
 pub use paths::{DataDir, PathsError, override_env_var};

@@ -2629,6 +2629,7 @@ dependencies = [
  "gpui_platform",
  "groovy-core",
  "raw-window-handle",
+ "tempfile",
  "tracing",
  "windows 0.61.3",
  "winresource",

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr, Watcher};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
@@ -70,6 +70,14 @@ pub enum NodeEvent {
 enum Command {
     Ping(oneshot::Sender<()>),
     Addr(oneshot::Sender<EndpointAddr>),
+}
+
+/// The relay URL the node is reachable through, if it has a home relay.
+pub fn relay_url(addr: &EndpointAddr) -> Option<String> {
+    addr.addrs.iter().find_map(|transport| match transport {
+        TransportAddr::Relay(url) => Some(url.to_string()),
+        _ => None,
+    })
 }
 
 /// Entry point for starting a node.

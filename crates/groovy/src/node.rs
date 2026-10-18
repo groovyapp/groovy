@@ -3,31 +3,41 @@
 use std::time::Duration;
 
 use gpui::{App, Global};
-use groovy_core::{EndpointAddr, EventStream, NodeEvent, NodeHandle};
+use groovy_core::{EndpointAddr, EndpointId, EventStream, NodeEvent, NodeHandle, relay_url};
 use tracing::{info, warn};
 
 /// How long quitting waits for the node to stop before exiting anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The node's lifecycle and reachable address, as seen from the UI thread.
+/// Where the node is in its lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeStatus {
+    Starting,
+    Online,
+    Offline,
+}
+
+/// The node's lifecycle and reachability, as seen from the UI thread.
 pub struct NodeState {
-    running: bool,
+    status: NodeStatus,
+    endpoint_id: EndpointId,
     addr: Option<EndpointAddr>,
 }
 
 impl Global for NodeState {}
 
 impl NodeState {
-    /// Whether the node has started and not yet stopped.
-    #[expect(dead_code, reason = "read by the status bar (#10)")]
-    pub fn is_running(&self) -> bool {
-        self.running
+    pub fn status(&self) -> NodeStatus {
+        self.status
     }
 
-    /// The node's latest address, once it has been reported.
-    #[expect(dead_code, reason = "read by the status bar (#10)")]
-    pub fn addr(&self) -> Option<&EndpointAddr> {
-        self.addr.as_ref()
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    /// The relay the node is reachable through, once its address is known.
+    pub fn relay(&self) -> Option<String> {
+        self.addr.as_ref().and_then(relay_url)
     }
 }
 
@@ -35,7 +45,8 @@ impl NodeState {
 /// stops it when the app quits.
 pub fn init(cx: &mut App, handle: NodeHandle, mut events: EventStream) {
     cx.set_global(NodeState {
-        running: false,
+        status: NodeStatus::Starting,
+        endpoint_id: handle.endpoint_id(),
         addr: None,
     });
 
@@ -45,9 +56,9 @@ pub fn init(cx: &mut App, handle: NodeHandle, mut events: EventStream) {
             cx.update(|cx| {
                 let state = cx.global_mut::<NodeState>();
                 match event {
-                    NodeEvent::Started => state.running = true,
+                    NodeEvent::Started => state.status = NodeStatus::Online,
                     NodeEvent::AddressChanged(addr) => state.addr = Some(addr),
-                    NodeEvent::Stopped => state.running = false,
+                    NodeEvent::Stopped => state.status = NodeStatus::Offline,
                 }
                 cx.refresh_windows();
             });

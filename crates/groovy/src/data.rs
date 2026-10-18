@@ -1,5 +1,7 @@
 //! Opens the data directory and config before the app starts.
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use gpui::Global;
 use groovy_core::{Config, DataDir, Database, Identity, Location};
@@ -12,7 +14,7 @@ use crate::APP_NAME;
 pub struct AppData {
     pub dir: DataDir,
     pub config: Config,
-    pub database: Database,
+    pub database: Arc<Database>,
     pub identity: Identity,
 }
 
@@ -42,7 +44,7 @@ pub fn load(dir: DataDir) -> anyhow::Result<AppData> {
     Ok(AppData {
         dir,
         config,
-        database,
+        database: Arc::new(database),
         identity,
     })
 }
