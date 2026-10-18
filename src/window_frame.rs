@@ -102,6 +102,7 @@ pub fn client_side_decorations(
                         blur_radius: SHADOW_SIZE / 2.,
                         spread_radius: px(0.),
                         offset: point(px(0.), px(0.)),
+                        inset: false,
                     }])
                 })
                 // Don't let the resize logic above see moves inside the frame.
