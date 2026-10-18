@@ -5,6 +5,7 @@ mod backup;
 mod data;
 mod node;
 mod onboarding;
+mod settings;
 mod settings_profile;
 mod theme;
 mod title_bar;
@@ -60,12 +61,12 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
     application()
         .with_assets(ui::icon::Assets)
         .run(move |cx: &mut App| {
+            data::init(cx, data);
             theme::init(cx);
             ui::input::bind_keys(cx);
             workspace::bind_keys(cx);
             #[cfg(debug_assertions)]
             ui::gallery::init(cx);
-            data::init(cx, data);
             // Until onboarding is done, the identity may still change, so the node waits.
             if onboarded {
                 node::start(cx);

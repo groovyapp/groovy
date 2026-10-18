@@ -44,10 +44,23 @@ pub enum ConfigError {
     Serialize(#[source] toml::ser::Error),
 }
 
+/// Whether the window follows the system's light or dark setting, or is fixed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// Groovy's settings, as stored in `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
+    /// Missing from older files, which get the default.
+    #[serde(default)]
+    pub appearance: Appearance,
     /// Keys this build does not know about. They are written back unchanged.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -57,6 +70,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: CURRENT_VERSION,
+            appearance: Appearance::default(),
             unknown: toml::Table::new(),
         }
     }
@@ -140,6 +154,32 @@ mod tests {
 
         assert_eq!(config, Config::default());
         assert!(dir.config_file().is_file());
+    }
+
+    #[test]
+    fn appearance_is_saved_and_loaded() {
+        let (_tmp, dir) = data_dir();
+        let config = Config {
+            appearance: Appearance::Dark,
+            ..Config::default()
+        };
+        config.save(&dir).unwrap();
+
+        assert_eq!(
+            Config::load_or_create(&dir).unwrap().appearance,
+            Appearance::Dark
+        );
+    }
+
+    #[test]
+    fn files_without_an_appearance_follow_the_system() {
+        let (_tmp, dir) = data_dir();
+        fs::write(dir.config_file(), "version = 1\n").unwrap();
+
+        assert_eq!(
+            Config::load_or_create(&dir).unwrap().appearance,
+            Appearance::System
+        );
     }
 
     #[test]

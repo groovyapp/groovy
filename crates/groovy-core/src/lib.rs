@@ -14,7 +14,7 @@ mod paths;
 pub mod profile;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
-pub use config::{CURRENT_VERSION, Config, ConfigError};
+pub use config::{Appearance, CURRENT_VERSION, Config, ConfigError};
 pub use db::{Database, DbError, SCHEMA_VERSION};
 pub use identity::{Identity, IdentityError, Location};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};

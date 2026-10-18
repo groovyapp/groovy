@@ -10,7 +10,6 @@ use tracing::{info, warn};
 use crate::APP_NAME;
 
 /// The data directory, config, database and identity, shared with the rest of the app.
-#[expect(dead_code, reason = "read by settings (#14) and the endpoint (#8)")]
 pub struct AppData {
     pub dir: DataDir,
     pub config: Config,
