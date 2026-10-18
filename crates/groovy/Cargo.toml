@@ -10,6 +10,7 @@ repository.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 groovy-core = { path = "../groovy-core" }
+tracing = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
