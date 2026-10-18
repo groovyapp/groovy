@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use anyhow::Context;
 use gpui::App;
 use gpui_platform::application;
-use groovy_core::{DataDir, Node};
+use groovy_core::{DataDir, Network, Node, NodeConfig};
 
 use workspace::Workspace;
 
@@ -50,7 +50,11 @@ fn run() -> anyhow::Result<()> {
 
 fn start_app(dir: DataDir) -> anyhow::Result<()> {
     let data = data::load(dir)?;
-    let (node, events) = Node::start().context("failed to start the Groovy node")?;
+    let (node, events) = Node::start(NodeConfig {
+        secret_key: data.identity.secret_key().clone(),
+        network: Network::Public,
+    })
+    .context("failed to start the Groovy node")?;
 
     application().run(move |cx: &mut App| {
         theme::init(cx);
