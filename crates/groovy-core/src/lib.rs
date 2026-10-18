@@ -3,6 +3,10 @@
 //! This crate must not depend on `gpui`, so that the desktop app, the CLI and
 //! tests can all share it.
 
+mod config;
 mod node;
+mod paths;
 
+pub use config::{CURRENT_VERSION, Config, ConfigError};
 pub use node::{EventStream, Node, NodeError, NodeEvent, NodeHandle};
+pub use paths::{DataDir, PathsError, override_env_var};
