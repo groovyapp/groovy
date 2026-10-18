@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use gpui::{App, Global};
-use groovy_core::{EndpointAddr, EndpointId, EventStream, NodeEvent, NodeHandle, relay_url};
-use tracing::{info, warn};
+use groovy_core::{EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, relay_url};
+use tracing::{error, info, warn};
+
+use crate::data::AppData;
 
 /// How long quitting waits for the node to stop before exiting anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -50,16 +52,39 @@ impl NodeState {
     }
 }
 
-/// Registers the started node as a global, forwards its events to the UI, and
-/// stops it when the app quits.
-pub fn init(cx: &mut App, handle: NodeHandle, mut events: EventStream) {
+/// Starts the node with the identity in [`AppData`], once. Called at launch
+/// when onboarding is done, and when onboarding finishes. A node that cannot
+/// start is recorded as offline, so the status bar still has something to show.
+pub fn start(cx: &mut App) {
+    if cx.has_global::<NodeState>() {
+        return;
+    }
+    let secret_key = cx.global::<AppData>().identity.secret_key().clone();
+    let endpoint_id = secret_key.public();
+
+    let (handle, events) = match Node::start(NodeConfig {
+        secret_key,
+        network: Network::Public,
+    }) {
+        Ok(started) => started,
+        Err(error) => {
+            error!(%error, "the Groovy node could not start");
+            cx.set_global(NodeState {
+                status: NodeStatus::Offline,
+                endpoint_id,
+                addr: None,
+            });
+            return;
+        }
+    };
     cx.set_global(NodeState {
         status: NodeStatus::Starting,
-        endpoint_id: handle.endpoint_id(),
+        endpoint_id,
         addr: None,
     });
 
     cx.spawn(async move |cx| {
+        let mut events = events;
         while let Some(event) = events.next().await {
             info!(?event, "node event");
             cx.update(|cx| {

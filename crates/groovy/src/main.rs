@@ -1,6 +1,7 @@
 // Release builds are GUI-only; debug builds keep a console for logs (same as Zed).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backup;
 mod data;
 mod node;
 mod onboarding;
@@ -16,7 +17,7 @@ use std::process::ExitCode;
 use anyhow::Context;
 use gpui::App;
 use gpui_platform::application;
-use groovy_core::{DataDir, Network, Node, NodeConfig};
+use groovy_core::DataDir;
 
 use workspace::Workspace;
 
@@ -55,11 +56,6 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
     let data = data::load(dir)?;
     let last_screen = workspace::Screen::load(&data.database);
     let onboarded = onboarding::is_completed(&data.database);
-    let (node, events) = Node::start(NodeConfig {
-        secret_key: data.identity.secret_key().clone(),
-        network: Network::Public,
-    })
-    .context("failed to start the Groovy node")?;
 
     application()
         .with_assets(ui::icon::Assets)
@@ -70,7 +66,10 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
             #[cfg(debug_assertions)]
             ui::gallery::init(cx);
             data::init(cx, data);
-            node::init(cx, node, events);
+            // Until onboarding is done, the identity may still change, so the node waits.
+            if onboarded {
+                node::start(cx);
+            }
             quit_when_last_window_closes(cx);
 
             // Failing to open the first window leaves nothing to show, so it stays a hard failure.
