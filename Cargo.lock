@@ -2147,10 +2147,15 @@ version = "0.0.1"
 dependencies = [
  "gpui",
  "gpui_platform",
+ "groovy-core",
  "raw-window-handle",
  "windows 0.61.3",
  "winresource",
 ]
+
+[[package]]
+name = "groovy-core"
+version = "0.0.1"
 
 [[package]]
 name = "half"

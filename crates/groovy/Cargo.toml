@@ -1,0 +1,19 @@
+[package]
+name = "groovy"
+description = "Groovy desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+groovy-core = { path = "../groovy-core" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.61.3", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_SystemInformation"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
