@@ -6,14 +6,17 @@ mod title_bar;
 mod window_frame;
 mod workspace;
 
-use gpui::{App, Application};
+use gpui::App;
+use gpui_platform::application;
 
 use workspace::Workspace;
 
-pub const APP_NAME: &str = "gpui-template";
+/// The package name from `Cargo.toml`, used for the window title, app ID and
+/// desktop entry matching.
+pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    application().run(|cx: &mut App| {
         theme::init(cx);
         quit_when_last_window_closes(cx);
 
@@ -24,7 +27,7 @@ fn main() {
 
 /// Windows already exits when the last window closes; macOS and Linux don't.
 fn quit_when_last_window_closes(cx: &mut App) {
-    cx.on_window_closed(|cx| {
+    cx.on_window_closed(|cx, _window_id| {
         if cx.windows().is_empty() {
             cx.quit();
         }

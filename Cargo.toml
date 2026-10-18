@@ -1,12 +1,15 @@
 [package]
-name = "gpui-template"
-version = "0.1.0"
+name = "groovy"
+version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/danielkosgei/gpui-template"
+repository = "https://github.com/thenewkenya/groovy"
 
 [dependencies]
-gpui = "0.2.2"
+# Pinned to a Zed commit rather than a crates.io release, for the latest GPUI.
+# Bump the rev deliberately; `cargo update -p gpui` will not move it.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

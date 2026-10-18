@@ -63,10 +63,10 @@ fn window_options(cx: &App) -> WindowOptions {
 /// Prefer the desktop's own frame (KDE, wlroots, X11 window managers).
 /// Compositors without xdg-decoration support, like GNOME, fall back to
 /// client-side, which `client_side_decorations` and `TitleBar` handle.
-/// Set `GPUI_TEMPLATE_WINDOW_DECORATIONS=client` to force our own frame, the
+/// Set `GROOVY_WINDOW_DECORATIONS=client` to force our own frame, the
 /// counterpart of Zed's `ZED_WINDOW_DECORATIONS`.
 fn window_decorations() -> WindowDecorations {
-    match std::env::var("GPUI_TEMPLATE_WINDOW_DECORATIONS").as_deref() {
+    match std::env::var("GROOVY_WINDOW_DECORATIONS").as_deref() {
         Ok("client") => WindowDecorations::Client,
         _ => WindowDecorations::Server,
     }
