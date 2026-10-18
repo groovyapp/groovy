@@ -4,6 +4,7 @@
 //! tests can all share it.
 
 mod config;
+pub mod logging;
 mod node;
 mod paths;
 

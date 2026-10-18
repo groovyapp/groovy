@@ -123,6 +123,8 @@ Groovy keeps its config and data in a per-user directory: `~/.local/share/groovy
 GROOVY_DATA_DIR=/tmp/groovy-b cargo run
 ```
 
+Logs go to `logs/` in the data directory (one file per day, the most recent seven kept) and to stderr. Set `RUST_LOG` to change the level, for example `RUST_LOG=debug cargo run`. See [CONTRIBUTING.md](CONTRIBUTING.md#logging) for what must never be logged.
+
 Release builds on Windows run without a console window; debug builds keep one for logs.
 
 ### Test
@@ -161,11 +163,12 @@ This is a Cargo workspace. `groovy-core` holds the UI-free services and must not
 crates/
   groovy-core/           Core services (networking, storage, messaging). No GPUI dependency.
     src/config.rs        Versioned config.toml with unknown keys preserved
+    src/logging.rs       Daily log file, stderr output and panic logging
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point
-      data.rs            Opens the data directory and config at startup
+      data.rs            Opens the data directory and config before startup
       node.rs            Runs the Groovy node and forwards its events to the UI
       theme/             Theme struct and the Gruvbox / One Dark palettes
       title_bar/         Custom titlebar and window controls (Windows and Linux)

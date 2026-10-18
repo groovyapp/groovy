@@ -18,9 +18,14 @@ use workspace::Workspace;
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
 fn main() {
-    application().run(|cx: &mut App| {
+    let data = data::open();
+    let _log_guard =
+        groovy_core::logging::init(&data.dir.logs_dir()).expect("failed to start logging");
+    groovy_core::logging::install_panic_hook();
+
+    application().run(move |cx: &mut App| {
         theme::init(cx);
-        data::init(cx);
+        data::init(cx, data);
         node::init(cx);
         quit_when_last_window_closes(cx);
 
