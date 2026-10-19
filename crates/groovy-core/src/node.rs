@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use futures_util::StreamExt;
@@ -26,6 +26,7 @@ use iroh_blobs::api::remote::GetProgressItem;
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::{GcConfig, ProtectCb, ProtectOutcome};
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
 use iroh_docs::NamespaceId;
@@ -43,12 +44,13 @@ use crate::contacts;
 use crate::db::Database;
 use crate::files;
 use crate::folder_sync;
-use crate::folders::{self, ExportReport, Folder, FolderAccess, FolderEntry};
+use crate::folders::{self, ExportReport, Folder, FolderAccess, FolderEntry, Protected};
 use crate::gated::TrustedOnly;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
 use crate::shares::Share;
+use crate::storage::StorageUsage;
 use crate::transfers::{Transfer, TransferState};
 
 const COMMAND_CAPACITY: usize = 32;
@@ -175,6 +177,9 @@ pub struct NodeConfig {
     /// Where transfers are recorded, so the list survives a restart. `None` keeps
     /// them in memory only.
     pub database: Option<Arc<Database>>,
+    /// How often content nothing references is removed from the blob store. `None` never
+    /// removes it.
+    pub garbage_interval: Option<Duration>,
 }
 
 /// Lifecycle events published by the node.
@@ -278,6 +283,10 @@ enum Command {
         oneshot::Sender<Result<ExportReport, NodeError>>,
     ),
     ListFolders(oneshot::Sender<Result<Vec<Folder>, NodeError>>),
+    DeleteTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
+    ClearCache(oneshot::Sender<Result<(), NodeError>>),
+    StorageUsage(oneshot::Sender<Result<StorageUsage, NodeError>>),
+    SetStorageCap(Option<u64>, oneshot::Sender<Result<(), NodeError>>),
     PauseTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     ResumeTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     CancelTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
@@ -468,14 +477,24 @@ async fn run(
     let gate = config.gate.clone();
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let offers: PendingOffers = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Hashes that shared folders reference. Collection keeps them, so it is refreshed from
+    // the folders, and grows as files are added.
+    let folder_live: Protected = Arc::new(Mutex::new(HashSet::new()));
     let blobs = match &config.blobs {
-        Some(dir) => match FsStore::load(dir).await {
-            Ok(store) => Some(store),
-            Err(error) => {
-                let _ = ready.send(Err(NodeError::Blobs(error.to_string())));
-                return;
+        Some(dir) => {
+            let mut options = iroh_blobs::store::fs::options::Options::new(dir);
+            options.gc = config.garbage_interval.map(|interval| GcConfig {
+                interval,
+                add_protected: Some(protect_folder_content(folder_live.clone())),
+            });
+            match FsStore::load_with_opts(dir.join("blobs.db"), options).await {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    let _ = ready.send(Err(NodeError::Blobs(error.to_string())));
+                    return;
+                }
             }
-        },
+        }
         None => None,
     };
     let receiving = Receiving {
@@ -522,7 +541,18 @@ async fn run(
                         docs: docs.clone(),
                         store: store.clone(),
                         database: database.clone(),
+                        live: folder_live.clone(),
                     };
+                    if config.garbage_interval.is_some() {
+                        let refreshing = state.clone();
+                        let live = folder_live.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                refresh_folder_live(&refreshing, &live).await;
+                                tokio::time::sleep(FOLDER_REFRESH).await;
+                            }
+                        });
+                    }
                     match database.folders() {
                         Ok(saved) => saved.iter().for_each(|folder| state.sync(folder)),
                         Err(error) => warn!(%error, "could not read the shared folders"),
@@ -666,7 +696,10 @@ async fn run(
                     });
                 }
                 Some(Command::RevokeShare(id, reply)) => {
-                    let _ = reply.send(revoke_share(&receiving, id, contacts::now()));
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(revoke_share_and_release(&receiving, id).await);
+                    });
                 }
                 Some(Command::ListShares(reply)) => {
                     let _ = reply.send(list_shares(&receiving));
@@ -749,11 +782,20 @@ async fn run(
                 }
                 Some(Command::AddToFolder(namespace, key, source, reply)) => {
                     let folders = folders.clone();
+                    let live = folder_live.clone();
                     tokio::spawn(async move {
                         let outcome = match folder_state(&folders) {
-                            Ok(state) => folders::add_file(&state.docs, &state.store, namespace, &key, &source)
-                                .await
-                                .map_err(folder_error),
+                            Ok(state) => {
+                                match folders::add_file(&state.docs, &state.store, namespace, &key, &source)
+                                    .await
+                                {
+                                    Ok(hash) => {
+                                        lock_live(&live).insert(hash);
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(folder_error(error)),
+                                }
+                            }
                             Err(error) => Err(error),
                         };
                         let _ = reply.send(outcome);
@@ -802,6 +844,34 @@ async fn run(
                         };
                         let _ = reply.send(outcome);
                     });
+                }
+                Some(Command::DeleteTransfer(id, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(delete_transfer(&receiving, id).await);
+                    });
+                }
+                Some(Command::ClearCache(reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(clear_cache(&receiving).await);
+                    });
+                }
+                Some(Command::StorageUsage(reply)) => {
+                    let receiving = receiving.clone();
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(storage_usage(&receiving, &folders).await);
+                    });
+                }
+                Some(Command::SetStorageCap(cap, reply)) => {
+                    let outcome = match &receiving.database {
+                        Some(database) => database
+                            .set_storage_cap(cap)
+                            .map_err(|error| NodeError::Files(error.to_string())),
+                        None => Err(NodeError::NoDatabase),
+                    };
+                    let _ = reply.send(outcome);
                 }
                 Some(Command::ListFolders(reply)) => {
                     let outcome = match folder_state(&folders) {
@@ -1002,6 +1072,7 @@ struct FolderState {
     docs: Docs,
     store: FsStore,
     database: Arc<Database>,
+    live: Protected,
 }
 
 impl FolderState {
@@ -1013,6 +1084,7 @@ impl FolderState {
                 std::ops::Deref::deref(&self.store).clone(),
                 folder.namespace,
                 dir.clone(),
+                self.live.clone(),
             );
         }
     }
@@ -1027,6 +1099,36 @@ fn folder_state(folders: &Option<FolderState>) -> Result<FolderState, NodeError>
 
 fn folder_error(error: folders::FolderError) -> NodeError {
     NodeError::Folder(error.to_string())
+}
+
+/// How often the hashes shared folders reference are read again.
+const FOLDER_REFRESH: Duration = Duration::from_secs(2);
+
+/// Lets collection keep what shared folders reference. The protection is read at the
+/// start of each collection, so a file is protected from the moment it is in a folder.
+fn protect_folder_content(live: Protected) -> ProtectCb {
+    Arc::new(move |protected: &mut HashSet<Hash>| {
+        protected.extend(lock_live(&live).iter().copied());
+        Box::pin(std::future::ready(ProtectOutcome::Continue))
+    })
+}
+
+fn lock_live(live: &Protected) -> std::sync::MutexGuard<'_, HashSet<Hash>> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Reads every hash the folders reference, and makes that the protected set.
+async fn refresh_folder_live(state: &FolderState, live: &Protected) {
+    let Ok(folders) = state.database.folders() else {
+        return;
+    };
+    let mut hashes = HashSet::new();
+    for folder in folders {
+        if let Ok(entries) = folders::entries(&state.docs, folder.namespace).await {
+            hashes.extend(entries.iter().map(|entry| entry.hash));
+        }
+    }
+    *lock_live(live) = hashes;
 }
 
 /// What `start` hands the node thread: the transfer book, the next free transfer id,
@@ -1072,6 +1174,14 @@ async fn send_files(
     })
     .await
     .map_err(|error| NodeError::Files(error.to_string()))?;
+    store
+        .tags()
+        .set(
+            format!("send-{}", imported.root),
+            HashAndFormat::hash_seq(imported.root),
+        )
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
     let offer = FileOffer {
         names: imported.names,
         root: imported.root,
@@ -1237,9 +1347,10 @@ async fn receive(receiving: &Receiving, id: i64, offer: &FileOffer) -> Result<()
         }
     }
 
+    // Named for the transfer, so deleting the transfer releases the content.
     store
         .tags()
-        .create(content)
+        .set(format!("transfer-{}", id), content)
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
     let saved = match &receiving.downloads {
@@ -1329,6 +1440,14 @@ async fn create_share(
     let imported = files::import(store, &paths, |_, _| {})
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
+    store
+        .tags()
+        .set(
+            format!("share-{}", imported.root),
+            HashAndFormat::hash_seq(imported.root),
+        )
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
     // The root's links are the metadata and every file, all of which the share serves.
     let root_bytes = store
         .blobs()
@@ -1379,6 +1498,107 @@ fn revoke_share(receiving: &Receiving, id: i64, now: i64) -> Result<(), NodeErro
     shared.clear();
     shared.extend(active);
     Ok(())
+}
+
+/// Revokes a share, and releases its tag so its content can be collected.
+async fn revoke_share_and_release(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    let root = receiving
+        .database
+        .as_ref()
+        .and_then(|database| database.shares().ok())
+        .and_then(|shares| shares.into_iter().find(|share| share.id == id))
+        .map(|share| share.root);
+    revoke_share(receiving, id, contacts::now())?;
+    if let (Some(root), Some(store)) = (root, &receiving.store)
+        && let Err(error) = store.tags().delete(format!("share-{root}")).await
+    {
+        warn!(%error, "could not release a share's content");
+    }
+    Ok(())
+}
+
+/// Deletes a transfer from the history, and releases its content. A transfer that is
+/// still moving cannot be deleted; pause or cancel it first.
+async fn delete_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    {
+        let book = lock_book(&receiving.book);
+        let slot = book.get(&id).ok_or(NodeError::UnknownTransfer)?;
+        if matches!(
+            slot.transfer.state,
+            TransferState::Queued | TransferState::Active
+        ) {
+            return Err(NodeError::WrongTransferState("deleted"));
+        }
+    }
+    lock_book(&receiving.book).remove(&id);
+    if let Some(database) = &receiving.database {
+        database
+            .delete_transfer(id)
+            .map_err(|error| NodeError::Files(error.to_string()))?;
+    }
+    if let Some(store) = &receiving.store
+        && let Err(error) = store.tags().delete(format!("transfer-{id}")).await
+    {
+        warn!(%error, "could not release a transfer's content");
+    }
+    Ok(())
+}
+
+/// Deletes the history of every received file, and the tags of files sent, then releases
+/// their content. Folders and shares are not touched, and their files stay.
+async fn clear_cache(receiving: &Receiving) -> Result<(), NodeError> {
+    let finished: Vec<i64> = lock_book(&receiving.book)
+        .values()
+        .filter(|slot| slot.transfer.state == TransferState::Completed)
+        .map(|slot| slot.transfer.id)
+        .collect();
+    for id in finished {
+        delete_transfer(receiving, id).await?;
+    }
+    if let Some(store) = &receiving.store {
+        let mut sent = store
+            .tags()
+            .list_prefix("send-")
+            .await
+            .map_err(|error| NodeError::Files(error.to_string()))?;
+        while let Some(tag) = sent.next().await {
+            let tag = tag.map_err(|error| NodeError::Files(error.to_string()))?;
+            if let Err(error) = store.tags().delete(tag.name.0.clone()).await {
+                warn!(%error, "could not release a sent file");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How much the node holds: what was received, what the folders hold, and the cap.
+async fn storage_usage(
+    receiving: &Receiving,
+    folders: &Option<FolderState>,
+) -> Result<StorageUsage, NodeError> {
+    let received_bytes = lock_book(&receiving.book)
+        .values()
+        .filter(|slot| slot.transfer.state == TransferState::Completed)
+        .map(|slot| slot.transfer.offer.bytes)
+        .sum();
+    let mut folder_bytes = 0;
+    let mut cap_bytes = None;
+    if let (Some(state), Some(database)) = (folders, &receiving.database) {
+        for folder in database.folders().unwrap_or_default() {
+            let entries = folders::entries(&state.docs, folder.namespace)
+                .await
+                .map_err(folder_error)?;
+            folder_bytes += entries.iter().map(|entry| entry.size).sum::<u64>();
+        }
+        cap_bytes = database
+            .storage_cap()
+            .map_err(|error| NodeError::Files(error.to_string()))?;
+    }
+    Ok(StorageUsage {
+        received_bytes,
+        folder_bytes,
+        cap_bytes,
+    })
 }
 
 fn list_shares(receiving: &Receiving) -> Result<Vec<Share>, NodeError> {
@@ -1936,6 +2156,44 @@ impl NodeHandle {
         response.await.map_err(|_| NodeError::Stopped)?
     }
 
+    /// Deletes a transfer from the history. Its content is freed by the next collection,
+    /// unless something else keeps it. A transfer still moving cannot be deleted.
+    pub async fn delete_transfer(&self, id: i64) -> Result<(), NodeError> {
+        self.transfer_command(|reply| Command::DeleteTransfer(id, reply))
+            .await
+    }
+
+    /// Clears the cache: the history of received files and the sent files' tags. Their
+    /// content is freed by the next collection. Folders and shares keep their files.
+    pub async fn clear_cache(&self) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ClearCache(reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// How much the node holds, and the cap the user set.
+    pub async fn storage_usage(&self) -> Result<StorageUsage, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::StorageUsage(reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Sets the cap on how much the node should hold, in bytes. `None` removes it.
+    pub async fn set_storage_cap(&self, cap: Option<u64>) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SetStorageCap(cap, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
     /// Every transfer this node knows, oldest first.
     pub fn transfers(&self) -> Vec<Transfer> {
         lock_book(&self.book)
@@ -2106,6 +2364,7 @@ mod tests {
             blobs: None,
             downloads: None,
             database: None,
+            garbage_interval: None,
         }
     }
 

@@ -82,6 +82,8 @@ Groovy is a layered system. The lower layers come from iroh, and Groovy builds t
 
 Every Groovy node is an iroh **endpoint** identified by an Ed25519 public key. Peers dial each other by that key rather than by IP address, and all traffic is encrypted end to end.
 
+What is stored on this device, such as received files, shared folders and the database, is not encrypted by Groovy. It is protected only by the operating system's disk encryption, so turn that on. See [docs/decisions/0002-encryption-at-rest.md](docs/decisions/0002-encryption-at-rest.md).
+
 ### Privacy properties inherited from iroh
 
 These follow from [iroh's security model](https://docs.iroh.computer/concepts/security-privacy). They are stated here so users can make informed decisions.

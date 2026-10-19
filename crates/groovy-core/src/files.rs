@@ -92,13 +92,10 @@ pub async fn import(
         progress(done as u64 + 1, total);
     }
 
+    // Not tagged here: the caller names the tag that keeps the collection, so it can be
+    // released later. Until then the collection is at risk from garbage collection.
     let root_tag = collection.store(store).await.map_err(store_error)?;
     let root = root_tag.hash();
-    store
-        .tags()
-        .create(root_tag.hash_and_format())
-        .await
-        .map_err(store_error)?;
     drop(temps);
     Ok(Imported {
         root,

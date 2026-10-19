@@ -114,6 +114,15 @@ impl Database {
         })
     }
 
+    /// Deletes a transfer from the history. Its content is released by the next collection,
+    /// unless something else keeps it.
+    pub fn delete_transfer(&self, id: i64) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM transfers WHERE id = ?1", [id])
+                .map(|_| ())
+        })
+    }
+
     /// Every transfer, oldest first.
     pub fn transfers(&self) -> Result<Vec<Transfer>, DbError> {
         let rows = self.with_conn(|conn| {
