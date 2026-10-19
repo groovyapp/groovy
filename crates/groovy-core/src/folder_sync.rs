@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::files;
-use crate::folders::{self, FolderEntry};
+use crate::folders::{self, FolderEntry, Protected};
 
 /// How often the folder is checked for changes from other members.
 const PULL_INTERVAL: Duration = Duration::from_secs(1);
@@ -32,15 +32,21 @@ const PULL_INTERVAL: Duration = Duration::from_secs(1);
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Starts syncing a folder's directory. The task runs until the node stops.
-pub fn spawn(docs: Docs, store: Store, namespace: NamespaceId, dir: PathBuf) {
+pub fn spawn(docs: Docs, store: Store, namespace: NamespaceId, dir: PathBuf, protected: Protected) {
     tokio::spawn(async move {
-        if let Err(error) = run(docs, store, namespace, dir).await {
+        if let Err(error) = run(docs, store, namespace, dir, protected).await {
             warn!(%error, "a shared folder stopped syncing");
         }
     });
 }
 
-async fn run(docs: Docs, store: Store, namespace: NamespaceId, dir: PathBuf) -> Result<(), String> {
+async fn run(
+    docs: Docs,
+    store: Store,
+    namespace: NamespaceId,
+    dir: PathBuf,
+    protected: Protected,
+) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let (tx, mut changes) = mpsc::unbounded_channel::<PathBuf>();
     // The watcher runs on its own thread; its events come back through the channel.
@@ -60,7 +66,7 @@ async fn run(docs: Docs, store: Store, namespace: NamespaceId, dir: PathBuf) -> 
     let mut known: HashMap<String, Hash> = HashMap::new();
     // Start from the state on disk: what is there is pushed, and what is missing is pulled.
     pull(&docs, &store, namespace, &dir, &mut known).await;
-    push_all(&docs, &store, namespace, &dir, &mut known).await;
+    push_all(&docs, &store, namespace, &dir, &mut known, &protected).await;
 
     let mut tick = tokio::time::interval(PULL_INTERVAL);
     loop {
@@ -75,7 +81,7 @@ async fn run(docs: Docs, store: Store, namespace: NamespaceId, dir: PathBuf) -> 
                 while let Ok(more) = changes.try_recv() {
                     paths.push(more);
                 }
-                push_paths(&docs, &store, namespace, &dir, &mut known, paths).await;
+                push_paths(&docs, &store, namespace, &dir, &mut known, &protected, paths).await;
             }
         }
     }
@@ -115,6 +121,7 @@ async fn push_paths(
     namespace: NamespaceId,
     dir: &Path,
     known: &mut HashMap<String, Hash>,
+    protected: &Protected,
     paths: Vec<PathBuf>,
 ) {
     for path in paths {
@@ -130,7 +137,11 @@ async fn push_paths(
                 continue;
             }
             match folders::add_file(docs, store, namespace, &key, &path).await {
-                Ok(()) => {
+                Ok(stored) => {
+                    protected
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(stored);
                     known.insert(key, hash);
                 }
                 Err(error) => warn!(%error, key, "could not share a change"),
@@ -153,10 +164,11 @@ async fn push_all(
     namespace: NamespaceId,
     dir: &Path,
     known: &mut HashMap<String, Hash>,
+    protected: &Protected,
 ) {
     let mut paths = Vec::new();
     collect_files(dir, &mut paths);
-    push_paths(docs, store, namespace, dir, known, paths).await;
+    push_paths(docs, store, namespace, dir, known, protected, paths).await;
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {

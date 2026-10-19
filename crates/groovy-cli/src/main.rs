@@ -21,6 +21,8 @@ const APP_NAME: &str = "groovy";
 
 /// How long to wait for the node to come online before giving up.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often content nothing references is removed from the blob store.
+const GARBAGE_INTERVAL: Duration = Duration::from_secs(60);
 /// How long to wait for the node to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -207,6 +209,7 @@ impl Setup {
             blobs: Some(self.dir.blobs_dir()),
             downloads,
             database: Some(self.database.clone()),
+            garbage_interval: Some(GARBAGE_INTERVAL),
         })
         .context("the node could not start")?;
         let started = tokio::time::timeout(START_TIMEOUT, async {

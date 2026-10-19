@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
-use iroh_blobs::{BlobFormat, Hash, HashAndFormat, api::Store};
+use iroh_blobs::{BlobFormat, Hash, api::Store};
 use iroh_docs::store::Query;
 use iroh_docs::{DocTicket, NamespaceId};
 use rusqlite::params;
@@ -47,6 +47,9 @@ pub struct ExportReport {
     /// Files that are in the folder but not yet downloaded here.
     pub missing: usize,
 }
+
+/// The hashes that shared folders reference. Garbage collection keeps every one of them.
+pub type Protected = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Hash>>>;
 
 /// Errors from shared folders.
 #[derive(Debug, Error)]
@@ -231,7 +234,7 @@ pub async fn add_file(
     namespace: NamespaceId,
     key: &str,
     source: &Path,
-) -> Result<(), FolderError> {
+) -> Result<Hash, FolderError> {
     let key = key_for(key)?;
     let doc = docs
         .open(namespace)
@@ -251,17 +254,12 @@ pub async fn add_file(
         .temp_tag()
         .await
         .map_err(|error| FolderError::Store(error.to_string()))?;
-    // The folder's entry points at this blob, so it is kept while the entry exists.
-    store
-        .tags()
-        .create(HashAndFormat::raw(temp.hash()))
-        .await
-        .map_err(|error| FolderError::Store(error.to_string()))?;
+    // No tag: the folder's entries are what keeps this blob, and garbage collection reads them.
     let author = docs.author_default().await.map_err(replica)?;
     doc.set_hash(author, key.into_bytes(), temp.hash(), size)
         .await
         .map_err(replica)?;
-    Ok(())
+    Ok(temp.hash())
 }
 
 /// Removes the file at `key`. Members see it removed when they sync.

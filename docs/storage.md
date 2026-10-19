@@ -1,6 +1,6 @@
 # Storage model: shared folders and replication
 
-Status: **partly built**. Shared folders (#35) follow this model: a folder is an iroh-docs replica, paths are keys, hashes are values, and deletes are empty entries. Not built yet: conflict copies (the newest entry wins for now), garbage collection and quotas (#38), replication status (#37). The open decisions at the end are answered by the recommendations, which #35 follows.
+Status: **partly built**. Shared folders (#35) follow this model: a folder is an iroh-docs replica, paths are keys, hashes are values, and deletes are empty entries. Garbage collection, the storage cap and clearing the cache (#38) are built, as described below. Not built yet: conflict copies (the newest entry wins for now), and replication status (#37). The open decisions at the end are answered by the recommendations, which #35 follows.
 
 ## What a shared folder is
 
@@ -36,7 +36,7 @@ iroh-blobs deletes content that no tag protects, when garbage collection runs. W
 3. **Each active share** holds a tag on its root and files (#30), until it is stopped.
 4. **Each file the user chose to keep offline** holds a tag, even if it is not in a folder.
 
-Garbage collection runs at an interval, and only removes blobs with no tags. Turning it on is part of #38. Until then nothing is removed, so disk use only grows.
+Garbage collection runs every minute, and removes only blobs that nothing references. A folder's files are referenced by the folder's entries, which are read every two seconds. A file that is downloaded and not yet in that read can be removed in the gap, so a download that finishes just as a collection runs can be lost and fetched again. Clearing the cache releases the received files and the sent files' tags. Folders and shares keep their files.
 
 ## What replication promises
 

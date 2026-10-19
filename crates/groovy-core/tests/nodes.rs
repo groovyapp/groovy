@@ -11,6 +11,7 @@ use groovy_core::{
 };
 use iroh::endpoint::presets::Minimal;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh_blobs::Hash;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -25,6 +26,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         blobs: None,
         downloads: None,
         database: None,
+        garbage_interval: None,
     }
 }
 
@@ -510,14 +512,25 @@ async fn a_contact_that_drops_off_is_unreachable_and_reachable_again_when_it_ret
     assert!(bob_again.shutdown(TIMEOUT));
 }
 
-/// A node with blob storage in `dir`, gated on its own database.
+/// A node with blob storage in `dir`, gated on its own database, and collecting garbage
+/// every 200 ms.
 async fn blob_node(dir: &DataDir, key: SecretKey) -> (NodeHandle, EventStream) {
+    blob_node_collecting(dir, key, Some(Duration::from_millis(200))).await
+}
+
+/// A node with blob storage in `dir`, collecting garbage at `interval`, or never if `None`.
+async fn blob_node_collecting(
+    dir: &DataDir,
+    key: SecretKey,
+    interval: Option<Duration>,
+) -> (NodeHandle, EventStream) {
     let db = Arc::new(Database::open(&dir.database_file()).unwrap());
     let config = NodeConfig {
         gate: Arc::new(ContactGate::new(db)),
         blobs: Some(dir.blobs_dir()),
         downloads: Some(dir.root().join("Downloads")),
         database: Some(Arc::new(Database::open(&dir.database_file()).unwrap())),
+        garbage_interval: interval,
         ..config(key)
     };
     let (handle, mut events) = Node::start(config).expect("node starts");
@@ -1216,8 +1229,9 @@ async fn a_shared_folder_syncs_between_trusted_members() {
     let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
     trust_in(&alice_dir, &bob_key);
     trust_in(&bob_dir, &alice_key);
-    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
-    let (bob, _bob_events) = blob_node(&bob_dir, bob_key).await;
+    // Collection is off here: this test is about sync. Collection is tested on its own.
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key, None).await;
 
     let folder = alice
         .create_folder("photos".into(), None)
@@ -1331,8 +1345,9 @@ async fn an_edit_on_one_device_reaches_another_member() {
     let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
     trust_in(&alice_dir, &bob_key);
     trust_in(&bob_dir, &alice_key);
-    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
-    let (bob, _bob_events) = blob_node(&bob_dir, bob_key).await;
+    // Collection is off here: this test is about sync. Collection is tested on its own.
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key, None).await;
 
     // Alice shares a folder made from a local directory that already has a file in it.
     let alice_folder = tmp.path().join("alice-photos");
@@ -1367,6 +1382,171 @@ async fn an_edit_on_one_device_reaches_another_member() {
     wait_until(|| alice_folder.join("from-bob.txt").is_file()).await;
     std::fs::remove_file(bob_folder.join("from-bob.txt")).unwrap();
     wait_until(|| !alice_folder.join("from-bob.txt").exists()).await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+/// Shares the sample files from `alice` to `bob`, and returns the receiving transfer's id
+/// and the root of its collection, once bob has them.
+async fn share_to(
+    alice: &NodeHandle,
+    bob: &NodeHandle,
+    bob_events: &mut EventStream,
+    paths: Vec<std::path::PathBuf>,
+) -> (i64, Hash) {
+    let shared = alice.create_share(paths).await.expect("the share is made");
+    let transfer = bob.receive_share(shared.ticket).await.expect("bob starts");
+    loop {
+        if let NodeEvent::FileReceived {
+            transfer: id, root, ..
+        } = tokio::time::timeout(TIMEOUT * 4, bob_events.next())
+            .await
+            .expect("bob receives the share")
+            .unwrap()
+        {
+            assert_eq!(id, transfer);
+            return (id, root);
+        }
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_transfer_frees_its_content_once_collected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let (transfer, root) = share_to(&alice, &bob, &mut bob_events, paths).await;
+    let note = bob
+        .list_collection(root)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == "note.txt")
+        .map(|(_, hash)| hash)
+        .unwrap();
+    assert!(bob.read_blob(note).await.unwrap().is_some());
+
+    bob.delete_transfer(transfer)
+        .await
+        .expect("the history entry is deleted");
+    assert!(bob.transfers().is_empty());
+    wait_until_gone(&bob, note).await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+/// Waits until the blob is no longer in the store, or fails after twenty seconds.
+async fn wait_until_gone(node: &NodeHandle, hash: Hash) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while node.read_blob(hash).await.unwrap().is_some() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the content is collected");
+}
+
+#[tokio::test]
+async fn a_file_in_a_shared_folder_survives_collection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice_dir = fresh_dir(&tmp, "alice");
+    let (alice, _alice_events) = blob_node(&alice_dir, SecretKey::generate()).await;
+    let folder = alice.create_folder("keep".into(), None).await.unwrap();
+    let source = tmp.path().join("keep.txt");
+    std::fs::write(&source, b"kept").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "keep.txt".into(), source)
+        .await
+        .unwrap();
+    let hash = alice.folder_entries(folder.namespace).await.unwrap()[0].hash;
+
+    // Several collections run in this time, and the file is still there.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(alice.read_blob(hash).await.unwrap(), Some(b"kept".to_vec()));
+
+    assert!(alice.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn storage_counts_what_is_held_and_warns_near_the_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+
+    let folder = alice.create_folder("docs".into(), None).await.unwrap();
+    let source = tmp.path().join("doc.txt");
+    std::fs::write(&source, b"0123456789").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "doc.txt".into(), source)
+        .await
+        .unwrap();
+    assert_eq!(alice.storage_usage().await.unwrap().folder_bytes, 10);
+
+    let (_, _) = share_to(
+        &alice,
+        &bob,
+        &mut bob_events,
+        write_sample_files(&tmp.path().join("source")),
+    )
+    .await;
+    let usage = bob.storage_usage().await.unwrap();
+    assert_eq!(usage.received_bytes, 17);
+    assert_eq!(usage.cap_bytes, None);
+    assert!(!usage.near_cap());
+
+    // Nine tenths of a cap of 18 is 16.2 bytes, and 17 is past it.
+    bob.set_storage_cap(Some(18)).await.unwrap();
+    assert!(bob.storage_usage().await.unwrap().near_cap());
+    bob.set_storage_cap(None).await.unwrap();
+    assert_eq!(bob.storage_usage().await.unwrap().cap_bytes, None);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn clearing_the_cache_drops_received_history_and_keeps_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+
+    let folder = alice.create_folder("keep".into(), None).await.unwrap();
+    let source = tmp.path().join("keep.txt");
+    std::fs::write(&source, b"kept").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "keep.txt".into(), source)
+        .await
+        .unwrap();
+    let kept = alice.folder_entries(folder.namespace).await.unwrap()[0].hash;
+
+    let (_, root) = share_to(
+        &alice,
+        &bob,
+        &mut bob_events,
+        write_sample_files(&tmp.path().join("source")),
+    )
+    .await;
+    assert_eq!(bob.transfers().len(), 1);
+
+    bob.clear_cache().await.expect("the cache is cleared");
+    assert!(bob.transfers().is_empty());
+    let gone =
+        bob.list_collection(root).await.is_err() || bob.read_blob(root).await.unwrap().is_none();
+    let _ = gone;
+    wait_until_gone(&bob, root).await;
+
+    // Alice's folder keeps its file, and the cache clear does not reach it.
+    assert_eq!(alice.read_blob(kept).await.unwrap(), Some(b"kept".to_vec()));
 
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));

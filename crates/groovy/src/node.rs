@@ -19,6 +19,9 @@ use tracing::{error, info, warn};
 
 use crate::data::AppData;
 
+/// How often content nothing references is removed from the blob store.
+const GARBAGE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How long quitting waits for the node to stop before exiting anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -302,6 +305,7 @@ pub fn start(cx: &mut App) {
         blobs: Some(cx.global::<AppData>().dir.blobs_dir()),
         downloads: groovy_core::files::default_downloads(),
         database: Some(cx.global::<AppData>().database.clone()),
+        garbage_interval: Some(GARBAGE_INTERVAL),
     }) {
         Ok(started) => started,
         Err(error) => {
