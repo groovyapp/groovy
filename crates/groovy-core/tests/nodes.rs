@@ -181,3 +181,19 @@ async fn a_message_over_the_size_limit_closes_the_connection() {
     dialer.close().await;
     assert!(node.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_ticket_copied_from_one_node_lets_another_connect() {
+    let (node_a, _events_a) = start(SecretKey::generate()).await;
+    let (node_b, _events_b) = start(SecretKey::generate()).await;
+
+    // A shares its ticket, and B pastes it.
+    let shared = groovy_core::ticket::encode(&node_a.addr().await.unwrap());
+    let dialled = groovy_core::ticket::parse(&shared, node_b.endpoint_id())
+        .expect("the pasted ticket is accepted");
+    let peer = node_b.connect(dialled).await.expect("B connects to A");
+
+    assert_eq!(peer.endpoint_id, node_a.endpoint_id());
+    assert!(node_a.shutdown(TIMEOUT));
+    assert!(node_b.shutdown(TIMEOUT));
+}

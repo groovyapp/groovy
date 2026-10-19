@@ -15,6 +15,7 @@ use crate::{
     onboarding::{self, Onboarding, OnboardingEvent},
     settings::SettingsScreen,
     theme::{self, ActiveTheme},
+    tickets::TicketPanel,
     title_bar::TitleBar,
     window_frame::{client_side_decorations, set_native_border_color},
 };
@@ -34,6 +35,7 @@ pub struct Workspace {
     /// Shown instead of the shell until onboarding is finished.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     settings: Entity<SettingsScreen>,
+    tickets: Entity<TicketPanel>,
     _appearance_subscription: Subscription,
 }
 
@@ -78,6 +80,7 @@ impl Workspace {
         window.focus(&focus_handle, cx);
 
         let settings = cx.new(|cx| SettingsScreen::new(database.clone(), cx));
+        let tickets = cx.new(TicketPanel::new);
 
         Self {
             current,
@@ -85,6 +88,7 @@ impl Workspace {
             focus_handle,
             onboarding,
             settings,
+            tickets,
             _appearance_subscription,
         }
     }
@@ -230,21 +234,27 @@ impl Workspace {
                     .when(self.current == Screen::Settings, |d| {
                         d.child(self.settings.clone())
                     })
-                    .when(self.current != Screen::Settings, |d| {
-                        d.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.text_muted)
-                                .child(self.current.description()),
-                        )
-                        .child(
-                            div()
-                                .mt_4()
-                                .text_sm()
-                                .text_color(theme.text_muted)
-                                .child("This screen is not built yet."),
-                        )
-                    }),
+                    .when(self.current == Screen::Peers, |d| {
+                        d.child(self.tickets.clone())
+                    })
+                    .when(
+                        !matches!(self.current, Screen::Settings | Screen::Peers),
+                        |d| {
+                            d.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.text_muted)
+                                    .child(self.current.description()),
+                            )
+                            .child(
+                                div()
+                                    .mt_4()
+                                    .text_sm()
+                                    .text_color(theme.text_muted)
+                                    .child("This screen is not built yet."),
+                            )
+                        },
+                    ),
             )
     }
 }

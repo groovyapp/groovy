@@ -8,6 +8,7 @@ mod onboarding;
 mod settings;
 mod settings_profile;
 mod theme;
+mod tickets;
 mod title_bar;
 mod ui;
 mod window_frame;

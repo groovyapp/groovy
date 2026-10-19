@@ -172,6 +172,7 @@ crates/
       ui/                  Component kit (buttons, inputs, dialogs, toasts, menus, icons); see ui/mod.rs
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
     src/protocol.rs      Groovy protocol: handshake, profile exchange, framing (see docs/protocol.md)
+    src/ticket.rs        Tickets: encode, parse (ticket or groovy:// link), QR codes
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point
@@ -183,6 +184,7 @@ crates/
       workspace/         Main window: sidebar, screens (Files, Messages, Peers, Storage, Settings) and the status bar
       onboarding.rs      First-run flow: welcome, display name, endpoint ID, backup note
       settings.rs          Settings screen: profile, appearance, network, identity, storage, advanced
+      tickets.rs           Peers screen panel: this device's ticket as a QR code, and connect by pasting one
       settings_profile.rs  Profile section of Settings: display name and picture
       backup.rs            Identity backup and restore: restore form and Settings section
     build.rs             Embeds the icon in the Windows executable

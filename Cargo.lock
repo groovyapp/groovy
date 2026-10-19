@@ -2893,8 +2893,10 @@ dependencies = [
  "directories",
  "image",
  "iroh",
+ "iroh-tickets",
  "keyring",
  "postcard",
+ "qrcode",
  "rusqlite",
  "serde",
  "tempfile",
@@ -3714,6 +3716,20 @@ dependencies = [
  "url",
  "webpki-roots",
  "ws_stream_wasm",
+]
+
+[[package]]
+name = "iroh-tickets"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da53233419ca36bf521ed45683b7748366f9b233032891eefc2d70567a84ac54"
+dependencies = [
+ "data-encoding",
+ "derive_more",
+ "iroh-base",
+ "n0-error",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
@@ -5862,6 +5878,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
 ]
 
 [[package]]
