@@ -36,6 +36,27 @@ impl SettingsScreen {
         }
     }
 
+    /// Changes how this node finds peers and saves it. The node reads the change the next time Groovy starts.
+    fn set_discovery(
+        &mut self,
+        change: impl FnOnce(&mut groovy_core::Discovery),
+        cx: &mut Context<Self>,
+    ) {
+        let config = {
+            let data = cx.global_mut::<AppData>();
+            change(&mut data.config.discovery);
+            data.config.clone()
+        };
+        let dir: DataDir = cx.global::<AppData>().dir.clone();
+        cx.background_spawn(async move {
+            if let Err(error) = config.save(&dir) {
+                warn!(%error, "could not save the discovery setting");
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Saves the appearance to `config.toml` and applies it straight away.
     fn set_appearance(&mut self, choice: Appearance, cx: &mut Context<Self>) {
         let config = {
@@ -72,6 +93,46 @@ fn section_heading(title: &'static str, detail: &'static str, cx: &App) -> impl 
         .child(div().text_xs().text_color(theme.text_muted).child(detail))
 }
 
+/// A switch for one way of finding peers. Takes effect the next time Groovy starts.
+fn discovery_row(
+    label: &'static str,
+    detail: &'static str,
+    id: &'static str,
+    on: bool,
+    view: Entity<SettingsScreen>,
+    set: fn(&mut groovy_core::Discovery, bool),
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let button = Button::new(id, if on { "On" } else { "Off" })
+        .variant(if on {
+            Variant::Primary
+        } else {
+            Variant::Secondary
+        })
+        .on_click(move |_, cx| {
+            view.update(cx, |screen, cx| {
+                screen.set_discovery(|discovery| set(discovery, !on), cx)
+            })
+        });
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(label))
+                .child(div().text_xs().text_color(theme.text_muted).child(detail)),
+        )
+        .child(button)
+}
+
 fn divider(cx: &App) -> impl IntoElement {
     div().h(px(1.)).w_full().bg(cx.theme().border)
 }
@@ -105,6 +166,7 @@ impl Render for SettingsScreen {
         let view = cx.entity().clone();
         let data = cx.global::<AppData>();
         let current = data.config.appearance;
+        let discovery = data.config.discovery;
         let data_dir: PathBuf = data.dir.root().to_path_buf();
         let logs_dir: PathBuf = data.dir.logs_dir();
         let endpoint_id = data.identity.public_key().to_string();
@@ -169,7 +231,7 @@ impl Render for SettingsScreen {
             .child(divider(cx))
             .child(section_heading(
                 "Network",
-                "How this device reaches peers. Options arrive with the relay and discovery work.",
+                "How this device reaches peers. Discovery changes take effect the next time Groovy starts.",
                 cx,
             ))
             .child(info_row(
@@ -178,10 +240,22 @@ impl Render for SettingsScreen {
                 None::<gpui::Div>,
                 cx,
             ))
-            .child(info_row(
-                "Discovery",
-                "Local network discovery arrives in #22.".to_owned(),
-                None::<gpui::Div>,
+            .child(discovery_row(
+                "Local network",
+                "Find devices on this network without the internet. Announces this device's ID and addresses there.",
+                "settings-local-discovery",
+                discovery.local_network,
+                cx.entity().clone(),
+                |discovery, on| discovery.local_network = on,
+                cx,
+            ))
+            .child(discovery_row(
+                "Internet directory",
+                "Publish this device's ID and addresses to the public DHT, so anyone who knows the ID can find it.",
+                "settings-dht-discovery",
+                discovery.dht,
+                cx.entity().clone(),
+                |discovery, on| discovery.dht = on,
                 cx,
             ))
             .child(divider(cx))

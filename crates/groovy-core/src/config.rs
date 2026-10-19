@@ -54,6 +54,20 @@ pub enum Appearance {
     Dark,
 }
 
+/// How this node finds peers beyond their endpoint ID. Each service reveals
+/// something, so each is opt-in: see the README's privacy section.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Discovery {
+    /// Announce this device on the local network (mDNS), so devices there find it
+    /// without the internet. Reveals the endpoint ID and addresses to that network.
+    #[serde(default)]
+    pub local_network: bool,
+    /// Publish this device's ID and addresses to the public Mainline DHT. Anyone
+    /// who knows the ID can then look up its addresses.
+    #[serde(default)]
+    pub dht: bool,
+}
+
 /// Groovy's settings, as stored in `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -61,6 +75,9 @@ pub struct Config {
     /// Missing from older files, which get the default.
     #[serde(default)]
     pub appearance: Appearance,
+    /// Missing from older files, which get the default: both services off.
+    #[serde(default)]
+    pub discovery: Discovery,
     /// Keys this build does not know about. They are written back unchanged.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -71,6 +88,7 @@ impl Default for Config {
         Self {
             version: CURRENT_VERSION,
             appearance: Appearance::default(),
+            discovery: Discovery::default(),
             unknown: toml::Table::new(),
         }
     }
@@ -169,6 +187,18 @@ mod tests {
             Config::load_or_create(&dir).unwrap().appearance,
             Appearance::Dark
         );
+    }
+
+    #[test]
+    fn discovery_is_off_until_the_user_turns_it_on() {
+        let (_tmp, dir) = data_dir();
+        fs::write(dir.config_file(), "version = 1\n").unwrap();
+
+        let config = Config::load_or_create(&dir).unwrap();
+
+        assert_eq!(config.discovery, Discovery::default());
+        assert!(!config.discovery.local_network);
+        assert!(!config.discovery.dht);
     }
 
     #[test]

@@ -91,6 +91,16 @@ These follow from [iroh's security model](https://docs.iroh.computer/concepts/se
 - **Public relays have no access control.** Any application that knows a public relay's URL can connect to it. n0 does not recommend public relays for production systems.
 - **Tor is supported as a custom transport,** but both endpoints must support the same transport, so both need Tor configured.
 
+### How peers find each other
+
+A peer is found by its endpoint ID through address lookup. Each service below reveals something, so they are set out here, and only the first is on by default:
+
+- **Public address lookup (on).** Groovy publishes this device's ID and addresses to n0's DNS servers, and looks up peers there. n0 can see who looks up whom, and the addresses published.
+- **Local network (off, Settings → Network).** Announces the ID and addresses to devices on the same network (mDNS). Anyone on that network can see them.
+- **Internet directory (off, Settings → Network).** Publishes the ID and addresses to the public Mainline DHT. Anyone who knows the ID can look up its addresses.
+
+Tickets carry the addresses at the time they are made, whatever the settings above.
+
 ## Getting started
 
 ### Prerequisites
