@@ -1,0 +1,64 @@
+# Dependency policy, checked in CI by `cargo deny check`.
+# Run locally with: cargo install cargo-deny && cargo deny check
+
+[advisories]
+# Vulnerabilities fail the check. Add an `ignore` entry with a reason to accept one.
+yanked = "warn"
+# "Unmaintained" is reported for our own dependencies only. Most of the reports
+# come from GPUI's font and D-Bus stack, which we do not control; they are
+# tracked upstream rather than failing every build.
+unmaintained = "workspace"
+
+[licenses]
+# Permissive licences, plus MPL-2.0 (file-level copyleft) and Unicode-3.0.
+# Anything else fails the check until it is reviewed and added here or below.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# Copyleft crates that reach us through GPUI or the Windows and UEFI toolchains.
+# Each needs a decision, recorded here. Remove the entry to fail the check again.
+[[licenses.exceptions]]
+allow = ["GPL-2.0-only"]
+crate = "self_cell"
+# Used by GPUI's text layout (cosmic-text / swash), inside the Zed revision we pin.
+# Undecided: confirm with the maintainer whether a GPL-2.0 dependency is acceptable.
+
+[[licenses.exceptions]]
+allow = ["LGPL-2.1-or-later"]
+crate = "r-efi"
+# Only compiled for UEFI targets, which Groovy does not ship.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Git sources come from the Zed repository we pin GPUI to (see Cargo.toml), and
+# from the forks and patched dependencies that Zed's workspace uses.
+allow-git = [
+    "https://github.com/zed-industries/zed",
+    "https://github.com/zed-industries/font-kit",
+    "https://github.com/zed-industries/wasm_thread",
+    "https://github.com/zed-industries/xim-rs",
+    "https://github.com/gfx-rs/wgpu",
+    "https://github.com/proptest-rs/proptest",
+]

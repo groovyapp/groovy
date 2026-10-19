@@ -11,7 +11,7 @@
 [![CI](https://github.com/thenewkenya/groovy/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/thenewkenya/groovy/actions/workflows/ci.yml)
 [![Status](https://img.shields.io/badge/status-pre--alpha-red?style=flat-square)](#roadmap)
 [![Version](https://img.shields.io/badge/version-0.0.1-blue?style=flat-square)](Cargo.toml)
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/tools/install)
+[![Rust](https://img.shields.io/badge/rust-1.99%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/tools/install)
 [![Edition](https://img.shields.io/badge/edition-2024-orange?style=flat-square)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 [![Built on iroh](https://img.shields.io/badge/built%20on-iroh%201.3-7c3aed?style=flat-square)](https://iroh.computer)
 [![License](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-lightgrey?style=flat-square)](#license)
@@ -95,7 +95,7 @@ These follow from [iroh's security model](https://docs.iroh.computer/concepts/se
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) **1.91 or newer** (the minimum supported version of iroh 1.3 and its protocol crates), with edition 2024 support. Development is done on Rust 1.99.0.
+- [Rust](https://www.rust-lang.org/tools/install) **1.99.0 or newer**, with edition 2024 support. The pinned GPUI needs a recent toolchain: its `gpui_util` crate uses `slice_as_array`, which is not stable on 1.92. CI checks this exact version. iroh 1.3 alone needs only 1.91.
 - Windows or Linux. CI builds both.
 - `git`, because GPUI is pulled from the [Zed repository](https://github.com/zed-industries/zed) at a pinned commit.
 - On Linux, the system libraries listed in [CI](.github/workflows/ci.yml) (ALSA, fontconfig, Wayland, X11/xcb, xkbcommon, Vulkan, OpenSSL, zstd, D-Bus and pkg-config).
