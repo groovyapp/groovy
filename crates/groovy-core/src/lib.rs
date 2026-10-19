@@ -5,6 +5,7 @@
 
 mod avatar;
 pub mod backup;
+pub mod blobs;
 mod config;
 pub mod contacts;
 pub mod db;

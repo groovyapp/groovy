@@ -35,7 +35,7 @@ Hello {
 }
 ```
 
-The avatar itself is not sent in the handshake. Only its hash is. Fetching a picture by hash is part of blob transfer (#26).
+The avatar itself is not sent in the handshake. Only its hash is. A picture is fetched by its hash as a blob (see Blobs).
 
 After a successful handshake, each side emits `PeerConnected` with the other's endpoint ID and profile. The connection stays open until either side closes it, then both emit `PeerDisconnected`.
 
@@ -45,7 +45,7 @@ Before a connection is accepted, the node asks its peer gate whether the remote 
 
 After each successful handshake, the peer is recorded as a contact with trust `pending`. Trust is only changed by the user, through pairing (#20) or a block. A handshake never changes it.
 
-Blob, gossip and docs protocols (#26, #41, #43) must use the same gate before serving anyone.
+Blob, gossip and docs protocols (#41, #43) must use the same gate before serving anyone. Blobs already do (see Blobs).
 
 ## Pairing
 
@@ -71,6 +71,14 @@ An untrusted peer may send only `Pair`. Any other request is refused, and the co
 A trusted contact may be checked for presence with `Request::Ping`. The checking node dials the contact, runs the handshake, sends `Ping` on a new stream, and expects `Reply::Pong`. It then closes the connection, so nothing stays open between checks. A contact that is not trusted by the answering node gets no `Pong`, and the check fails.
 
 The route is read from the connection's selected path: `Direct` if it is a direct path, `Relayed` if it goes through a relay. A contact that does not answer is checked again after a delay that starts at one minute and doubles, up to 15 minutes. Each delay varies by up to a tenth either way, so contacts do not all retry together. When this node's network changes (its address changes), every contact is checked again at once.
+
+## Blobs
+
+Content is transferred with the `iroh-blobs` protocol on its own ALPN, served from the node's blob store in the data directory's `blobs` folder. The store is opened at startup, so content added earlier is still there after a restart.
+
+The same trust check applies before any blob is served. A connection from an endpoint that is not trusted is closed with application code 3, so it receives no content. Blobs are fetched by hash, and a peer can only fetch what it can name.
+
+Each blob added on this device gets a persistent tag, so it is kept across restarts and garbage collection. Garbage collection is not enabled yet. When it is, it will delete only blobs that have no tag, so content added through the node is never removed by it.
 
 ## Not yet specified
 
