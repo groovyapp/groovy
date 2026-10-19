@@ -3,11 +3,13 @@
 use std::time::Duration;
 
 use gpui::{App, AppContext, Global};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use groovy_core::{
-    ContactGate, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, NodeHandle,
-    PeerInfo, PeerProfile, relay_url,
+    ContactGate, Database, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent,
+    NodeHandle, PeerInfo, PeerProfile, Route, Tracker, Trust, relay_url,
 };
 use tracing::{error, info, warn};
 
@@ -42,6 +44,8 @@ pub struct NodeState {
     handle: Option<NodeHandle>,
     /// Pairing requests waiting for the user, oldest first.
     pairings: Vec<PairingRequest>,
+    /// Trusted contacts that answered their last check, and how they are reached.
+    routes: HashMap<EndpointId, Route>,
 }
 
 /// A peer asking to pair, and the code the user compares with theirs.
@@ -62,6 +66,20 @@ impl NodeState {
     /// Pairing requests waiting for the user, oldest first.
     pub fn pairings(&self) -> &[PairingRequest] {
         &self.pairings
+    }
+
+    /// How a trusted contact is reached, if it answered its last check. `None` means
+    /// it is not reachable now.
+    #[expect(dead_code, reason = "shown on the Peers screen (#25)")]
+    pub fn route(&self, peer: &EndpointId) -> Option<Route> {
+        self.routes.get(peer).copied()
+    }
+
+    fn set_route(&mut self, peer: EndpointId, route: Option<Route>) {
+        match route {
+            Some(route) => self.routes.insert(peer, route),
+            None => self.routes.remove(&peer),
+        };
     }
 
     /// The handle for talking to the node, once it has started.
@@ -88,6 +106,49 @@ impl NodeState {
     pub fn relay(&self) -> Option<String> {
         self.addr.as_ref().and_then(relay_url)
     }
+}
+
+/// How often the presence loop wakes to check whether any contact is due.
+const PRESENCE_TICK: Duration = Duration::from_secs(15);
+
+/// Checks trusted contacts for presence on a schedule, and records how each is reached.
+fn spawn_presence(cx: &mut App, handle: NodeHandle, database: Arc<Database>) {
+    cx.spawn(async move |cx| {
+        let mut tracker = Tracker::default();
+        loop {
+            cx.background_executor().timer(PRESENCE_TICK).await;
+
+            let db = database.clone();
+            let contacts = cx
+                .background_executor()
+                .spawn(async move { db.contacts() })
+                .await;
+            let Ok(contacts) = contacts else {
+                continue;
+            };
+            let trusted: Vec<EndpointId> = contacts
+                .iter()
+                .filter(|contact| contact.trust == Trust::Trusted)
+                .map(|contact| contact.endpoint_id)
+                .collect();
+            tracker.retain(&trusted);
+            tracker.track(trusted, Instant::now());
+
+            for peer in tracker.due(Instant::now()) {
+                // On the public network, the ID is enough to find the peer.
+                let result = handle.check_presence(EndpointAddr::from(peer)).await;
+                tracker.record(peer, result.is_ok(), Instant::now());
+                let route = result.ok();
+                cx.update(|cx| {
+                    if cx.has_global::<NodeState>() {
+                        cx.global_mut::<NodeState>().set_route(peer, route);
+                        cx.refresh_windows();
+                    }
+                });
+            }
+        }
+    })
+    .detach();
 }
 
 /// Answers a pairing request. The request is removed at once, and the answer is
@@ -146,6 +207,7 @@ pub fn start(cx: &mut App) {
                 addr: None,
                 handle: None,
                 pairings: Vec::new(),
+                routes: HashMap::new(),
             });
             return;
         }
@@ -156,7 +218,10 @@ pub fn start(cx: &mut App) {
         addr: None,
         handle: Some(handle.clone()),
         pairings: Vec::new(),
+        routes: HashMap::new(),
     });
+
+    spawn_presence(cx, handle.clone(), database.clone());
 
     // Publish the stored profile once it has been read.
     let database = cx.global::<AppData>().database.clone();

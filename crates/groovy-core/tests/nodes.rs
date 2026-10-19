@@ -396,3 +396,63 @@ async fn a_peer_that_asks_too_often_is_declined_without_a_prompt() {
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_trusted_contact_is_reachable_and_an_untrusted_one_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key, carol_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let (alice, _alice_events, _alice_db) =
+        gated_node(&fresh_dir(&tmp, "alice"), alice_key.clone()).await;
+    let (bob, _bob_events, bob_db) = gated_node(&fresh_dir(&tmp, "bob"), bob_key.clone()).await;
+    let (carol, _carol_events, _carol_db) =
+        gated_node(&fresh_dir(&tmp, "carol"), carol_key.clone()).await;
+
+    // Bob trusts Alice, and knows Carol but has not paired with her.
+    bob_db
+        .record_handshake(
+            &groovy_core::PeerInfo {
+                endpoint_id: alice_key.public(),
+                profile: PeerProfile::default(),
+            },
+            0,
+        )
+        .unwrap();
+    bob_db
+        .set_trust(alice_key.public(), Trust::Trusted)
+        .unwrap();
+    bob_db
+        .record_handshake(
+            &groovy_core::PeerInfo {
+                endpoint_id: carol_key.public(),
+                profile: PeerProfile::default(),
+            },
+            0,
+        )
+        .unwrap();
+
+    let bob_addr = bob.addr().await.unwrap();
+    let reached = alice.check_presence(bob_addr.clone()).await;
+    assert_eq!(reached.unwrap(), groovy_core::Route::Direct);
+
+    // Bob has not paired with Carol, so Carol gets no answer either.
+    let refused = carol.check_presence(bob_addr.clone()).await;
+    assert!(
+        refused.is_err(),
+        "Bob answered an untrusted peer: {refused:?}"
+    );
+    let carol_addr = carol.addr().await.unwrap();
+    let untrusted = tokio::time::timeout(TIMEOUT, bob.check_presence(carol_addr)).await;
+    let untrusted = untrusted.expect("the check ends");
+    assert!(
+        untrusted.is_err(),
+        "an untrusted peer got a reply: {untrusted:?}"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+    assert!(carol.shutdown(TIMEOUT));
+}

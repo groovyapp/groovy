@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::pairing::{RateLimiter, verification_code};
+use crate::presence::{Route, route_of};
 use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
 
 const COMMAND_CAPACITY: usize = 32;
@@ -133,6 +134,7 @@ enum Command {
     Connect(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
     RequestPairing(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
     AnswerPairing(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
+    CheckPresence(EndpointAddr, oneshot::Sender<Result<Route, NodeError>>),
 }
 
 /// Pairing requests waiting for this node's user, keyed by the peer that sent them.
@@ -284,6 +286,14 @@ async fn run(
                         );
                     });
                 }
+                Some(Command::CheckPresence(addr, reply)) => {
+                    let endpoint = endpoint.clone();
+                    let profile = profile.clone();
+                    let gate = gate.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(check_presence(&endpoint, addr, &profile, &gate).await);
+                    });
+                }
                 Some(Command::AnswerPairing(peer, accept, reply)) => {
                     let pending = pending.clone();
                     let gate = gate.clone();
@@ -380,6 +390,39 @@ async fn open_peer(
     Ok((connection, peer))
 }
 
+/// Dials a peer by its endpoint ID, pings it, and reports how it is reached.
+/// The connection is closed afterwards, so nothing stays open between checks.
+async fn check_presence(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    profile: &SharedProfile,
+    gate: &Arc<dyn PeerGate>,
+) -> Result<Route, NodeError> {
+    if !gate.may_connect(&addr.id) {
+        return Err(NodeError::Blocked);
+    }
+    let connection = endpoint
+        .connect(addr, protocol::ALPN)
+        .await
+        .map_err(connection_error)?;
+    protocol::handshake_outgoing(&connection, current_profile(profile))
+        .await
+        .map_err(NodeError::Connect)?;
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &Request::Ping)
+        .await
+        .map_err(NodeError::Connect)?;
+    let reply: Reply = protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)?;
+    if reply != Reply::Pong {
+        return Err(NodeError::Connect(ProtocolError::Closed));
+    }
+    let route = route_of(&connection);
+    connection.close(0u32.into(), b"checked");
+    Ok(route)
+}
+
 /// Reports a peer's disconnection once its connection closes.
 fn keep_open(connection: Connection, peer: EndpointId, events: broadcast::Sender<NodeEvent>) {
     tokio::spawn(async move {
@@ -440,6 +483,8 @@ async fn ask_to_pair(
             Ok(())
         }
         Reply::Declined => Err(NodeError::PairingDeclined),
+        // A pairing request is never answered with a pong, so this is a protocol error.
+        Reply::Pong => Err(NodeError::Connect(ProtocolError::Closed)),
     }
 }
 
@@ -465,6 +510,13 @@ impl Inbox {
             }
         };
         match request {
+            Request::Ping => {
+                // Only a trusted peer may ask whether this node is reachable. Anyone
+                // else gets no answer, which the requester sees as an unreachable peer.
+                if self.gate.is_trusted(&peer.endpoint_id) {
+                    reply_and_finish(&mut send, Reply::Pong).await;
+                }
+            }
             Request::Pair => {
                 let id = peer.endpoint_id;
                 if self.gate.is_trusted(&id) {
@@ -602,6 +654,18 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::AnswerPairing(peer, accept, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Checks whether a trusted peer is reachable, and whether directly or through a relay.
+    /// Pass the peer's address, or just its ID on the public network, where
+    /// address lookup finds it. Only trusted peers answer; anyone else is an error.
+    pub async fn check_presence(&self, addr: EndpointAddr) -> Result<Route, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::CheckPresence(addr, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?
