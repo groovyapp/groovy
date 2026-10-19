@@ -101,6 +101,8 @@ A peer is found by its endpoint ID through address lookup. Each service below re
 
 Tickets carry the addresses at the time they are made, whatever the settings above.
 
+To run your own relay, and point Groovy at it, see [docs/relay.md](docs/relay.md).
+
 ## Getting started
 
 ### Prerequisites

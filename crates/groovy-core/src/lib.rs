@@ -19,7 +19,7 @@ pub mod protocol;
 pub mod ticket;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
-pub use config::{Appearance, CURRENT_VERSION, Config, ConfigError, Discovery};
+pub use config::{Appearance, CURRENT_VERSION, Config, ConfigError, Discovery, RelaySetting};
 pub use contacts::{Contact, ContactGate, Trust};
 pub use db::{Database, DbError, SCHEMA_VERSION};
 pub use identity::{Identity, IdentityError, Location};

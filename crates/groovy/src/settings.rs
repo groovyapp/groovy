@@ -7,7 +7,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui::{App, Context, Entity, FontWeight, Window, div, prelude::*, px};
-use groovy_core::{Appearance, DataDir, Database};
+use groovy_core::{Appearance, DataDir, Database, RelaySetting};
 use tracing::warn;
 
 use crate::{
@@ -34,6 +34,23 @@ impl SettingsScreen {
             profile: cx.new(|cx| ProfileEditor::new(database, cx)),
             backup: cx.new(BackupSection::new),
         }
+    }
+
+    /// Changes which relays the node uses and saves it. Takes effect the next time Groovy starts.
+    fn set_relay(&mut self, relay: RelaySetting, cx: &mut Context<Self>) {
+        let config = {
+            let data = cx.global_mut::<AppData>();
+            data.config.relay = relay;
+            data.config.clone()
+        };
+        let dir: DataDir = cx.global::<AppData>().dir.clone();
+        cx.background_spawn(async move {
+            if let Err(error) = config.save(&dir) {
+                warn!(%error, "could not save the relay setting");
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Changes how this node finds peers and saves it. The node reads the change the next time Groovy starts.
@@ -91,6 +108,66 @@ fn section_heading(title: &'static str, detail: &'static str, cx: &App) -> impl 
                 .child(title),
         )
         .child(div().text_xs().text_color(theme.text_muted).child(detail))
+}
+
+/// Which relays are used: n0's public relays, none, or a custom list set in config.toml.
+fn relay_row(relay: &RelaySetting, view: Entity<SettingsScreen>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let (current, detail) = match relay {
+        RelaySetting::Public => (
+            "Public",
+            "n0's public relays help peers connect when a direct connection is not possible.",
+        ),
+        RelaySetting::Disabled => (
+            "Off",
+            "No relays. Peers must be reachable directly, so some connections will fail.",
+        ),
+        RelaySetting::Custom { .. } => (
+            "Custom",
+            "Your own relays, set under [relay] in config.toml. Choosing Public or Off replaces them.",
+        ),
+    };
+    let choose = |label: &'static str, id: &'static str, value: RelaySetting| {
+        let selected = std::mem::discriminant(&value) == std::mem::discriminant(relay);
+        let view = view.clone();
+        Button::new(id, label)
+            .variant(if selected {
+                Variant::Primary
+            } else {
+                Variant::Secondary
+            })
+            .on_click(move |_, cx| {
+                let value = value.clone();
+                view.update(cx, |screen, cx| screen.set_relay(value, cx))
+            })
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(format!("Relays: {current}")))
+                .child(div().text_xs().text_color(theme.text_muted).child(detail)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(choose(
+                    "Public",
+                    "settings-relay-public",
+                    RelaySetting::Public,
+                ))
+                .child(choose("Off", "settings-relay-off", RelaySetting::Disabled)),
+        )
 }
 
 /// A switch for one way of finding peers. Takes effect the next time Groovy starts.
@@ -167,6 +244,7 @@ impl Render for SettingsScreen {
         let data = cx.global::<AppData>();
         let current = data.config.appearance;
         let discovery = data.config.discovery;
+        let relay = data.config.relay.clone();
         let data_dir: PathBuf = data.dir.root().to_path_buf();
         let logs_dir: PathBuf = data.dir.logs_dir();
         let endpoint_id = data.identity.public_key().to_string();
@@ -258,6 +336,7 @@ impl Render for SettingsScreen {
                 |discovery, on| discovery.dht = on,
                 cx,
             ))
+            .child(relay_row(&relay, cx.entity().clone(), cx))
             .child(divider(cx))
             .child(section_heading(
                 "Identity",
