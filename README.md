@@ -216,6 +216,10 @@ scripts/
 .github/workflows/       CI: fmt, clippy and release build on Windows and Linux
 docs/
   decisions/             Architecture decision records (0001: SQLite for local state)
+  benchmarks.md          How to run the benchmarks, and the results
+  storage.md             Storage model: shared folders, replication, garbage collection (proposal)
+  protocol.md            Groovy protocol: handshake, trust, pairing, presence, files, shares
+  relay.md               Running your own relay
 ```
 
 ### Linux desktop entry
