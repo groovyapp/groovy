@@ -52,6 +52,21 @@ impl PeerProfile {
     }
 }
 
+/// The first message on a stream opened after the handshake.
+///
+/// A peer that is not trusted may only send `Pair`. Any other request is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    Pair,
+}
+
+/// The answer to a [`Request::Pair`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reply {
+    Accepted,
+    Declined,
+}
+
 /// A peer we have completed a handshake with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {

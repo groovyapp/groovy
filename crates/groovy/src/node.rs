@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use groovy_core::{
     ContactGate, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, NodeHandle,
-    PeerProfile, relay_url,
+    PeerInfo, PeerProfile, relay_url,
 };
 use tracing::{error, info, warn};
 
@@ -40,6 +40,15 @@ pub struct NodeState {
     addr: Option<EndpointAddr>,
     /// Kept so the UI can publish profile changes to peers.
     handle: Option<NodeHandle>,
+    /// Pairing requests waiting for the user, oldest first.
+    pairings: Vec<PairingRequest>,
+}
+
+/// A peer asking to pair, and the code the user compares with theirs.
+#[derive(Debug, Clone)]
+pub struct PairingRequest {
+    pub peer: PeerInfo,
+    pub code: String,
 }
 
 impl Global for NodeState {}
@@ -48,6 +57,11 @@ impl NodeState {
     /// The node's latest reachable address, once it has been reported.
     pub fn addr(&self) -> Option<&EndpointAddr> {
         self.addr.as_ref()
+    }
+
+    /// Pairing requests waiting for the user, oldest first.
+    pub fn pairings(&self) -> &[PairingRequest] {
+        &self.pairings
     }
 
     /// The handle for talking to the node, once it has started.
@@ -74,6 +88,28 @@ impl NodeState {
     pub fn relay(&self) -> Option<String> {
         self.addr.as_ref().and_then(relay_url)
     }
+}
+
+/// Answers a pairing request. The request is removed at once, and the answer is
+/// sent in the background.
+pub fn answer_pairing(cx: &mut App, peer: EndpointId, accept: bool) {
+    if !cx.has_global::<NodeState>() {
+        return;
+    }
+    let state = cx.global_mut::<NodeState>();
+    state
+        .pairings
+        .retain(|request| request.peer.endpoint_id != peer);
+    let Some(handle) = state.handle.clone() else {
+        return;
+    };
+    cx.refresh_windows();
+    cx.spawn(async move |_| {
+        if let Err(error) = handle.answer_pairing(peer, accept).await {
+            warn!(%error, "could not answer a pairing request");
+        }
+    })
+    .detach();
 }
 
 /// Tells peers about a change to this node's profile. Does nothing if the node is not running.
@@ -109,6 +145,7 @@ pub fn start(cx: &mut App) {
                 endpoint_id,
                 addr: None,
                 handle: None,
+                pairings: Vec::new(),
             });
             return;
         }
@@ -118,6 +155,7 @@ pub fn start(cx: &mut App) {
         endpoint_id,
         addr: None,
         handle: Some(handle.clone()),
+        pairings: Vec::new(),
     });
 
     // Publish the stored profile once it has been read.
@@ -140,6 +178,9 @@ pub fn start(cx: &mut App) {
                     NodeEvent::Started => state.status = NodeStatus::Online,
                     NodeEvent::AddressChanged(addr) => state.addr = Some(addr),
                     NodeEvent::Stopped => state.status = NodeStatus::Offline,
+                    NodeEvent::PairingRequested { peer, code } => {
+                        state.pairings.push(PairingRequest { peer, code });
+                    }
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }

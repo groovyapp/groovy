@@ -248,6 +248,19 @@ impl PeerGate for ContactGate {
             warn!(%error, "could not record a handshake");
         }
     }
+
+    fn is_trusted(&self, peer: &EndpointId) -> bool {
+        self.database
+            .contact(*peer)
+            .map(|contact| contact.is_some_and(|contact| contact.trust == Trust::Trusted))
+            .unwrap_or(false)
+    }
+
+    fn pair(&self, peer: &EndpointId) {
+        if let Err(error) = self.database.set_trust(*peer, Trust::Trusted) {
+            warn!(%error, "could not record a pairing");
+        }
+    }
 }
 
 #[cfg(test)]

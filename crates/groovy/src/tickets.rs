@@ -77,9 +77,15 @@ impl TicketPanel {
             }
         };
 
+        // Both sides show this code, so each can check the other sees the same one.
+        let code = groovy_core::verification_code(&our_id, &addr.id);
         self.busy = true;
-        self.set_status(false, "Connecting…", cx);
-        let connecting = async move { handle.connect(addr).await };
+        self.set_status(
+            false,
+            format!("Waiting for them to accept. Check that they see {code}."),
+            cx,
+        );
+        let connecting = async move { handle.request_pairing(addr).await };
         cx.spawn(async move |this, cx| {
             let result = connecting.await;
             this.update(cx, |panel, cx| panel.finish_connect(result, cx))
@@ -102,7 +108,10 @@ impl TicketPanel {
                     peer.profile.display_name
                 };
                 self.input.update(cx, |input, cx| input.set_text("", cx));
-                self.set_status(false, format!("Connected to {name}."), cx);
+                self.set_status(false, format!("Paired with {name}."), cx);
+            }
+            Err(groovy_core::NodeError::PairingDeclined) => {
+                self.set_status(true, "They declined the pairing.", cx);
             }
             Err(error) => {
                 warn!(%error, "could not connect to a peer");
@@ -268,7 +277,7 @@ impl Render for TicketPanel {
                     .items_center()
                     .child(div().flex_1().child(self.input.clone()))
                     .child(
-                        Button::new("ticket-connect", "Connect")
+                        Button::new("ticket-connect", "Pair")
                             .disabled(!can_connect)
                             .on_click(move |_, cx| view.update(cx, |panel, cx| panel.connect(cx))),
                     ),

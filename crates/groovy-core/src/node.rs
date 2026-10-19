@@ -10,14 +10,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, presets};
+use std::collections::HashMap;
+
+use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr, Watcher};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError};
+use crate::pairing::{RateLimiter, verification_code};
+use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -45,6 +48,10 @@ pub enum NodeError {
     Connect(#[source] ProtocolError),
     #[error("this peer is blocked")]
     Blocked,
+    #[error("the other person declined the pairing")]
+    PairingDeclined,
+    #[error("there is no pairing request from that peer to answer")]
+    NoPendingPairing,
     #[error("the node has stopped")]
     Stopped,
 }
@@ -67,6 +74,10 @@ pub enum Network {
 pub trait PeerGate: Send + Sync + 'static {
     fn may_connect(&self, peer: &EndpointId) -> bool;
     fn handshook(&self, peer: &PeerInfo);
+    /// Whether the user has paired with `peer`. A trusted peer may send any request.
+    fn is_trusted(&self, peer: &EndpointId) -> bool;
+    /// Records that the user has paired with `peer`.
+    fn pair(&self, peer: &EndpointId);
 }
 
 /// A gate that lets every peer in and ignores handshakes.
@@ -78,6 +89,12 @@ impl PeerGate for AllowAll {
     }
 
     fn handshook(&self, _peer: &PeerInfo) {}
+
+    fn is_trusted(&self, _peer: &EndpointId) -> bool {
+        false
+    }
+
+    fn pair(&self, _peer: &EndpointId) {}
 }
 
 /// What a node needs to start.
@@ -102,6 +119,11 @@ pub enum NodeEvent {
     PeerConnected(PeerInfo),
     /// A connection to a peer closed.
     PeerDisconnected(EndpointId),
+    /// A peer asks to pair. The user compares `code` with the peer's and answers.
+    PairingRequested {
+        peer: PeerInfo,
+        code: String,
+    },
     Stopped,
 }
 
@@ -109,7 +131,12 @@ enum Command {
     Ping(oneshot::Sender<()>),
     Addr(oneshot::Sender<EndpointAddr>),
     Connect(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
+    RequestPairing(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
+    AnswerPairing(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
 }
+
+/// Pairing requests waiting for this node's user, keyed by the peer that sent them.
+type Pending = Arc<std::sync::Mutex<HashMap<EndpointId, SendStream>>>;
 
 /// The relay URL the node is reachable through, if it has a home relay.
 pub fn relay_url(addr: &EndpointAddr) -> Option<String> {
@@ -213,13 +240,19 @@ async fn run(
         }
     };
     let gate = config.gate.clone();
+    let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let router = Router::builder(endpoint.clone())
         .accept(
             protocol::ALPN,
             GroovyProtocol {
                 profile: profile.clone(),
-                events: events.clone(),
-                gate: gate.clone(),
+                inbox: Inbox {
+                    own_id: endpoint.id(),
+                    gate: gate.clone(),
+                    events: events.clone(),
+                    pending: pending.clone(),
+                    limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
+                },
             },
         )
         .spawn();
@@ -239,6 +272,36 @@ async fn run(
                 }
                 Some(Command::Addr(reply)) => {
                     let _ = reply.send(endpoint.addr());
+                }
+                Some(Command::RequestPairing(addr, reply)) => {
+                    let endpoint = endpoint.clone();
+                    let profile = profile.clone();
+                    let events = events.clone();
+                    let gate = gate.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(
+                            dial_to_pair(&endpoint, addr, &profile, &events, &gate).await,
+                        );
+                    });
+                }
+                Some(Command::AnswerPairing(peer, accept, reply)) => {
+                    let pending = pending.clone();
+                    let gate = gate.clone();
+                    let taken = pending.lock().ok().and_then(|mut map| map.remove(&peer));
+                    tokio::spawn(async move {
+                        let outcome = match taken {
+                            None => Err(NodeError::NoPendingPairing),
+                            Some(mut send) => {
+                                let answer = if accept { Reply::Accepted } else { Reply::Declined };
+                                reply_and_finish(&mut send, answer).await;
+                                if accept {
+                                    gate.pair(&peer);
+                                }
+                                Ok(())
+                            }
+                        };
+                        let _ = reply.send(outcome);
+                    });
                 }
                 Some(Command::Connect(addr, reply)) => {
                     // Dialing takes a network round trip, so it runs on its own task.
@@ -282,15 +345,18 @@ fn current_profile(profile: &SharedProfile) -> PeerProfile {
         .unwrap_or_default()
 }
 
-/// Dials `addr` and runs the handshake. The connection stays open until the peer
-/// closes it, and a `PeerDisconnected` event follows.
-async fn dial(
+fn connection_error(error: impl std::error::Error + Send + Sync + 'static) -> NodeError {
+    NodeError::Connect(ProtocolError::Connection(Box::new(error)))
+}
+
+/// Dials `addr` and runs the handshake. The connection is returned open.
+async fn open_peer(
     endpoint: &Endpoint,
     addr: EndpointAddr,
     profile: &SharedProfile,
     events: &broadcast::Sender<NodeEvent>,
     gate: &Arc<dyn PeerGate>,
-) -> Result<PeerInfo, NodeError> {
+) -> Result<(Connection, PeerInfo), NodeError> {
     if !gate.may_connect(&addr.id) {
         return Err(NodeError::Blocked);
     }
@@ -303,37 +369,150 @@ async fn dial(
             if error.to_string().contains("known protocol") {
                 NodeError::Connect(ProtocolError::UnsupportedProtocol)
             } else {
-                NodeError::Connect(ProtocolError::Connection(Box::new(error)))
+                connection_error(error)
             }
         })?;
     let peer = protocol::handshake_outgoing(&connection, current_profile(profile))
         .await
         .map_err(NodeError::Connect)?;
     gate.handshook(&peer);
-
     let _ = events.send(NodeEvent::PeerConnected(peer.clone()));
-    let endpoint_id = peer.endpoint_id;
-    let events = events.clone();
+    Ok((connection, peer))
+}
+
+/// Reports a peer's disconnection once its connection closes.
+fn keep_open(connection: Connection, peer: EndpointId, events: broadcast::Sender<NodeEvent>) {
     tokio::spawn(async move {
         connection.closed().await;
-        let _ = events.send(NodeEvent::PeerDisconnected(endpoint_id));
+        let _ = events.send(NodeEvent::PeerDisconnected(peer));
     });
+}
+
+async fn dial(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    profile: &SharedProfile,
+    events: &broadcast::Sender<NodeEvent>,
+    gate: &Arc<dyn PeerGate>,
+) -> Result<PeerInfo, NodeError> {
+    let (connection, peer) = open_peer(endpoint, addr, profile, events, gate).await?;
+    keep_open(connection, peer.endpoint_id, events.clone());
     Ok(peer)
 }
 
-/// Groovy's protocol handler: answers handshakes from peers that dial us.
-///
-/// Trust is not checked yet. Contacts and pairing (#19, #20) will decide which
-/// endpoints may connect, and refuse the others here.
-struct GroovyProtocol {
-    profile: SharedProfile,
-    events: broadcast::Sender<NodeEvent>,
-    gate: Arc<dyn PeerGate>,
+/// Dials a peer, asks it to pair, and waits for its user's answer.
+async fn dial_to_pair(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    profile: &SharedProfile,
+    events: &broadcast::Sender<NodeEvent>,
+    gate: &Arc<dyn PeerGate>,
+) -> Result<PeerInfo, NodeError> {
+    let (connection, peer) = open_peer(endpoint, addr, profile, events, gate).await?;
+    match ask_to_pair(&connection, &peer.endpoint_id, gate).await {
+        Ok(()) => {
+            keep_open(connection, peer.endpoint_id, events.clone());
+            Ok(peer)
+        }
+        Err(error) => {
+            connection.close(0u32.into(), b"pairing");
+            Err(error)
+        }
+    }
 }
 
-impl std::fmt::Debug for GroovyProtocol {
+/// Sends a pairing request on a new stream and records the answer.
+async fn ask_to_pair(
+    connection: &Connection,
+    peer: &EndpointId,
+    gate: &Arc<dyn PeerGate>,
+) -> Result<(), NodeError> {
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &Request::Pair)
+        .await
+        .map_err(NodeError::Connect)?;
+    let reply: Reply = protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)?;
+    match reply {
+        Reply::Accepted => {
+            gate.pair(peer);
+            Ok(())
+        }
+        Reply::Declined => Err(NodeError::PairingDeclined),
+    }
+}
+
+/// Everything a connection needs to answer the requests it receives.
+#[derive(Clone)]
+struct Inbox {
+    own_id: EndpointId,
+    gate: Arc<dyn PeerGate>,
+    events: broadcast::Sender<NodeEvent>,
+    pending: Pending,
+    limiter: Arc<std::sync::Mutex<RateLimiter>>,
+}
+
+impl Inbox {
+    /// Answers one request from `peer`. Only `Pair` exists, and an untrusted
+    /// peer may send nothing else.
+    async fn answer(self, peer: PeerInfo, mut send: SendStream, mut recv: RecvStream) {
+        let request: Request = match protocol::read_message(&mut recv).await {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, "a peer sent a request this node does not understand");
+                return;
+            }
+        };
+        match request {
+            Request::Pair => {
+                let id = peer.endpoint_id;
+                if self.gate.is_trusted(&id) {
+                    // Already paired, so there is nothing to ask.
+                    reply_and_finish(&mut send, Reply::Accepted).await;
+                    return;
+                }
+                let allowed = self
+                    .limiter
+                    .lock()
+                    .map(|mut limiter| limiter.allow(id, Instant::now()))
+                    .unwrap_or(false);
+                if !allowed {
+                    warn!(peer = %id, "a peer asked to pair too often; declining");
+                    reply_and_finish(&mut send, Reply::Declined).await;
+                    return;
+                }
+                let code = verification_code(&self.own_id, &id);
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.insert(id, send);
+                }
+                let _ = self.events.send(NodeEvent::PairingRequested { peer, code });
+            }
+        }
+    }
+}
+
+/// Writes a reply and closes the stream's send side.
+async fn reply_and_finish(send: &mut SendStream, answer: Reply) {
+    if protocol::write_message(send, &answer).await.is_ok() {
+        let _ = send.finish();
+    }
+}
+
+/// Groovy's protocol handler: answers handshakes from peers that dial us, and
+/// the requests they send after it.
+///
+/// A blocked endpoint is refused before the handshake. The other peers may send
+/// requests on new streams, which are answered by [`Inbox`].
+#[derive(Debug)]
+struct GroovyProtocol {
+    profile: SharedProfile,
+    inbox: Inbox,
+}
+
+impl std::fmt::Debug for Inbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GroovyProtocol").finish_non_exhaustive()
+        f.debug_struct("Inbox").finish_non_exhaustive()
     }
 }
 
@@ -342,17 +521,28 @@ const CLOSE_BLOCKED: u32 = 2;
 
 impl ProtocolHandler for GroovyProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        if !self.gate.may_connect(&connection.remote_id()) {
+        let inbox = &self.inbox;
+        if !inbox.gate.may_connect(&connection.remote_id()) {
             connection.close(CLOSE_BLOCKED.into(), b"blocked");
             return Ok(());
         }
         match protocol::handshake_incoming(&connection, current_profile(&self.profile)).await {
             Ok(peer) => {
-                self.gate.handshook(&peer);
+                inbox.gate.handshook(&peer);
                 let endpoint_id = peer.endpoint_id;
-                let _ = self.events.send(NodeEvent::PeerConnected(peer));
-                connection.closed().await;
-                let _ = self.events.send(NodeEvent::PeerDisconnected(endpoint_id));
+                let _ = inbox.events.send(NodeEvent::PeerConnected(peer.clone()));
+                loop {
+                    tokio::select! {
+                        stream = connection.accept_bi() => match stream {
+                            Ok((send, recv)) => {
+                                tokio::spawn(inbox.clone().answer(peer.clone(), send, recv));
+                            }
+                            Err(_) => break,
+                        },
+                        _ = connection.closed() => break,
+                    }
+                }
+                let _ = inbox.events.send(NodeEvent::PeerDisconnected(endpoint_id));
             }
             Err(error) => warn!(%error, "a peer's handshake failed"),
         }
@@ -390,6 +580,28 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Connect(addr, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Asks the peer at `addr` to pair with this node, and waits for its user to answer.
+    /// Returns the peer once it accepts. The verification code both sides show is
+    /// [`verification_code`](crate::verification_code) of the two endpoint IDs.
+    pub async fn request_pairing(&self, addr: EndpointAddr) -> Result<PeerInfo, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::RequestPairing(addr, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Answers a pairing request from `peer`. Accepting makes it trusted on this node.
+    pub async fn answer_pairing(&self, peer: EndpointId, accept: bool) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::AnswerPairing(peer, accept, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?
