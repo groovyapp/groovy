@@ -11,13 +11,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
 };
-use iroh_blobs::{BlobsProtocol, Hash, store::fs::FsStore};
+use iroh_blobs::{BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
@@ -26,9 +27,10 @@ use tracing::{info, warn};
 
 use crate::blobs::TrustedBlobs;
 use crate::config::{Discovery, RelaySetting};
+use crate::files;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
-use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
+use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -66,6 +68,12 @@ pub enum NodeError {
     PairingDeclined,
     #[error("there is no pairing request from that peer to answer")]
     NoPendingPairing,
+    #[error("the other person declined the files")]
+    OfferDeclined,
+    #[error("there are no offered files from that peer to answer")]
+    NoPendingOffer,
+    #[error("sending or receiving the files failed: {0}")]
+    Files(String),
     #[error("the node has stopped")]
     Stopped,
 }
@@ -144,6 +152,22 @@ pub enum NodeEvent {
         peer: PeerInfo,
         code: String,
     },
+    /// A trusted peer offers files. The user accepts or declines them.
+    FileOffered {
+        peer: PeerInfo,
+        offer: FileOffer,
+    },
+    /// Files are being imported to send: `done` of `total` are in the store.
+    ImportProgress {
+        done: u64,
+        total: u64,
+    },
+    /// The files from an accepted offer are now in this node's store.
+    FileReceived {
+        peer: EndpointId,
+        names: Vec<String>,
+        root: Hash,
+    },
     Stopped,
 }
 
@@ -153,13 +177,26 @@ enum Command {
     Connect(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
     RequestPairing(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
     AnswerPairing(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
+    SendFiles(
+        EndpointAddr,
+        Vec<PathBuf>,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
+    AnswerOffer(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
     CheckPresence(EndpointAddr, oneshot::Sender<Result<Route, NodeError>>),
     AddBlob(Vec<u8>, oneshot::Sender<Result<Hash, NodeError>>),
     ReadBlob(Hash, oneshot::Sender<Result<Option<Vec<u8>>, NodeError>>),
+    ListCollection(
+        Hash,
+        oneshot::Sender<Result<Vec<(String, Hash)>, NodeError>>,
+    ),
 }
 
 /// Pairing requests waiting for this node's user, keyed by the peer that sent them.
 type Pending = Arc<std::sync::Mutex<HashMap<EndpointId, SendStream>>>;
+
+/// File offers waiting for this node's user, keyed by the peer that sent them.
+type PendingOffers = Arc<std::sync::Mutex<HashMap<EndpointId, (SendStream, FileOffer)>>>;
 
 /// The relay URL the node is reachable through, if it has a home relay.
 pub fn relay_url(addr: &EndpointAddr) -> Option<String> {
@@ -290,6 +327,7 @@ async fn run(
     };
     let gate = config.gate.clone();
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let offers: PendingOffers = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let blobs = match &config.blobs {
         Some(dir) => match FsStore::load(dir).await {
             Ok(store) => Some(store),
@@ -309,6 +347,7 @@ async fn run(
                 gate: gate.clone(),
                 events: events.clone(),
                 pending: pending.clone(),
+                offers: offers.clone(),
                 limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
             },
         },
@@ -375,6 +414,15 @@ async fn run(
                     };
                     let _ = reply.send(result);
                 }
+                Some(Command::ListCollection(root, reply)) => {
+                    let result = match &blobs {
+                        Some(store) => files::list(store, root)
+                            .await
+                            .map_err(|error| NodeError::Files(error.to_string())),
+                        None => Err(NodeError::BlobsDisabled),
+                    };
+                    let _ = reply.send(result);
+                }
                 Some(Command::CheckPresence(addr, reply)) => {
                     let endpoint = endpoint.clone();
                     let profile = profile.clone();
@@ -397,6 +445,36 @@ async fn run(
                                     gate.pair(&peer);
                                 }
                                 Ok(())
+                            }
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::SendFiles(addr, paths, reply)) => {
+                    let endpoint = endpoint.clone();
+                    let profile = profile.clone();
+                    let events = events.clone();
+                    let gate = gate.clone();
+                    let store = blobs.clone();
+                    tokio::spawn(async move {
+                        let outcome = send_files(
+                            &endpoint, addr, &profile, &events, &gate, store, paths,
+                        )
+                        .await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::AnswerOffer(peer, accept, reply)) => {
+                    let taken = offers.lock().ok().and_then(|mut map| map.remove(&peer));
+                    let endpoint = endpoint.clone();
+                    let events = events.clone();
+                    let store = blobs.clone();
+                    tokio::spawn(async move {
+                        let outcome = match taken {
+                            None => Err(NodeError::NoPendingOffer),
+                            Some((mut send, offer)) => {
+                                answer_offer(&endpoint, &events, store, peer, &mut send, offer, accept)
+                                    .await
                             }
                         };
                         let _ = reply.send(outcome);
@@ -512,6 +590,95 @@ async fn check_presence(
     Ok(route)
 }
 
+/// Imports `paths` into the blob store, offers them to a trusted peer, and waits for
+/// its answer. An accepted offer is fetched by the peer from this node's store.
+async fn send_files(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    profile: &SharedProfile,
+    events: &broadcast::Sender<NodeEvent>,
+    gate: &Arc<dyn PeerGate>,
+    store: Option<FsStore>,
+    paths: Vec<PathBuf>,
+) -> Result<(), NodeError> {
+    let store = store.ok_or(NodeError::BlobsDisabled)?;
+    let progress = events.clone();
+    let imported = files::import(&store, &paths, |done, total| {
+        let _ = progress.send(NodeEvent::ImportProgress { done, total });
+    })
+    .await
+    .map_err(|error| NodeError::Files(error.to_string()))?;
+    let offer = FileOffer {
+        names: imported.names,
+        root: imported.root,
+        files: imported.files,
+        bytes: imported.bytes,
+        from: endpoint.addr(),
+    };
+
+    let (connection, _peer) = open_peer(endpoint, addr, profile, events, gate).await?;
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &Request::Offer(offer))
+        .await
+        .map_err(NodeError::Connect)?;
+    let reply: Reply = protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)?;
+    connection.close(0u32.into(), b"offered");
+    match reply {
+        Reply::Accepted => Ok(()),
+        Reply::Declined => Err(NodeError::OfferDeclined),
+        Reply::Pong => Err(NodeError::Connect(ProtocolError::Closed)),
+    }
+}
+
+/// Answers an offer. On accept, the files are fetched from the sender into this
+/// node's store, verified as they arrive, and then reported as received.
+async fn answer_offer(
+    endpoint: &Endpoint,
+    events: &broadcast::Sender<NodeEvent>,
+    store: Option<FsStore>,
+    peer: EndpointId,
+    send: &mut SendStream,
+    offer: FileOffer,
+    accept: bool,
+) -> Result<(), NodeError> {
+    let store = match (accept, store) {
+        (false, _) => {
+            reply_and_finish(send, Reply::Declined).await;
+            return Ok(());
+        }
+        (true, None) => {
+            reply_and_finish(send, Reply::Declined).await;
+            return Err(NodeError::BlobsDisabled);
+        }
+        (true, Some(store)) => store,
+    };
+    reply_and_finish(send, Reply::Accepted).await;
+
+    let content = HashAndFormat::hash_seq(offer.root);
+    let connection = endpoint
+        .connect(offer.from.clone(), iroh_blobs::ALPN)
+        .await
+        .map_err(connection_error)?;
+    store
+        .remote()
+        .fetch(connection, content)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    store
+        .tags()
+        .create(content)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let _ = events.send(NodeEvent::FileReceived {
+        peer,
+        names: offer.names,
+        root: offer.root,
+    });
+    Ok(())
+}
+
 /// Reports a peer's disconnection once its connection closes.
 fn keep_open(connection: Connection, peer: EndpointId, events: broadcast::Sender<NodeEvent>) {
     tokio::spawn(async move {
@@ -584,12 +751,12 @@ struct Inbox {
     gate: Arc<dyn PeerGate>,
     events: broadcast::Sender<NodeEvent>,
     pending: Pending,
+    offers: PendingOffers,
     limiter: Arc<std::sync::Mutex<RateLimiter>>,
 }
 
 impl Inbox {
-    /// Answers one request from `peer`. Only `Pair` exists, and an untrusted
-    /// peer may send nothing else.
+    /// Answers one request from `peer`. An untrusted peer may send only `Pair`.
     async fn answer(self, peer: PeerInfo, mut send: SendStream, mut recv: RecvStream) {
         let request: Request = match protocol::read_message(&mut recv).await {
             Ok(request) => request,
@@ -628,6 +795,17 @@ impl Inbox {
                     pending.insert(id, send);
                 }
                 let _ = self.events.send(NodeEvent::PairingRequested { peer, code });
+            }
+            Request::Offer(offer) => {
+                let id = peer.endpoint_id;
+                // Only a trusted peer may offer files. Anyone else gets no answer.
+                if !self.gate.is_trusted(&id) {
+                    return;
+                }
+                if let Ok(mut offers) = self.offers.lock() {
+                    offers.insert(id, (send, offer.clone()));
+                }
+                let _ = self.events.send(NodeEvent::FileOffered { peer, offer });
             }
         }
     }
@@ -754,6 +932,42 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::AddBlob(data, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Lists the files in a collection held by this node, with their paths inside it.
+    pub async fn list_collection(&self, root: Hash) -> Result<Vec<(String, Hash)>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ListCollection(root, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Imports `paths` and offers them to a trusted peer. Returns once the peer has
+    /// answered; an accepted offer is then fetched by the peer.
+    pub async fn send_files(
+        &self,
+        addr: EndpointAddr,
+        paths: Vec<PathBuf>,
+    ) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SendFiles(addr, paths, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Accepts or declines files a trusted peer has offered. On accept, returns once
+    /// the files are in this node's store.
+    pub async fn answer_offer(&self, peer: EndpointId, accept: bool) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::AnswerOffer(peer, accept, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

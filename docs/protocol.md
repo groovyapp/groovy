@@ -72,6 +72,21 @@ A trusted contact may be checked for presence with `Request::Ping`. The checking
 
 The route is read from the connection's selected path: `Direct` if it is a direct path, `Relayed` if it goes through a relay. A contact that does not answer is checked again after a delay that starts at one minute and doubles, up to 15 minutes. Each delay varies by up to a tenth either way, so contacts do not all retry together. When this node's network changes (its address changes), every contact is checked again at once.
 
+## Files
+
+A trusted peer may offer files. The sender imports them into its blob store as one collection, and sends an offer on a new stream:
+
+```
+Request::Offer(FileOffer { names, root, files, bytes, from })
+Reply::Accepted | Reply::Declined
+```
+
+`names` are the top-level names the user chose (a file's name, or a folder's), and `root` is the collection's hash. The collection lists every file with its path, such as `photos/sub/b.bin`, so the offer stays small however many files there are. `from` is where the sender can be reached for the blobs.
+
+Only a trusted peer's offer is shown to the user. An untrusted peer's offer gets no answer, and its stream is dropped. When the user accepts, the node answers `Accepted`, then fetches the collection from the sender over the blobs protocol. Every block is checked against its hash as it arrives. Declining answers `Declined`, and nothing is fetched.
+
+Nothing is written to the user's disk by this step. Saving received files to a folder is part of receiving (#28).
+
 ## Blobs
 
 Content is transferred with the `iroh-blobs` protocol on its own ALPN, served from the node's blob store in the data directory's `blobs` folder. The store is opened at startup, so content added earlier is still there after a restart.
@@ -82,4 +97,4 @@ Each blob added on this device gets a persistent tag, so it is kept across resta
 
 ## Not yet specified
 
-Messages after the handshake: presence (#21), file offers and transfers (#27), chat (#41), and groups (#43). Each will get a section here when it is built.
+Messages after the handshake: transfer progress and resumption (#28, #29), chat (#41), and groups (#43). Each will get a section here when it is built.

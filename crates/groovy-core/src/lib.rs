@@ -9,6 +9,7 @@ pub mod blobs;
 mod config;
 pub mod contacts;
 pub mod db;
+pub mod files;
 pub mod identity;
 pub mod logging;
 mod node;

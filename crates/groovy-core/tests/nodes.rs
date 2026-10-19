@@ -602,3 +602,166 @@ async fn a_trusted_peer_fetches_a_blob_and_an_untrusted_one_cannot() {
     carol.close().await;
     assert!(alice.shutdown(TIMEOUT));
 }
+
+/// Records `peer` as a trusted contact in `dir`'s database.
+fn trust_in(dir: &DataDir, peer: &SecretKey) {
+    let db = Database::open(&dir.database_file()).unwrap();
+    db.record_handshake(
+        &groovy_core::PeerInfo {
+            endpoint_id: peer.public(),
+            profile: PeerProfile::default(),
+        },
+        0,
+    )
+    .unwrap();
+    db.set_trust(peer.public(), Trust::Trusted).unwrap();
+}
+
+async fn next_file_offer(events: &mut EventStream) -> groovy_core::protocol::FileOffer {
+    loop {
+        if let NodeEvent::FileOffered { offer, .. } = events.next().await.unwrap() {
+            return offer;
+        }
+    }
+}
+
+async fn next_file_received(events: &mut EventStream) -> NodeEvent {
+    loop {
+        let event = events.next().await.unwrap();
+        if let NodeEvent::FileReceived { .. } = event {
+            return event;
+        }
+    }
+}
+
+/// Writes a folder with a nested file, and a file at the top, under `root`.
+fn write_sample_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::create_dir_all(root.join("photos/sub")).unwrap();
+    std::fs::write(root.join("photos/a.txt"), b"alpha").unwrap();
+    std::fs::write(root.join("photos/sub/b.bin"), b"bravo").unwrap();
+    std::fs::write(root.join("note.txt"), b"charlie").unwrap();
+    vec![root.join("photos"), root.join("note.txt")]
+}
+
+#[tokio::test]
+async fn a_folder_sent_to_a_trusted_peer_arrives_with_its_structure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    let offer = tokio::time::timeout(TIMEOUT, next_file_offer(&mut bob_events))
+        .await
+        .expect("bob is offered the files");
+    assert_eq!(offer.names, ["photos", "note.txt"]);
+    assert_eq!(offer.files, 3);
+
+    bob.answer_offer(alice_key.public(), true)
+        .await
+        .expect("bob accepts");
+    send.await.unwrap().expect("alice's offer is accepted");
+    let received = tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("bob reports the files");
+    assert!(matches!(received, NodeEvent::FileReceived { root, .. } if root == offer.root));
+
+    // The collection keeps each file's path inside the folder it was sent from.
+    let listed = bob.list_collection(offer.root).await.unwrap();
+    let names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["note.txt", "photos/a.txt", "photos/sub/b.bin"]);
+    let mut contents = Vec::new();
+    for (name, hash) in &listed {
+        contents.push((name.clone(), bob.read_blob(*hash).await.unwrap().unwrap()));
+    }
+    assert_eq!(
+        contents,
+        [
+            ("note.txt".to_owned(), b"charlie".to_vec()),
+            ("photos/a.txt".to_owned(), b"alpha".to_vec()),
+            ("photos/sub/b.bin".to_owned(), b"bravo".to_vec()),
+        ]
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_declined_offer_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), false).await.unwrap();
+
+    let outcome = send.await.unwrap();
+    assert!(
+        matches!(outcome, Err(groovy_core::NodeError::OfferDeclined)),
+        "{outcome:?}"
+    );
+    let received = tokio::time::timeout(
+        Duration::from_millis(300),
+        next_file_received(&mut bob_events),
+    )
+    .await;
+    assert!(received.is_err(), "a declined offer was received anyway");
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn an_untrusted_peer_cannot_offer_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bob_key, carol_key) = (SecretKey::generate(), SecretKey::generate());
+    let bob_dir = fresh_dir(&tmp, "bob");
+    let carol_dir = fresh_dir(&tmp, "carol");
+    // Bob has never paired with Carol.
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let (carol, _carol_events) = blob_node(&carol_dir, carol_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let carol = carol.clone();
+        async move { carol.send_files(bob_addr, paths).await }
+    });
+    let offered =
+        tokio::time::timeout(Duration::from_millis(500), next_file_offer(&mut bob_events)).await;
+    assert!(
+        offered.is_err(),
+        "bob was offered files by an untrusted peer"
+    );
+
+    // Bob gives no answer, so Carol gets no Accepted or Declined. Her send fails instead.
+    let outcome = tokio::time::timeout(TIMEOUT, send)
+        .await
+        .expect("carol's send ends")
+        .unwrap();
+    assert!(
+        matches!(outcome, Err(groovy_core::NodeError::Connect(_))),
+        "bob answered an untrusted peer: {outcome:?}"
+    );
+    assert!(carol.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

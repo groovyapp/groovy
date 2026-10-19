@@ -9,8 +9,9 @@
 //! The listener always answers with its version before closing a connection
 //! for a version mismatch, so the dialer can say what went wrong.
 
-use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::{EndpointAddr, EndpointId};
+use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -55,11 +56,31 @@ impl PeerProfile {
 /// The first message on a stream opened after the handshake.
 ///
 /// A peer that is not trusted may only send `Pair`. Any other request is refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Pair,
     /// Asks a trusted peer whether it is reachable. Only trusted peers may send it.
     Ping,
+    /// Offers files to a trusted peer. The peer answers with [`Reply::Accepted`] or
+    /// [`Reply::Declined`] once its user has decided.
+    Offer(FileOffer),
+}
+
+/// What a sender offers: the top-level names being sent, and the collection that
+/// holds them. The full listing is in the collection, so it is fetched only after
+/// the recipient accepts, which keeps this message small however many files there are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOffer {
+    /// The names of the files and folders at the top of the offer.
+    pub names: Vec<String>,
+    /// The root of the collection holding every file.
+    pub root: Hash,
+    /// How many files the collection holds.
+    pub files: u64,
+    /// The total size of those files, in bytes.
+    pub bytes: u64,
+    /// Where the sender can be reached for the blobs.
+    pub from: EndpointAddr,
 }
 
 /// The answer to a [`Request::Pair`].
