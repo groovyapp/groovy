@@ -100,6 +100,10 @@ pub trait PeerGate: Send + Sync + 'static {
     fn is_trusted(&self, peer: &EndpointId) -> bool;
     /// Records that the user has paired with `peer`.
     fn pair(&self, peer: &EndpointId);
+    /// Whether files from `peer` are accepted without asking the user.
+    fn accepts_files_automatically(&self, _peer: &EndpointId) -> bool {
+        false
+    }
 }
 
 /// A gate that lets every peer in and ignores handshakes.
@@ -230,6 +234,7 @@ impl Node {
         let (event_tx, event_rx) = broadcast::channel(EVENT_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
 
+        let weak_commands = command_tx.downgrade();
         let thread = thread::Builder::new()
             .name("groovy-node".into())
             .spawn(move || {
@@ -240,6 +245,7 @@ impl Node {
                     shutdown_rx,
                     event_tx,
                     ready_tx,
+                    weak_commands,
                 ))
             })
             .map_err(NodeError::Spawn)?;
@@ -317,6 +323,8 @@ async fn run(
     shutdown: oneshot::Receiver<()>,
     events: broadcast::Sender<NodeEvent>,
     ready: std_mpsc::SyncSender<Result<(), NodeError>>,
+    // Weak, so the node still stops once every handle is dropped.
+    command_tx: mpsc::WeakSender<Command>,
 ) {
     let endpoint = match bind(&config).await {
         Ok(endpoint) => endpoint,
@@ -348,6 +356,7 @@ async fn run(
                 events: events.clone(),
                 pending: pending.clone(),
                 offers: offers.clone(),
+                commands: command_tx,
                 limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
             },
         },
@@ -477,6 +486,9 @@ async fn run(
                                     .await
                             }
                         };
+                        if let Err(error) = &outcome {
+                            warn!(%error, "could not answer a file offer");
+                        }
                         let _ = reply.send(outcome);
                     });
                 }
@@ -752,6 +764,7 @@ struct Inbox {
     events: broadcast::Sender<NodeEvent>,
     pending: Pending,
     offers: PendingOffers,
+    commands: mpsc::WeakSender<Command>,
     limiter: Arc<std::sync::Mutex<RateLimiter>>,
 }
 
@@ -800,6 +813,18 @@ impl Inbox {
                 let id = peer.endpoint_id;
                 // Only a trusted peer may offer files. Anyone else gets no answer.
                 if !self.gate.is_trusted(&id) {
+                    return;
+                }
+                if self.gate.accepts_files_automatically(&id) {
+                    // The user chose to accept this contact's files, so the offer is
+                    // answered now, and nothing is shown to the user.
+                    if let Ok(mut offers) = self.offers.lock() {
+                        offers.insert(id, (send, offer));
+                    }
+                    if let Some(commands) = self.commands.upgrade() {
+                        let (reply, _) = oneshot::channel();
+                        let _ = commands.send(Command::AnswerOffer(id, true, reply)).await;
+                    }
                     return;
                 }
                 if let Ok(mut offers) = self.offers.lock() {

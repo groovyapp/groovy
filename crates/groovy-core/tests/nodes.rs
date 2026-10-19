@@ -765,3 +765,44 @@ async fn an_untrusted_peer_cannot_offer_files() {
     assert!(carol.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn files_from_a_contact_set_to_auto_accept_arrive_without_asking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    Database::open(&bob_dir.database_file())
+        .unwrap()
+        .set_auto_accept_files(alice_key.public(), true)
+        .unwrap();
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+
+    // Nobody answers the offer, yet the files arrive.
+    let received = tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("the files arrive without an answer");
+    assert!(matches!(received, NodeEvent::FileReceived { .. }));
+    send.await.unwrap().expect("alice is accepted");
+
+    let listed = bob
+        .list_collection(match received {
+            NodeEvent::FileReceived { root, .. } => root,
+            _ => unreachable!(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 3);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

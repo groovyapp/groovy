@@ -85,7 +85,7 @@ Reply::Accepted | Reply::Declined
 
 Only a trusted peer's offer is shown to the user. An untrusted peer's offer gets no answer, and its stream is dropped. When the user accepts, the node answers `Accepted`, then fetches the collection from the sender over the blobs protocol. Every block is checked against its hash as it arrives. Declining answers `Declined`, and nothing is fetched.
 
-Nothing is written to the user's disk by this step. Saving received files to a folder is part of receiving (#28).
+A contact can be set to auto-accept. Its offers are then accepted at once, and the user is not asked. Nothing is written to the user's disk by this step. Saving received files to a folder is part of receiving (#28).
 
 ## Blobs
 

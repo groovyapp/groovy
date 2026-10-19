@@ -206,6 +206,30 @@ impl Database {
     }
 
     /// Whether `id` is blocked.
+    /// Sets whether files from `id` are accepted without asking. Returns `false` if
+    /// there is no such contact.
+    pub fn set_auto_accept_files(&self, id: EndpointId, on: bool) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE contacts SET auto_accept_files = ?2 WHERE endpoint_id = ?1",
+                params![id.as_bytes().as_slice(), on],
+            )
+            .map(|changed| changed > 0)
+        })
+    }
+
+    /// Whether files from `id` are accepted without asking. A peer that is not a contact
+    /// is not auto-accepted.
+    pub fn auto_accepts_files(&self, id: EndpointId) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COALESCE((SELECT auto_accept_files FROM contacts WHERE endpoint_id = ?1), 0)",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+        })
+    }
+
     pub fn is_blocked(&self, id: EndpointId) -> Result<bool, DbError> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -246,6 +270,16 @@ impl PeerGate for ContactGate {
     fn handshook(&self, peer: &PeerInfo) {
         if let Err(error) = self.database.record_handshake(peer, now()) {
             warn!(%error, "could not record a handshake");
+        }
+    }
+
+    fn accepts_files_automatically(&self, peer: &EndpointId) -> bool {
+        match self.database.auto_accepts_files(*peer) {
+            Ok(auto) => auto,
+            Err(error) => {
+                warn!(%error, "could not check a contact's file setting; asking instead");
+                false
+            }
         }
     }
 
