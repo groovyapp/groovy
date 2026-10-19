@@ -10,6 +10,7 @@ repository.workspace = true
 age = { version = "0.11", features = [] }
 blake3 = "1"
 directories = "6"
+iroh-blobs = "0.103"
 data-encoding = "2"
 iroh-mainline-address-lookup = "0.6"
 iroh-mdns-address-lookup = "0.6"

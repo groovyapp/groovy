@@ -212,6 +212,7 @@ pub fn start(cx: &mut App) {
         gate: Arc::new(ContactGate::new(database.clone())),
         discovery: cx.global::<AppData>().config.discovery,
         relay: cx.global::<AppData>().config.relay.clone(),
+        blobs: Some(cx.global::<AppData>().dir.blobs_dir()),
     }) {
         Ok(started) => started,
         Err(error) => {

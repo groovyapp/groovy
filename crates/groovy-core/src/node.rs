@@ -17,12 +17,14 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
 };
+use iroh_blobs::{BlobsProtocol, Hash, store::fs::FsStore};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::blobs::TrustedBlobs;
 use crate::config::{Discovery, RelaySetting};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
@@ -50,6 +52,10 @@ pub enum NodeError {
     Bind(#[source] BindError),
     #[error("invalid bind address")]
     InvalidBindAddress(#[source] InvalidSocketAddr),
+    #[error("blob storage failed: {0}")]
+    Blobs(String),
+    #[error("blob storage is turned off for this node")]
+    BlobsDisabled,
     #[error("the relay setting is invalid: {0}")]
     InvalidRelay(String),
     #[error("the peer could not be reached")]
@@ -119,6 +125,8 @@ pub struct NodeConfig {
     pub discovery: Discovery,
     /// Which relays to use. Used on the public network.
     pub relay: RelaySetting,
+    /// Where blobs are stored. `None` turns blob storage off.
+    pub blobs: Option<std::path::PathBuf>,
 }
 
 /// Lifecycle events published by the node.
@@ -146,6 +154,8 @@ enum Command {
     RequestPairing(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
     AnswerPairing(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
     CheckPresence(EndpointAddr, oneshot::Sender<Result<Route, NodeError>>),
+    AddBlob(Vec<u8>, oneshot::Sender<Result<Hash, NodeError>>),
+    ReadBlob(Hash, oneshot::Sender<Result<Option<Vec<u8>>, NodeError>>),
 }
 
 /// Pairing requests waiting for this node's user, keyed by the peer that sent them.
@@ -280,21 +290,34 @@ async fn run(
     };
     let gate = config.gate.clone();
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let router = Router::builder(endpoint.clone())
-        .accept(
-            protocol::ALPN,
-            GroovyProtocol {
-                profile: profile.clone(),
-                inbox: Inbox {
-                    own_id: endpoint.id(),
-                    gate: gate.clone(),
-                    events: events.clone(),
-                    pending: pending.clone(),
-                    limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
-                },
+    let blobs = match &config.blobs {
+        Some(dir) => match FsStore::load(dir).await {
+            Ok(store) => Some(store),
+            Err(error) => {
+                let _ = ready.send(Err(NodeError::Blobs(error.to_string())));
+                return;
+            }
+        },
+        None => None,
+    };
+    let mut router = Router::builder(endpoint.clone()).accept(
+        protocol::ALPN,
+        GroovyProtocol {
+            profile: profile.clone(),
+            inbox: Inbox {
+                own_id: endpoint.id(),
+                gate: gate.clone(),
+                events: events.clone(),
+                pending: pending.clone(),
+                limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
             },
-        )
-        .spawn();
+        },
+    );
+    if let Some(store) = &blobs {
+        let served = TrustedBlobs::new(BlobsProtocol::new(store, None), gate.clone());
+        router = router.accept(iroh_blobs::ALPN, served);
+    }
+    let router = router.spawn();
     let mut addresses = endpoint.watch_addr();
 
     info!(endpoint_id = %endpoint.id(), "node started");
@@ -322,6 +345,35 @@ async fn run(
                             dial_to_pair(&endpoint, addr, &profile, &events, &gate).await,
                         );
                     });
+                }
+                Some(Command::AddBlob(data, reply)) => {
+                    let result = match &blobs {
+                        Some(store) => match store.blobs().add_bytes(data).await {
+                            Ok(temp) => {
+                                // A persistent tag keeps the blob across restarts and garbage collection.
+                                let hash = temp.hash;
+                                store
+                                    .tags()
+                                    .create(temp.hash_and_format())
+                                    .await
+                                    .map(|_| hash)
+                                    .map_err(|error| NodeError::Blobs(error.to_string()))
+                            }
+                            Err(error) => Err(NodeError::Blobs(error.to_string())),
+                        },
+                        None => Err(NodeError::BlobsDisabled),
+                    };
+                    let _ = reply.send(result);
+                }
+                Some(Command::ReadBlob(hash, reply)) => {
+                    let result = match &blobs {
+                        Some(store) => match store.blobs().get_bytes(hash).await {
+                            Ok(bytes) => Ok(Some(bytes.to_vec())),
+                            Err(_) => Ok(None),
+                        },
+                        None => Err(NodeError::BlobsDisabled),
+                    };
+                    let _ = reply.send(result);
                 }
                 Some(Command::CheckPresence(addr, reply)) => {
                     let endpoint = endpoint.clone();
@@ -696,6 +748,27 @@ impl NodeHandle {
         response.await.map_err(|_| NodeError::Stopped)?
     }
 
+    /// Adds `data` to this node's blob store, kept by a tag so it survives restarts.
+    /// Returns its hash, which identifies its content.
+    pub async fn add_blob(&self, data: Vec<u8>) -> Result<Hash, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::AddBlob(data, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Reads a blob from this node's store, or `None` if it is not there.
+    pub async fn read_blob(&self, hash: Hash) -> Result<Option<Vec<u8>>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ReadBlob(hash, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
     /// Checks whether a trusted peer is reachable, and whether directly or through a relay.
     /// Pass the peer's address, or just its ID on the public network, where
     /// address lookup finds it. Only trusted peers answer; anyone else is an error.
@@ -803,6 +876,7 @@ mod tests {
             gate: Arc::new(AllowAll),
             discovery: Discovery::default(),
             relay: RelaySetting::Public,
+            blobs: None,
         }
     }
 

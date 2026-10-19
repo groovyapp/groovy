@@ -188,6 +188,7 @@ crates/
     src/contacts.rs      Contacts: known peers, trust, blocking, and the connection gate
     src/pairing.rs       Pairing: verification codes and the request rate limit
     src/presence.rs      Presence: which trusted contacts are reachable, and how often to check
+    src/blobs.rs         Blob store: serves content only to trusted contacts
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point

@@ -22,6 +22,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         gate: Arc::new(AllowAll),
         discovery: groovy_core::Discovery::default(),
         relay: groovy_core::RelaySetting::Public,
+        blobs: None,
     }
 }
 
@@ -505,4 +506,99 @@ async fn a_contact_that_drops_off_is_unreachable_and_reachable_again_when_it_ret
 
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob_again.shutdown(TIMEOUT));
+}
+
+/// A node with blob storage in `dir`, gated on its own database.
+async fn blob_node(dir: &DataDir, key: SecretKey) -> (NodeHandle, EventStream) {
+    let db = Arc::new(Database::open(&dir.database_file()).unwrap());
+    let config = NodeConfig {
+        gate: Arc::new(ContactGate::new(db)),
+        blobs: Some(dir.blobs_dir()),
+        ..config(key)
+    };
+    let (handle, mut events) = Node::start(config).expect("node starts");
+    assert_eq!(events.next().await, Some(NodeEvent::Started));
+    (handle, events)
+}
+
+/// A loopback endpoint with a chosen identity, which asks blobs from other nodes.
+async fn dialer_with(key: SecretKey) -> Endpoint {
+    Endpoint::builder(Minimal)
+        .secret_key(key)
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        .expect("loopback address is valid")
+        .bind()
+        .await
+        .expect("dialer binds")
+}
+
+#[tokio::test]
+async fn a_blob_survives_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = fresh_dir(&tmp, "node");
+    let data = b"hello, durable world".to_vec();
+
+    let (first, _events) = blob_node(&dir, SecretKey::generate()).await;
+    let hash = first.add_blob(data.clone()).await.expect("blob is added");
+    assert!(first.shutdown(TIMEOUT));
+
+    let (second, _events) = blob_node(&dir, SecretKey::generate()).await;
+    let read = second.read_blob(hash).await.expect("the store reopens");
+
+    assert_eq!(read, Some(data));
+    assert!(second.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_trusted_peer_fetches_a_blob_and_an_untrusted_one_cannot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key, carol_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let alice_dir = fresh_dir(&tmp, "alice");
+    {
+        let db = Database::open(&alice_dir.database_file()).unwrap();
+        db.record_handshake(
+            &groovy_core::PeerInfo {
+                endpoint_id: bob_key.public(),
+                profile: PeerProfile::default(),
+            },
+            0,
+        )
+        .unwrap();
+        db.set_trust(bob_key.public(), Trust::Trusted).unwrap();
+    }
+    let (alice, _events) = blob_node(&alice_dir, alice_key).await;
+    let data = b"shared with a contact".to_vec();
+    let hash = alice.add_blob(data.clone()).await.unwrap();
+    let alice_addr = alice.addr().await.unwrap();
+
+    let bob = dialer_with(bob_key).await;
+    let connection = bob
+        .connect(alice_addr.clone(), iroh_blobs::ALPN)
+        .await
+        .expect("bob connects");
+    let fetched = iroh_blobs::get::request::get_blob(connection, hash).await;
+    assert_eq!(
+        fetched.expect("bob is trusted and gets the blob").to_vec(),
+        data
+    );
+
+    let carol = dialer_with(carol_key).await;
+    let refused = carol.connect(alice_addr, iroh_blobs::ALPN).await;
+    let refused_fetch = match refused {
+        Err(_) => true,
+        Ok(connection) => iroh_blobs::get::request::get_blob(connection, hash)
+            .await
+            .is_err(),
+    };
+    assert!(refused_fetch, "an untrusted peer got a blob");
+
+    bob.close().await;
+    carol.close().await;
+    assert!(alice.shutdown(TIMEOUT));
 }
