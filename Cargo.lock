@@ -2890,10 +2890,10 @@ version = "0.0.1"
 dependencies = [
  "age",
  "blake3",
+ "data-encoding",
  "directories",
  "image",
  "iroh",
- "iroh-tickets",
  "keyring",
  "postcard",
  "qrcode",
@@ -3716,20 +3716,6 @@ dependencies = [
  "url",
  "webpki-roots",
  "ws_stream_wasm",
-]
-
-[[package]]
-name = "iroh-tickets"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da53233419ca36bf521ed45683b7748366f9b233032891eefc2d70567a84ac54"
-dependencies = [
- "data-encoding",
- "derive_more",
- "iroh-base",
- "n0-error",
- "postcard",
- "serde",
 ]
 
 [[package]]

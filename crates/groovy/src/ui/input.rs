@@ -2,7 +2,9 @@
 //!
 //! Multiline editing (the chat composer) is not part of this component yet.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     ElementInputHandler, EntityInputHandler, EventEmitter, FocusHandle, KeyBinding, TextRun,
@@ -48,6 +50,8 @@ pub struct TextInput {
     placeholder: SharedString,
     /// Shows each character as a dot, for passphrases.
     masked: bool,
+    /// The field's width, measured while painting. Used to keep the caret in view.
+    view_width: Rc<Cell<Pixels>>,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -60,6 +64,7 @@ impl TextInput {
             cursor: 0,
             placeholder: placeholder.into(),
             masked: false,
+            view_width: Rc::new(Cell::new(px(0.))),
         }
     }
 
@@ -288,6 +293,7 @@ impl Render for TextInput {
             self.cursor
         };
         let color = if empty { theme.text_muted } else { theme.text };
+        let view_width = self.view_width.clone();
 
         // Where the caret sits: shape the same text the user sees and ask for the x position.
         let caret_x = if empty {
@@ -316,6 +322,11 @@ impl Render for TextInput {
         };
         let caret = theme.text;
 
+        // Text longer than the field scrolls left so the caret stays at the right edge.
+        const PADDING: Pixels = px(8.);
+        let inner_width = (view_width.get() - PADDING * 2.).max(px(0.));
+        let scroll = (caret_x - inner_width + px(2.)).max(px(0.));
+
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -340,14 +351,24 @@ impl Render for TextInput {
             .text_sm()
             .text_color(color)
             .overflow_hidden()
-            .child(display)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .left(PADDING - scroll)
+                    .flex()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .child(display),
+            )
             .when(focused, |d| {
                 d.child(
                     div()
                         .absolute()
                         .top(px(6.))
                         .bottom(px(6.))
-                        .left(px(8.) + caret_x)
+                        .left(PADDING + caret_x - scroll)
                         .w(px(1.))
                         .bg(caret),
                 )
@@ -358,6 +379,7 @@ impl Render for TextInput {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
+                        view_width.set(bounds.size.width);
                         if focus.is_focused(window) {
                             window.handle_input(
                                 &focus,

@@ -1,17 +1,22 @@
-//! Tickets: the text a person shares so a peer can dial them.
+//! Groovy tickets: the text a person shares so a peer can dial them.
 //!
-//! A ticket is an iroh endpoint ticket: the endpoint ID plus the addresses the
-//! node is reachable at when the ticket was made. Peers paste it, or open a
-//! `groovy://` link that contains it.
+//! A ticket is `groovy1` followed by base32 (no padding, lowercase) of a
+//! postcard encoding of the endpoint ID and the addresses the node was
+//! reachable at when the ticket was made. The `1` is the format version. A
+//! `groovy://` link holds the same ticket and opens the app to the peer.
 
 use std::io::Cursor;
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 use image::{ImageFormat, Luma};
-use iroh::{EndpointAddr, EndpointId};
-use iroh_tickets::{ParseError, endpoint::EndpointTicket};
+use iroh::{EndpointAddr, EndpointId, PublicKey, RelayUrl, TransportAddr};
 use qrcode::QrCode;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const PREFIX: &str = "groovy";
+const VERSION: u8 = 1;
 const LINK_PREFIX: &str = "groovy://";
 
 /// Why a pasted ticket cannot be used.
@@ -19,10 +24,12 @@ const LINK_PREFIX: &str = "groovy://";
 pub enum TicketError {
     #[error("paste a ticket first")]
     Empty,
-    #[error(
-        "that is not a Groovy ticket. Tickets start with \"endpoint\" and come from the other person's Groovy."
-    )]
-    Malformed(#[source] ParseError),
+    #[error("that is not a Groovy ticket. Groovy tickets start with \"groovy1\".")]
+    NotATicket,
+    #[error("this ticket is from a newer Groovy (format {0}). Update Groovy to use it.")]
+    UnknownVersion(u8),
+    #[error("this ticket is damaged or was cut short. Copy it again.")]
+    Damaged,
     #[error("that is your own ticket. Give it to someone else, not to yourself.")]
     OwnTicket,
     #[error(
@@ -35,9 +42,40 @@ pub enum TicketError {
     Image(#[source] image::ImageError),
 }
 
+/// The body of a version-1 ticket.
+#[derive(Debug, Serialize, Deserialize)]
+struct TicketV1 {
+    id: [u8; 32],
+    addrs: Vec<WireAddr>,
+}
+
+/// An address as it is written in a ticket. Other transports are not shared.
+#[derive(Debug, Serialize, Deserialize)]
+enum WireAddr {
+    Ip(SocketAddr),
+    Relay(String),
+}
+
 /// The ticket text for `addr`.
 pub fn encode(addr: &EndpointAddr) -> String {
-    EndpointTicket::from(addr.clone()).to_string()
+    let body = TicketV1 {
+        id: *addr.id.as_bytes(),
+        addrs: addr
+            .addrs
+            .iter()
+            .filter_map(|transport| match transport {
+                TransportAddr::Ip(socket) => Some(WireAddr::Ip(*socket)),
+                TransportAddr::Relay(url) => Some(WireAddr::Relay(url.to_string())),
+                _ => None,
+            })
+            .collect(),
+    };
+    // Serializing this plain struct cannot fail, so a failure is a bug.
+    let bytes = postcard::to_allocvec(&body).expect("a ticket always serializes");
+    let mut out = format!("{PREFIX}{VERSION}");
+    data_encoding::BASE32_NOPAD.encode_append(&bytes, &mut out);
+    out.make_ascii_lowercase();
+    out
 }
 
 /// The `groovy://` link for `addr`, which opens the app to the same peer.
@@ -55,8 +93,7 @@ pub fn parse(text: &str, our_id: EndpointId) -> Result<EndpointAddr, TicketError
         .strip_prefix(LINK_PREFIX)
         .unwrap_or(trimmed)
         .trim_end_matches('/');
-    let ticket: EndpointTicket = body.parse().map_err(TicketError::Malformed)?;
-    let addr: EndpointAddr = ticket.into();
+    let addr = decode(body)?;
     if addr.id == our_id {
         return Err(TicketError::OwnTicket);
     }
@@ -64,6 +101,38 @@ pub fn parse(text: &str, our_id: EndpointId) -> Result<EndpointAddr, TicketError
         return Err(TicketError::NoAddresses);
     }
     Ok(addr)
+}
+
+fn decode(text: &str) -> Result<EndpointAddr, TicketError> {
+    let rest = text.strip_prefix(PREFIX).ok_or(TicketError::NotATicket)?;
+    // The version is exactly one digit. Base32 also uses digits, so it cannot be
+    // read as a run of digits.
+    let mut chars = rest.chars();
+    let version = chars
+        .next()
+        .and_then(|ch| ch.to_digit(10))
+        .ok_or(TicketError::NotATicket)? as u8;
+    if version != VERSION {
+        return Err(TicketError::UnknownVersion(version));
+    }
+    let encoded = chars.as_str();
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(encoded.to_ascii_uppercase().as_bytes())
+        .map_err(|_| TicketError::Damaged)?;
+    let body: TicketV1 = postcard::from_bytes(&bytes).map_err(|_| TicketError::Damaged)?;
+
+    let id = PublicKey::from_bytes(&body.id).map_err(|_| TicketError::Damaged)?;
+    let addrs = body
+        .addrs
+        .into_iter()
+        .map(|wire| match wire {
+            WireAddr::Ip(socket) => Ok(TransportAddr::Ip(socket)),
+            WireAddr::Relay(url) => RelayUrl::from_str(&url)
+                .map(TransportAddr::Relay)
+                .map_err(|_| TicketError::Damaged),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EndpointAddr::from_parts(id, addrs))
 }
 
 /// A PNG of `text` as a QR code, at least 256 pixels square.
@@ -79,15 +148,24 @@ pub fn qr_png(text: &str) -> Result<Vec<u8>, TicketError> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
-    use iroh::{SecretKey, TransportAddr};
+    use iroh::SecretKey;
 
     use super::*;
 
-    fn addr_with_socket() -> EndpointAddr {
-        let socket: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    fn socket_addr() -> EndpointAddr {
+        let socket: SocketAddr = "192.168.1.20:4433".parse().unwrap();
         EndpointAddr::from_parts(SecretKey::generate().public(), [TransportAddr::Ip(socket)])
+    }
+
+    fn relay_addr() -> EndpointAddr {
+        let relay = RelayUrl::from_str("https://relay.example.org./").unwrap();
+        EndpointAddr::from_parts(
+            SecretKey::generate().public(),
+            [
+                TransportAddr::Relay(relay),
+                TransportAddr::Ip("10.0.0.2:1234".parse().unwrap()),
+            ],
+        )
     }
 
     fn stranger() -> EndpointId {
@@ -95,8 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn a_ticket_round_trips_to_the_same_peer() {
-        let addr = addr_with_socket();
+    fn tickets_start_with_the_groovy_prefix_and_version() {
+        assert!(encode(&socket_addr()).starts_with("groovy1"));
+    }
+
+    #[test]
+    fn a_ticket_round_trips_with_direct_and_relay_addresses() {
+        let addr = relay_addr();
 
         let parsed = parse(&encode(&addr), stranger()).unwrap();
 
@@ -105,7 +188,7 @@ mod tests {
 
     #[test]
     fn the_link_form_and_surrounding_whitespace_are_accepted() {
-        let addr = addr_with_socket();
+        let addr = socket_addr();
         let pasted = format!("  {}  \n", share_link(&addr));
 
         assert_eq!(parse(&pasted, stranger()).unwrap(), addr);
@@ -120,13 +203,31 @@ mod tests {
     fn text_that_is_not_a_ticket_is_explained() {
         let err = parse("hello there", stranger()).unwrap_err();
 
-        assert!(matches!(err, TicketError::Malformed(_)), "{err}");
+        assert!(matches!(err, TicketError::NotATicket), "{err}");
         assert!(err.to_string().contains("not a Groovy ticket"), "{err}");
     }
 
     #[test]
+    fn a_ticket_from_a_newer_format_asks_for_an_update() {
+        let err = parse("groovy2abcdefgh", stranger()).unwrap_err();
+
+        assert!(matches!(err, TicketError::UnknownVersion(2)), "{err}");
+        assert!(err.to_string().contains("newer Groovy"), "{err}");
+    }
+
+    #[test]
+    fn a_cut_short_ticket_is_called_damaged() {
+        let full = encode(&socket_addr());
+        let cut = &full[..full.len() - 12];
+
+        let err = parse(cut, stranger()).unwrap_err();
+
+        assert!(matches!(err, TicketError::Damaged), "{err}");
+    }
+
+    #[test]
     fn a_ticket_for_this_node_is_refused() {
-        let addr = addr_with_socket();
+        let addr = socket_addr();
 
         let err = parse(&encode(&addr), addr.id).unwrap_err();
 
@@ -144,7 +245,7 @@ mod tests {
 
     #[test]
     fn the_qr_code_is_a_png() {
-        let png = qr_png(&encode(&addr_with_socket())).unwrap();
+        let png = qr_png(&encode(&socket_addr())).unwrap();
 
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
