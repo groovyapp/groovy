@@ -371,3 +371,82 @@ mod tests {
         assert_eq!(byte_to_utf16(text, 8), 5);
     }
 }
+
+#[cfg(test)]
+mod gpui_tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::{TestAppContext, WindowAppearance};
+
+    use super::{TextInput, TextInputEvent, bind_keys};
+    use crate::theme::{self, ModeOverride};
+
+    fn setup(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(ModeOverride::default());
+            theme::sync_with_appearance(WindowAppearance::Light, cx);
+            bind_keys(cx);
+        });
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_the_text() {
+        let mut cx = TestAppContext::single();
+        setup(&mut cx);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("Name", cx));
+        let focus = input.read_with(cx, |input, _| input.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+
+        cx.simulate_input("Ada");
+        cx.simulate_keystrokes("backspace");
+
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text().to_owned()),
+            "Ad"
+        );
+    }
+
+    #[test]
+    fn enter_submits_and_the_text_is_kept() {
+        let mut cx = TestAppContext::single();
+        setup(&mut cx);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("Name", cx));
+        let submitted = Rc::new(RefCell::new(0));
+        let counter = submitted.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &TextInputEvent, _| {
+                if *event == TextInputEvent::Submitted {
+                    *counter.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        });
+        let focus = input.read_with(cx, |input, _| input.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+
+        cx.simulate_input("Grace");
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(*submitted.borrow(), 1);
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text().to_owned()),
+            "Grace"
+        );
+    }
+
+    #[test]
+    fn masked_input_keeps_the_text_but_hides_it() {
+        let mut cx = TestAppContext::single();
+        setup(&mut cx);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("Passphrase", cx).masked());
+        let focus = input.read_with(cx, |input, _| input.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+
+        cx.simulate_input("secret");
+
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text().to_owned()),
+            "secret"
+        );
+    }
+}

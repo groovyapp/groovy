@@ -21,4 +21,5 @@ windows = { version = "0.61.3", features = ["Wdk_System_SystemServices", "Win32_
 winresource = "0.1"
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
