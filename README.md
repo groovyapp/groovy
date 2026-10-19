@@ -184,6 +184,8 @@ crates/
     src/protocol.rs      Groovy protocol: handshake, profile exchange, framing (see docs/protocol.md)
     src/ticket.rs        Tickets: encode, parse (ticket or groovy:// link), QR codes
     src/contacts.rs      Contacts: known peers, trust, blocking, and the connection gate
+    src/pairing.rs       Pairing: verification codes and the request rate limit
+    src/presence.rs      Presence: which trusted contacts are reachable, and how often to check
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point

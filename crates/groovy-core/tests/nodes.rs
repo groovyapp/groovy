@@ -260,3 +260,200 @@ async fn a_blocked_peer_is_refused_and_an_ordinary_peer_is_recorded() {
     blocked_node.shutdown(TIMEOUT);
     assert!(server.shutdown(TIMEOUT));
 }
+
+/// A node that gates connections on its own database, which the test can read.
+async fn gated_node(dir: &DataDir, key: SecretKey) -> (NodeHandle, EventStream, Arc<Database>) {
+    let db = Arc::new(Database::open(&dir.database_file()).unwrap());
+    let config = NodeConfig {
+        gate: Arc::new(ContactGate::new(db.clone())),
+        ..config(key)
+    };
+    let (handle, mut events) = Node::start(config).expect("node starts");
+    assert_eq!(events.next().await, Some(NodeEvent::Started));
+    (handle, events, db)
+}
+
+fn fresh_dir(tmp: &tempfile::TempDir, name: &str) -> DataDir {
+    let dir = DataDir::at(tmp.path().join(name));
+    dir.create_all().unwrap();
+    dir
+}
+
+async fn next_pairing_request(events: &mut EventStream) -> (groovy_core::PeerInfo, String) {
+    loop {
+        if let NodeEvent::PairingRequested { peer, code } = events.next().await.unwrap() {
+            return (peer, code);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_accepted_pairing_makes_both_sides_trusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice, _alice_events, alice_db) =
+        gated_node(&fresh_dir(&tmp, "alice"), alice_key.clone()).await;
+    let (bob, mut bob_events, bob_db) = gated_node(&fresh_dir(&tmp, "bob"), bob_key.clone()).await;
+
+    let request = tokio::spawn({
+        let alice = alice.clone();
+        let bob_addr = bob.addr().await.unwrap();
+        async move { alice.request_pairing(bob_addr).await }
+    });
+    let (from, code) = next_pairing_request(&mut bob_events).await;
+    assert_eq!(from.endpoint_id, alice_key.public());
+    assert_eq!(
+        code,
+        groovy_core::verification_code(&alice_key.public(), &bob_key.public())
+    );
+
+    bob.answer_pairing(alice_key.public(), true).await.unwrap();
+    let paired = request.await.unwrap().expect("alice is paired");
+
+    assert_eq!(paired.endpoint_id, bob_key.public());
+    assert_eq!(
+        bob_db.contact(alice_key.public()).unwrap().unwrap().trust,
+        Trust::Trusted
+    );
+    assert_eq!(
+        alice_db.contact(bob_key.public()).unwrap().unwrap().trust,
+        Trust::Trusted
+    );
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_declined_pairing_leaves_both_sides_untrusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice, _alice_events, alice_db) =
+        gated_node(&fresh_dir(&tmp, "alice"), alice_key.clone()).await;
+    let (bob, mut bob_events, bob_db) = gated_node(&fresh_dir(&tmp, "bob"), bob_key.clone()).await;
+
+    let request = tokio::spawn({
+        let alice = alice.clone();
+        let bob_addr = bob.addr().await.unwrap();
+        async move { alice.request_pairing(bob_addr).await }
+    });
+    next_pairing_request(&mut bob_events).await;
+    bob.answer_pairing(alice_key.public(), false).await.unwrap();
+
+    let outcome = request.await.unwrap();
+    assert!(
+        matches!(outcome, Err(groovy_core::NodeError::PairingDeclined)),
+        "{outcome:?}"
+    );
+    assert_ne!(
+        bob_db.contact(alice_key.public()).unwrap().map(|c| c.trust),
+        Some(Trust::Trusted)
+    );
+    assert_ne!(
+        alice_db.contact(bob_key.public()).unwrap().map(|c| c.trust),
+        Some(Trust::Trusted)
+    );
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_peer_that_asks_too_often_is_declined_without_a_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice, _alice_events, _alice_db) =
+        gated_node(&fresh_dir(&tmp, "alice"), alice_key.clone()).await;
+    let (bob, mut bob_events, _bob_db) = gated_node(&fresh_dir(&tmp, "bob"), bob_key.clone()).await;
+    let bob_addr = bob.addr().await.unwrap();
+
+    // Three requests are allowed; they wait for Bob's answer.
+    let mut waiting = Vec::new();
+    for _ in 0..3 {
+        let alice = alice.clone();
+        let addr = bob_addr.clone();
+        waiting.push(tokio::spawn(
+            async move { alice.request_pairing(addr).await },
+        ));
+        next_pairing_request(&mut bob_events).await;
+    }
+
+    // The fourth is refused at once, and Bob is not asked.
+    let fourth = tokio::time::timeout(TIMEOUT, alice.request_pairing(bob_addr))
+        .await
+        .expect("the refusal is immediate");
+    assert!(
+        matches!(fourth, Err(groovy_core::NodeError::PairingDeclined)),
+        "{fourth:?}"
+    );
+    let asked = tokio::time::timeout(
+        Duration::from_millis(300),
+        next_pairing_request(&mut bob_events),
+    )
+    .await;
+    assert!(asked.is_err(), "a fourth request reached the user");
+
+    for handle in &waiting {
+        handle.abort();
+    }
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_trusted_contact_is_reachable_and_an_untrusted_one_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key, carol_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let (alice, _alice_events, _alice_db) =
+        gated_node(&fresh_dir(&tmp, "alice"), alice_key.clone()).await;
+    let (bob, _bob_events, bob_db) = gated_node(&fresh_dir(&tmp, "bob"), bob_key.clone()).await;
+    let (carol, _carol_events, _carol_db) =
+        gated_node(&fresh_dir(&tmp, "carol"), carol_key.clone()).await;
+
+    // Bob trusts Alice, and knows Carol but has not paired with her.
+    bob_db
+        .record_handshake(
+            &groovy_core::PeerInfo {
+                endpoint_id: alice_key.public(),
+                profile: PeerProfile::default(),
+            },
+            0,
+        )
+        .unwrap();
+    bob_db
+        .set_trust(alice_key.public(), Trust::Trusted)
+        .unwrap();
+    bob_db
+        .record_handshake(
+            &groovy_core::PeerInfo {
+                endpoint_id: carol_key.public(),
+                profile: PeerProfile::default(),
+            },
+            0,
+        )
+        .unwrap();
+
+    let bob_addr = bob.addr().await.unwrap();
+    let reached = alice.check_presence(bob_addr.clone()).await;
+    assert_eq!(reached.unwrap(), groovy_core::Route::Direct);
+
+    // Bob has not paired with Carol, so Carol gets no answer either.
+    let refused = carol.check_presence(bob_addr.clone()).await;
+    assert!(
+        refused.is_err(),
+        "Bob answered an untrusted peer: {refused:?}"
+    );
+    let carol_addr = carol.addr().await.unwrap();
+    let untrusted = tokio::time::timeout(TIMEOUT, bob.check_presence(carol_addr)).await;
+    let untrusted = untrusted.expect("the check ends");
+    assert!(
+        untrusted.is_err(),
+        "an untrusted peer got a reply: {untrusted:?}"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+    assert!(carol.shutdown(TIMEOUT));
+}

@@ -3,11 +3,13 @@
 use std::time::Duration;
 
 use gpui::{App, AppContext, Global};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use groovy_core::{
-    ContactGate, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, NodeHandle,
-    PeerProfile, relay_url,
+    ContactGate, Database, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent,
+    NodeHandle, PeerInfo, PeerProfile, Route, Tracker, Trust, relay_url,
 };
 use tracing::{error, info, warn};
 
@@ -40,6 +42,17 @@ pub struct NodeState {
     addr: Option<EndpointAddr>,
     /// Kept so the UI can publish profile changes to peers.
     handle: Option<NodeHandle>,
+    /// Pairing requests waiting for the user, oldest first.
+    pairings: Vec<PairingRequest>,
+    /// Trusted contacts that answered their last check, and how they are reached.
+    routes: HashMap<EndpointId, Route>,
+}
+
+/// A peer asking to pair, and the code the user compares with theirs.
+#[derive(Debug, Clone)]
+pub struct PairingRequest {
+    pub peer: PeerInfo,
+    pub code: String,
 }
 
 impl Global for NodeState {}
@@ -48,6 +61,25 @@ impl NodeState {
     /// The node's latest reachable address, once it has been reported.
     pub fn addr(&self) -> Option<&EndpointAddr> {
         self.addr.as_ref()
+    }
+
+    /// Pairing requests waiting for the user, oldest first.
+    pub fn pairings(&self) -> &[PairingRequest] {
+        &self.pairings
+    }
+
+    /// How a trusted contact is reached, if it answered its last check. `None` means
+    /// it is not reachable now.
+    #[expect(dead_code, reason = "shown on the Peers screen (#25)")]
+    pub fn route(&self, peer: &EndpointId) -> Option<Route> {
+        self.routes.get(peer).copied()
+    }
+
+    fn set_route(&mut self, peer: EndpointId, route: Option<Route>) {
+        match route {
+            Some(route) => self.routes.insert(peer, route),
+            None => self.routes.remove(&peer),
+        };
     }
 
     /// The handle for talking to the node, once it has started.
@@ -74,6 +106,71 @@ impl NodeState {
     pub fn relay(&self) -> Option<String> {
         self.addr.as_ref().and_then(relay_url)
     }
+}
+
+/// How often the presence loop wakes to check whether any contact is due.
+const PRESENCE_TICK: Duration = Duration::from_secs(15);
+
+/// Checks trusted contacts for presence on a schedule, and records how each is reached.
+fn spawn_presence(cx: &mut App, handle: NodeHandle, database: Arc<Database>) {
+    cx.spawn(async move |cx| {
+        let mut tracker = Tracker::default();
+        loop {
+            cx.background_executor().timer(PRESENCE_TICK).await;
+
+            let db = database.clone();
+            let contacts = cx
+                .background_executor()
+                .spawn(async move { db.contacts() })
+                .await;
+            let Ok(contacts) = contacts else {
+                continue;
+            };
+            let trusted: Vec<EndpointId> = contacts
+                .iter()
+                .filter(|contact| contact.trust == Trust::Trusted)
+                .map(|contact| contact.endpoint_id)
+                .collect();
+            tracker.retain(&trusted);
+            tracker.track(trusted, Instant::now());
+
+            for peer in tracker.due(Instant::now()) {
+                // On the public network, the ID is enough to find the peer.
+                let result = handle.check_presence(EndpointAddr::from(peer)).await;
+                tracker.record(peer, result.is_ok(), Instant::now());
+                let route = result.ok();
+                cx.update(|cx| {
+                    if cx.has_global::<NodeState>() {
+                        cx.global_mut::<NodeState>().set_route(peer, route);
+                        cx.refresh_windows();
+                    }
+                });
+            }
+        }
+    })
+    .detach();
+}
+
+/// Answers a pairing request. The request is removed at once, and the answer is
+/// sent in the background.
+pub fn answer_pairing(cx: &mut App, peer: EndpointId, accept: bool) {
+    if !cx.has_global::<NodeState>() {
+        return;
+    }
+    let state = cx.global_mut::<NodeState>();
+    state
+        .pairings
+        .retain(|request| request.peer.endpoint_id != peer);
+    let Some(handle) = state.handle.clone() else {
+        return;
+    };
+    cx.refresh_windows();
+    cx.spawn(async move |_| {
+        if let Err(error) = handle.answer_pairing(peer, accept).await {
+            warn!(%error, "could not answer a pairing request");
+        }
+    })
+    .detach();
 }
 
 /// Tells peers about a change to this node's profile. Does nothing if the node is not running.
@@ -110,6 +207,8 @@ pub fn start(cx: &mut App) {
                 endpoint_id,
                 addr: None,
                 handle: None,
+                pairings: Vec::new(),
+                routes: HashMap::new(),
             });
             return;
         }
@@ -119,7 +218,11 @@ pub fn start(cx: &mut App) {
         endpoint_id,
         addr: None,
         handle: Some(handle.clone()),
+        pairings: Vec::new(),
+        routes: HashMap::new(),
     });
+
+    spawn_presence(cx, handle.clone(), database.clone());
 
     // Publish the stored profile once it has been read.
     let database = cx.global::<AppData>().database.clone();
@@ -141,6 +244,9 @@ pub fn start(cx: &mut App) {
                     NodeEvent::Started => state.status = NodeStatus::Online,
                     NodeEvent::AddressChanged(addr) => state.addr = Some(addr),
                     NodeEvent::Stopped => state.status = NodeStatus::Offline,
+                    NodeEvent::PairingRequested { peer, code } => {
+                        state.pairings.push(PairingRequest { peer, code });
+                    }
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }

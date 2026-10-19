@@ -47,6 +47,31 @@ After each successful handshake, the peer is recorded as a contact with trust `p
 
 Blob, gossip and docs protocols (#26, #41, #43) must use the same gate before serving anyone.
 
+## Pairing
+
+After the handshake, either side may open a new bidirectional stream and send a `Request`. Version 0 has one request:
+
+```
+Request::Pair
+Reply::Accepted | Reply::Declined
+```
+
+The requester writes `Pair`, and the answering side replies on the same stream:
+
+- If the requester is already trusted, the answer is `Accepted` at once.
+- If the requester has sent too many pairing requests recently (3 in 60 seconds), the answer is `Declined` at once, and the user is not asked.
+- Otherwise the answering node's user is asked. Their answer is sent as `Accepted` or `Declined`.
+
+Both sides compute the same verification code from the two endpoint IDs, so the users can compare it. The code is six digits, written as `123 456`. An accepting node records the other as trusted, and so does the requester when it receives `Accepted`. A declined pairing changes nothing.
+
+An untrusted peer may send only `Pair`. Any other request is refused, and the connection is closed.
+
+## Presence
+
+A trusted contact may be checked for presence with `Request::Ping`. The checking node dials the contact, runs the handshake, sends `Ping` on a new stream, and expects `Reply::Pong`. It then closes the connection, so nothing stays open between checks. A contact that is not trusted by the answering node gets no `Pong`, and the check fails.
+
+The route is read from the connection's selected path: `Direct` if it is a direct path, `Relayed` if it goes through a relay. A contact that does not answer is checked again after a delay that starts at one minute and doubles, up to 15 minutes.
+
 ## Not yet specified
 
 Messages after the handshake: presence (#21), file offers and transfers (#27), chat (#41), and groups (#43). Each will get a section here when it is built.
