@@ -114,6 +114,104 @@ pub async fn list(store: &Store, root: Hash) -> Result<Vec<(String, Hash)>, File
     Ok(collection.iter().cloned().collect())
 }
 
+/// Writes the files in a stored collection under `dir`, at the paths they have inside
+/// it. Each path is made safe first, so a peer cannot write outside `dir`, and a file
+/// whose name is taken gets a number added. Returns where each file was written.
+pub async fn export(store: &Store, root: Hash, dir: &Path) -> Result<Vec<PathBuf>, FileError> {
+    let mut written = Vec::new();
+    for (name, hash) in list(store, root).await? {
+        let target = unique_path(&dir.join(safe_path(&name)));
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| FileError::Read {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        store
+            .blobs()
+            .export(hash, &target)
+            .await
+            .map_err(store_error)?;
+        written.push(target);
+    }
+    Ok(written)
+}
+
+/// Where received files go by default: a `Groovy` folder in the user's Downloads.
+pub fn default_downloads() -> Option<PathBuf> {
+    directories::UserDirs::new()?
+        .download_dir()
+        .map(|dir| dir.join("Groovy"))
+}
+
+/// Turns a name from a peer into a relative path that stays inside the folder it is
+/// written to. Empty, `.` and `..` parts are dropped, so `../../x` becomes `x`.
+/// Characters that Windows does not allow are replaced, and reserved device names
+/// such as `CON` get an underscore in front.
+pub fn safe_path(name: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for part in name.split(['/', '\\']) {
+        if let Some(clean) = safe_component(part) {
+            path.push(clean);
+        }
+    }
+    if path.as_os_str().is_empty() {
+        path.push("file");
+    }
+    path
+}
+
+fn safe_component(part: &str) -> Option<String> {
+    // Windows ignores trailing dots and spaces, so they are dropped here too.
+    let trimmed = part.trim().trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut clean: String = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_control() || "<>:\"|?*".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let stem = clean.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if is_reserved_device(&stem) {
+        clean.insert(0, '_');
+    }
+    Some(clean)
+}
+
+fn is_reserved_device(stem: &str) -> bool {
+    matches!(stem, "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+}
+
+/// `path` if nothing is there yet, otherwise `name (2).ext`, `name (3).ext` and so on.
+fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let extension = path.extension().and_then(|e| e.to_str());
+    for number in 2u32.. {
+        let name = match extension {
+            Some(ext) => format!("{stem} ({number}).{ext}"),
+            None => format!("{stem} ({number})"),
+        };
+        let candidate = path.with_file_name(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the counter runs out of numbers only after u32::MAX files of one name")
+}
+
 /// Lists every file under `paths`, sorted by path so the same content always
 /// makes the same collection. A folder's files are named under the folder's name.
 /// Symbolic links are skipped, so nothing outside the chosen folders is sent.
@@ -193,4 +291,48 @@ fn top_name(path: &Path) -> Result<String, FileError> {
 
 fn store_error(error: impl std::fmt::Display) -> FileError {
     FileError::Store(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_path;
+    use std::path::PathBuf;
+
+    fn path(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
+    }
+
+    #[test]
+    fn names_that_climb_out_of_the_folder_stay_inside_it() {
+        assert_eq!(safe_path("../../x"), path(&["x"]));
+        assert_eq!(safe_path("a/../../b.txt"), path(&["a", "b.txt"]));
+        assert_eq!(safe_path("/etc/passwd"), path(&["etc", "passwd"]));
+        assert_eq!(safe_path("..\\..\\x"), path(&["x"]));
+        assert_eq!(safe_path("..."), path(&["file"]));
+        assert_eq!(safe_path(""), path(&["file"]));
+    }
+
+    #[test]
+    fn ordinary_paths_are_kept() {
+        assert_eq!(
+            safe_path("photos/sub/b.bin"),
+            path(&["photos", "sub", "b.bin"])
+        );
+    }
+
+    #[test]
+    fn characters_windows_forbids_are_replaced() {
+        assert_eq!(safe_path("a:b?.txt"), path(&["a_b_.txt"]));
+        assert_eq!(safe_path("trailing. "), path(&["trailing"]));
+    }
+
+    #[test]
+    fn reserved_device_names_are_prefixed() {
+        assert_eq!(safe_path("CON.txt"), path(&["_CON.txt"]));
+        assert_eq!(safe_path("com1"), path(&["_com1"]));
+        assert_eq!(safe_path("LPT9.log"), path(&["_LPT9.log"]));
+        // Only COM1 to COM9 and LPT1 to LPT9 are reserved.
+        assert_eq!(safe_path("COM10"), path(&["COM10"]));
+        assert_eq!(safe_path("CONSOLE.txt"), path(&["CONSOLE.txt"]));
+    }
 }

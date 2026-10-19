@@ -23,6 +23,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         discovery: groovy_core::Discovery::default(),
         relay: groovy_core::RelaySetting::Public,
         blobs: None,
+        downloads: None,
     }
 }
 
@@ -514,6 +515,7 @@ async fn blob_node(dir: &DataDir, key: SecretKey) -> (NodeHandle, EventStream) {
     let config = NodeConfig {
         gate: Arc::new(ContactGate::new(db)),
         blobs: Some(dir.blobs_dir()),
+        downloads: Some(dir.root().join("Downloads")),
         ..config(key)
     };
     let (handle, mut events) = Node::start(config).expect("node starts");
@@ -802,6 +804,92 @@ async fn files_from_a_contact_set_to_auto_accept_arrive_without_asking() {
         .await
         .unwrap();
     assert_eq!(listed.len(), 3);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn received_files_are_saved_and_a_name_taken_gets_a_number() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let downloads = bob_dir.root().join("Downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::write(downloads.join("note.txt"), b"already here").unwrap();
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+
+    // The folder keeps its structure on disk, and the file that was already there is kept.
+    assert_eq!(
+        std::fs::read(downloads.join("photos/a.txt")).unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        std::fs::read(downloads.join("photos/sub/b.bin")).unwrap(),
+        b"bravo"
+    );
+    assert_eq!(
+        std::fs::read(downloads.join("note.txt")).unwrap(),
+        b"already here"
+    );
+    assert_eq!(
+        std::fs::read(downloads.join("note (2).txt")).unwrap(),
+        b"charlie"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn receiving_an_offer_again_fetches_nothing_already_received() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    let offer = next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+
+    // The first receive's event is read first, so the retry's event is checked below.
+    next_file_received(&mut bob_events).await;
+
+    // The second receive finds every block already in the store.
+    bob.resume_files(alice_key.public(), offer.clone())
+        .await
+        .expect("the retry finds the files");
+    let received = tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("the retry reports the files");
+    match received {
+        NodeEvent::FileReceived { fetched, .. } => {
+            assert_eq!(fetched, 0, "a retry fetched bytes it already had");
+        }
+        other => panic!("{other:?}"),
+    }
 
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));

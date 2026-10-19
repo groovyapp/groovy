@@ -3055,6 +3055,7 @@ dependencies = [
  "blake3",
  "data-encoding",
  "directories",
+ "futures-util",
  "image",
  "iroh",
  "iroh-blobs",

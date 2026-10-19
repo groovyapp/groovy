@@ -213,6 +213,7 @@ pub fn start(cx: &mut App) {
         discovery: cx.global::<AppData>().config.discovery,
         relay: cx.global::<AppData>().config.relay.clone(),
         blobs: Some(cx.global::<AppData>().dir.blobs_dir()),
+        downloads: groovy_core::files::default_downloads(),
     }) {
         Ok(started) => started,
         Err(error) => {
@@ -286,7 +287,13 @@ pub fn start(cx: &mut App) {
                         }
                     }
                     // Progress and received files are shown once the Files screen exists (#31).
-                    NodeEvent::ImportProgress { .. } | NodeEvent::FileReceived { .. } => {}
+                    NodeEvent::ReceiveFailed { peer, error, .. } => {
+                        // Retrying a failed receive needs the Files screen (#31).
+                        warn!(peer = %peer, %error, "could not receive files");
+                    }
+                    NodeEvent::ImportProgress { .. }
+                    | NodeEvent::DownloadProgress { .. }
+                    | NodeEvent::FileReceived { .. } => {}
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }

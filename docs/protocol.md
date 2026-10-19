@@ -85,7 +85,9 @@ Reply::Accepted | Reply::Declined
 
 Only a trusted peer's offer is shown to the user. An untrusted peer's offer gets no answer, and its stream is dropped. When the user accepts, the node answers `Accepted`, then fetches the collection from the sender over the blobs protocol. Every block is checked against its hash as it arrives. Declining answers `Declined`, and nothing is fetched.
 
-A contact can be set to auto-accept. Its offers are then accepted at once, and the user is not asked. Nothing is written to the user's disk by this step. Saving received files to a folder is part of receiving (#28).
+A contact can be set to auto-accept. Its offers are then accepted at once, and the user is not asked.
+
+Receiving is checked as it goes, and saved to the downloads folder when it is done. Bytes already in the store are not fetched again, so an interrupted receive can be retried with the same offer. Each file is written under the path it had in the collection, with a number added if its name is taken. Each name from a peer is made safe before anything is written: empty, `.` and `..` parts are dropped, so nothing can be written outside the downloads folder. Saving received files to a folder is part of receiving (#28).
 
 ## Blobs
 
@@ -97,4 +99,4 @@ Each blob added on this device gets a persistent tag, so it is kept across resta
 
 ## Not yet specified
 
-Messages after the handshake: transfer progress and resumption (#28, #29), chat (#41), and groups (#43). Each will get a section here when it is built.
+Messages after the handshake: transfer management (#29), chat (#41), and groups (#43). Each will get a section here when it is built.

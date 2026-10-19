@@ -13,11 +13,13 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use futures_util::StreamExt;
 use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
 };
+use iroh_blobs::api::remote::GetProgressItem;
 use iroh_blobs::{BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -139,6 +141,8 @@ pub struct NodeConfig {
     pub relay: RelaySetting,
     /// Where blobs are stored. `None` turns blob storage off.
     pub blobs: Option<std::path::PathBuf>,
+    /// The folder accepted files are saved to. `None` keeps them in the blob store only.
+    pub downloads: Option<std::path::PathBuf>,
 }
 
 /// Lifecycle events published by the node.
@@ -166,11 +170,30 @@ pub enum NodeEvent {
         done: u64,
         total: u64,
     },
-    /// The files from an accepted offer are now in this node's store.
+    /// Payload bytes of an accepted offer read so far, out of `total`. This counts
+    /// bytes already in the store too, so a retry starts near `total`.
+    DownloadProgress {
+        peer: EndpointId,
+        root: Hash,
+        done: u64,
+        total: u64,
+    },
+    /// The files from an accepted offer are in this node's store, and saved to the
+    /// downloads folder if there is one.
     FileReceived {
         peer: EndpointId,
         names: Vec<String>,
         root: Hash,
+        saved: Vec<std::path::PathBuf>,
+        /// Payload bytes this receive transferred. Zero if everything was already held.
+        fetched: u64,
+    },
+    /// Receiving an accepted offer failed. Retry it with [`NodeHandle::resume_files`];
+    /// the bytes already received are kept.
+    ReceiveFailed {
+        peer: EndpointId,
+        offer: FileOffer,
+        error: String,
     },
     Stopped,
 }
@@ -187,6 +210,11 @@ enum Command {
         oneshot::Sender<Result<(), NodeError>>,
     ),
     AnswerOffer(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
+    ResumeFiles(
+        EndpointId,
+        FileOffer,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
     CheckPresence(EndpointAddr, oneshot::Sender<Result<Route, NodeError>>),
     AddBlob(Vec<u8>, oneshot::Sender<Result<Hash, NodeError>>),
     ReadBlob(Hash, oneshot::Sender<Result<Option<Vec<u8>>, NodeError>>),
@@ -346,6 +374,12 @@ async fn run(
         },
         None => None,
     };
+    let receiving = Receiving {
+        endpoint: endpoint.clone(),
+        events: events.clone(),
+        store: blobs.clone(),
+        downloads: config.downloads.clone(),
+    };
     let mut router = Router::builder(endpoint.clone()).accept(
         protocol::ALPN,
         GroovyProtocol {
@@ -459,6 +493,12 @@ async fn run(
                         let _ = reply.send(outcome);
                     });
                 }
+                Some(Command::ResumeFiles(peer, offer, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(receive(&receiving, peer, &offer).await);
+                    });
+                }
                 Some(Command::SendFiles(addr, paths, reply)) => {
                     let endpoint = endpoint.clone();
                     let profile = profile.clone();
@@ -475,15 +515,12 @@ async fn run(
                 }
                 Some(Command::AnswerOffer(peer, accept, reply)) => {
                     let taken = offers.lock().ok().and_then(|mut map| map.remove(&peer));
-                    let endpoint = endpoint.clone();
-                    let events = events.clone();
-                    let store = blobs.clone();
+                    let receiving = receiving.clone();
                     tokio::spawn(async move {
                         let outcome = match taken {
                             None => Err(NodeError::NoPendingOffer),
                             Some((mut send, offer)) => {
-                                answer_offer(&endpoint, &events, store, peer, &mut send, offer, accept)
-                                    .await
+                                answer_offer(&receiving, peer, &mut send, offer, accept).await
                             }
                         };
                         if let Err(error) = &outcome {
@@ -602,6 +639,16 @@ async fn check_presence(
     Ok(route)
 }
 
+/// What an accepted offer needs to be received: the endpoint to fetch with, the events
+/// to report on, the blob store, and the folder to save into.
+#[derive(Clone)]
+struct Receiving {
+    endpoint: Endpoint,
+    events: broadcast::Sender<NodeEvent>,
+    store: Option<FsStore>,
+    downloads: Option<std::path::PathBuf>,
+}
+
 /// Imports `paths` into the blob store, offers them to a trusted peer, and waits for
 /// its answer. An accepted offer is fetched by the peer from this node's store.
 async fn send_files(
@@ -644,49 +691,87 @@ async fn send_files(
     }
 }
 
-/// Answers an offer. On accept, the files are fetched from the sender into this
-/// node's store, verified as they arrive, and then reported as received.
+/// Answers an offer. On accept, the files are received from the sender.
 async fn answer_offer(
-    endpoint: &Endpoint,
-    events: &broadcast::Sender<NodeEvent>,
-    store: Option<FsStore>,
+    receiving: &Receiving,
     peer: EndpointId,
     send: &mut SendStream,
     offer: FileOffer,
     accept: bool,
 ) -> Result<(), NodeError> {
-    let store = match (accept, store) {
-        (false, _) => {
-            reply_and_finish(send, Reply::Declined).await;
-            return Ok(());
-        }
-        (true, None) => {
-            reply_and_finish(send, Reply::Declined).await;
-            return Err(NodeError::BlobsDisabled);
-        }
-        (true, Some(store)) => store,
-    };
+    if !accept || receiving.store.is_none() {
+        reply_and_finish(send, Reply::Declined).await;
+        return if accept {
+            Err(NodeError::BlobsDisabled)
+        } else {
+            Ok(())
+        };
+    }
     reply_and_finish(send, Reply::Accepted).await;
+    let outcome = receive(receiving, peer, &offer).await;
+    if let Err(error) = &outcome {
+        let _ = receiving.events.send(NodeEvent::ReceiveFailed {
+            peer,
+            offer,
+            error: error.to_string(),
+        });
+    }
+    outcome
+}
 
+/// Fetches an offer's files into the blob store, checking each block as it arrives.
+/// Bytes already in the store are not fetched again, so a retry picks up where it stopped.
+/// Then saves the files to the downloads folder, if there is one, and reports them.
+async fn receive(
+    receiving: &Receiving,
+    peer: EndpointId,
+    offer: &FileOffer,
+) -> Result<(), NodeError> {
+    let store = receiving.store.as_ref().ok_or(NodeError::BlobsDisabled)?;
     let content = HashAndFormat::hash_seq(offer.root);
-    let connection = endpoint
+    let connection = receiving
+        .endpoint
         .connect(offer.from.clone(), iroh_blobs::ALPN)
         .await
         .map_err(connection_error)?;
-    store
-        .remote()
-        .fetch(connection, content)
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
+
+    let mut fetched = 0;
+    let mut progress = store.remote().fetch(connection, content).stream();
+    while let Some(item) = progress.next().await {
+        match item {
+            GetProgressItem::Progress(done) => {
+                let _ = receiving.events.send(NodeEvent::DownloadProgress {
+                    peer,
+                    root: offer.root,
+                    done,
+                    total: offer.bytes,
+                });
+            }
+            GetProgressItem::Done(stats) => {
+                fetched = stats.payload_bytes_read;
+                break;
+            }
+            GetProgressItem::Error(error) => return Err(NodeError::Files(error.to_string())),
+        }
+    }
+
     store
         .tags()
         .create(content)
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
-    let _ = events.send(NodeEvent::FileReceived {
+    let saved = match &receiving.downloads {
+        Some(dir) => files::export(store, offer.root, dir)
+            .await
+            .map_err(|error| NodeError::Files(error.to_string()))?,
+        None => Vec::new(),
+    };
+    let _ = receiving.events.send(NodeEvent::FileReceived {
         peer,
-        names: offer.names,
+        names: offer.names.clone(),
         root: offer.root,
+        saved,
+        fetched,
     });
     Ok(())
 }
@@ -987,6 +1072,17 @@ impl NodeHandle {
         response.await.map_err(|_| NodeError::Stopped)?
     }
 
+    /// Retries receiving an offer that failed. Bytes already received are kept, so only
+    /// the rest is fetched.
+    pub async fn resume_files(&self, peer: EndpointId, offer: FileOffer) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ResumeFiles(peer, offer, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
     /// Accepts or declines files a trusted peer has offered. On accept, returns once
     /// the files are in this node's store.
     pub async fn answer_offer(&self, peer: EndpointId, accept: bool) -> Result<(), NodeError> {
@@ -1116,6 +1212,7 @@ mod tests {
             discovery: Discovery::default(),
             relay: RelaySetting::Public,
             blobs: None,
+            downloads: None,
         }
     }
 
