@@ -153,6 +153,7 @@ impl Render for TicketPanel {
         let share = match my_ticket {
             Some(text) => {
                 let copy = text.clone();
+                let link = format!("groovy://{text}");
                 let mut row = div().flex().flex_row().items_start().gap_4();
                 if let Some((_, picture)) = &self.qr {
                     row = row.child(
@@ -185,6 +186,19 @@ impl Render for TicketPanel {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                         copy.clone(),
                                     ));
+                                }),
+                        )
+                        .child(
+                            Button::new("ticket-copy-link", "Copy link")
+                                .variant(Variant::Secondary)
+                                .icon(Icon::Copy)
+                                .on_click({
+                                    let link = link.clone();
+                                    move |_, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            link.clone(),
+                                        ));
+                                    }
                                 }),
                         ),
                 )

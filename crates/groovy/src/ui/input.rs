@@ -13,7 +13,7 @@ use crate::theme::ActiveTheme;
 
 actions!(
     text_input,
-    [Backspace, Delete, Left, Right, Home, End, Enter]
+    [Backspace, Delete, Left, Right, Home, End, Enter, Paste]
 );
 
 const CONTEXT: &str = "TextInput";
@@ -28,6 +28,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", Home, Some(CONTEXT)),
         KeyBinding::new("end", End, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
+        // `secondary` is Ctrl on Linux and Windows, and Cmd on macOS.
+        KeyBinding::new("secondary-v", Paste, Some(CONTEXT)),
     ]);
 }
 
@@ -136,6 +138,22 @@ impl TextInput {
     fn on_end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.cursor = self.content.len();
         cx.notify();
+    }
+
+    /// Inserts the clipboard text at the caret. The field is one line, so line
+    /// breaks are removed and surrounding whitespace is trimmed.
+    fn on_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let line: String = text
+            .trim()
+            .chars()
+            .filter(|ch| !matches!(ch, '\r' | '\n'))
+            .collect();
+        if !line.is_empty() {
+            self.replace_range(self.cursor..self.cursor, &line, cx);
+        }
     }
 
     fn on_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
@@ -308,6 +326,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::on_home))
             .on_action(cx.listener(Self::on_end))
             .on_action(cx.listener(Self::on_enter))
+            .on_action(cx.listener(Self::on_paste))
             .relative()
             .flex()
             .items_center()
@@ -447,6 +466,25 @@ mod gpui_tests {
         assert_eq!(
             input.read_with(cx, |input, _| input.text().to_owned()),
             "secret"
+        );
+    }
+
+    #[test]
+    fn ctrl_v_pastes_the_clipboard_at_the_caret() {
+        let mut cx = TestAppContext::single();
+        setup(&mut cx);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("Ticket", cx));
+        let focus = input.read_with(cx, |input, _| input.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "  endpointabc\n".to_owned(),
+        ));
+
+        cx.simulate_keystrokes("ctrl-v");
+
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text().to_owned()),
+            "endpointabc"
         );
     }
 }
