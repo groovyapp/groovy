@@ -5,12 +5,13 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use futures_util::StreamExt;
@@ -24,15 +25,18 @@ use iroh_blobs::{BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::blobs::TrustedBlobs;
 use crate::config::{Discovery, RelaySetting};
+use crate::contacts;
+use crate::db::Database;
 use crate::files;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
+use crate::transfers::{Transfer, TransferState};
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -74,6 +78,10 @@ pub enum NodeError {
     OfferDeclined,
     #[error("there are no offered files from that peer to answer")]
     NoPendingOffer,
+    #[error("there is no transfer with that id")]
+    UnknownTransfer,
+    #[error("that transfer cannot be {0} in its current state")]
+    WrongTransferState(&'static str),
     #[error("sending or receiving the files failed: {0}")]
     Files(String),
     #[error("the node has stopped")]
@@ -143,6 +151,9 @@ pub struct NodeConfig {
     pub blobs: Option<std::path::PathBuf>,
     /// The folder accepted files are saved to. `None` keeps them in the blob store only.
     pub downloads: Option<std::path::PathBuf>,
+    /// Where transfers are recorded, so the list survives a restart. `None` keeps
+    /// them in memory only.
+    pub database: Option<Arc<Database>>,
 }
 
 /// Lifecycle events published by the node.
@@ -170,17 +181,13 @@ pub enum NodeEvent {
         done: u64,
         total: u64,
     },
-    /// Payload bytes of an accepted offer read so far, out of `total`. This counts
-    /// bytes already in the store too, so a retry starts near `total`.
-    DownloadProgress {
-        peer: EndpointId,
-        root: Hash,
-        done: u64,
-        total: u64,
-    },
+    /// A transfer was added, or its state or progress changed. Progress updates come
+    /// at most every 100 ms for each transfer.
+    TransferChanged(Transfer),
     /// The files from an accepted offer are in this node's store, and saved to the
     /// downloads folder if there is one.
     FileReceived {
+        transfer: i64,
         peer: EndpointId,
         names: Vec<String>,
         root: Hash,
@@ -188,9 +195,10 @@ pub enum NodeEvent {
         /// Payload bytes this receive transferred. Zero if everything was already held.
         fetched: u64,
     },
-    /// Receiving an accepted offer failed. Retry it with [`NodeHandle::resume_files`];
+    /// Receiving an accepted offer failed. Resume it with [`NodeHandle::resume_transfer`];
     /// the bytes already received are kept.
     ReceiveFailed {
+        transfer: i64,
         peer: EndpointId,
         offer: FileOffer,
         error: String,
@@ -210,11 +218,9 @@ enum Command {
         oneshot::Sender<Result<(), NodeError>>,
     ),
     AnswerOffer(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
-    ResumeFiles(
-        EndpointId,
-        FileOffer,
-        oneshot::Sender<Result<(), NodeError>>,
-    ),
+    PauseTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
+    ResumeTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
+    CancelTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     CheckPresence(EndpointAddr, oneshot::Sender<Result<Route, NodeError>>),
     AddBlob(Vec<u8>, oneshot::Sender<Result<Hash, NodeError>>),
     ReadBlob(Hash, oneshot::Sender<Result<Option<Vec<u8>>, NodeError>>),
@@ -263,6 +269,35 @@ impl Node {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
 
         let weak_commands = command_tx.downgrade();
+        let book: Book = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut resume = Vec::new();
+        let mut next_id: i64 = 1;
+        if let Some(db) = &config.database {
+            match db.transfers() {
+                Ok(transfers) => {
+                    for transfer in transfers {
+                        next_id = next_id.max(transfer.id + 1);
+                        if transfer.state.is_unfinished() {
+                            resume.push(transfer.id);
+                        }
+                        lock_book(&book).insert(
+                            transfer.id,
+                            Slot {
+                                transfer,
+                                abort: None,
+                            },
+                        );
+                    }
+                }
+                Err(error) => warn!(%error, "could not load the transfers"),
+            }
+        }
+        let startup = Startup {
+            book: book.clone(),
+            next_id: Arc::new(AtomicI64::new(next_id)),
+            resume,
+            commands: weak_commands,
+        };
         let thread = thread::Builder::new()
             .name("groovy-node".into())
             .spawn(move || {
@@ -273,7 +308,7 @@ impl Node {
                     shutdown_rx,
                     event_tx,
                     ready_tx,
-                    weak_commands,
+                    startup,
                 ))
             })
             .map_err(NodeError::Spawn)?;
@@ -297,6 +332,7 @@ impl Node {
             commands: command_tx,
             shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
             thread: Arc::new(Mutex::new(Some(thread))),
+            book,
         };
         Ok((handle, EventStream { receiver: event_rx }))
     }
@@ -352,7 +388,7 @@ async fn run(
     events: broadcast::Sender<NodeEvent>,
     ready: std_mpsc::SyncSender<Result<(), NodeError>>,
     // Weak, so the node still stops once every handle is dropped.
-    command_tx: mpsc::WeakSender<Command>,
+    startup: Startup,
 ) {
     let endpoint = match bind(&config).await {
         Ok(endpoint) => endpoint,
@@ -379,6 +415,10 @@ async fn run(
         events: events.clone(),
         store: blobs.clone(),
         downloads: config.downloads.clone(),
+        book: startup.book.clone(),
+        slots: Arc::new(Semaphore::new(MAX_ACTIVE_RECEIVES)),
+        next_id: startup.next_id.clone(),
+        database: config.database.clone(),
     };
     let mut router = Router::builder(endpoint.clone()).accept(
         protocol::ALPN,
@@ -390,7 +430,7 @@ async fn run(
                 events: events.clone(),
                 pending: pending.clone(),
                 offers: offers.clone(),
-                commands: command_tx,
+                commands: startup.commands.clone(),
                 limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
             },
         },
@@ -405,6 +445,18 @@ async fn run(
     info!(endpoint_id = %endpoint.id(), "node started");
     let _ = events.send(NodeEvent::Started);
     let _ = ready.send(Ok(()));
+    // Transfers that were queued or receiving when the node last stopped start again.
+    if receiving.store.is_some() {
+        for id in startup.resume.clone() {
+            set_transfer(&receiving, id, Some(TransferState::Queued), None);
+            let offer = lock_book(&receiving.book)
+                .get(&id)
+                .map(|slot| (slot.transfer.peer, slot.transfer.offer.clone()));
+            if let Some((peer, offer)) = offer {
+                spawn_receive(&receiving, id, peer, offer);
+            }
+        }
+    }
 
     tokio::pin!(shutdown);
     let mut watching = true;
@@ -493,11 +545,14 @@ async fn run(
                         let _ = reply.send(outcome);
                     });
                 }
-                Some(Command::ResumeFiles(peer, offer, reply)) => {
-                    let receiving = receiving.clone();
-                    tokio::spawn(async move {
-                        let _ = reply.send(receive(&receiving, peer, &offer).await);
-                    });
+                Some(Command::PauseTransfer(id, reply)) => {
+                    let _ = reply.send(stop_transfer(&receiving, id, TransferState::Paused));
+                }
+                Some(Command::ResumeTransfer(id, reply)) => {
+                    let _ = reply.send(resume_transfer(&receiving, id));
+                }
+                Some(Command::CancelTransfer(id, reply)) => {
+                    let _ = reply.send(stop_transfer(&receiving, id, TransferState::Cancelled));
                 }
                 Some(Command::SendFiles(addr, paths, reply)) => {
                     let endpoint = endpoint.clone();
@@ -639,14 +694,40 @@ async fn check_presence(
     Ok(route)
 }
 
+/// Every transfer this node knows, by id, with the task receiving it while one runs.
+type Book = Arc<Mutex<BTreeMap<i64, Slot>>>;
+
+struct Slot {
+    transfer: Transfer,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Receives at most this many offers at once. The rest wait in the queue.
+const MAX_ACTIVE_RECEIVES: usize = 2;
+/// How often a transfer's progress is reported, at most.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What `start` hands the node thread: the transfer book, the next free transfer id,
+/// the transfers to pick up again, and a way to send the node its commands.
+struct Startup {
+    book: Book,
+    next_id: Arc<AtomicI64>,
+    resume: Vec<i64>,
+    commands: mpsc::WeakSender<Command>,
+}
+
 /// What an accepted offer needs to be received: the endpoint to fetch with, the events
-/// to report on, the blob store, and the folder to save into.
+/// to report on, the blob store, the folder to save into, and the transfer book.
 #[derive(Clone)]
 struct Receiving {
     endpoint: Endpoint,
     events: broadcast::Sender<NodeEvent>,
     store: Option<FsStore>,
     downloads: Option<std::path::PathBuf>,
+    book: Book,
+    slots: Arc<Semaphore>,
+    next_id: Arc<AtomicI64>,
+    database: Option<Arc<Database>>,
 }
 
 /// Imports `paths` into the blob store, offers them to a trusted peer, and waits for
@@ -691,7 +772,7 @@ async fn send_files(
     }
 }
 
-/// Answers an offer. On accept, the files are received from the sender.
+/// Answers an offer. On accept, the files are queued to be received.
 async fn answer_offer(
     receiving: &Receiving,
     peer: EndpointId,
@@ -708,25 +789,103 @@ async fn answer_offer(
         };
     }
     reply_and_finish(send, Reply::Accepted).await;
-    let outcome = receive(receiving, peer, &offer).await;
-    if let Err(error) = &outcome {
-        let _ = receiving.events.send(NodeEvent::ReceiveFailed {
-            peer,
-            offer,
-            error: error.to_string(),
-        });
-    }
-    outcome
+    let id = new_transfer(receiving, peer, offer.clone());
+    spawn_receive(receiving, id, peer, offer);
+    Ok(())
 }
 
-/// Fetches an offer's files into the blob store, checking each block as it arrives.
+/// Records a new transfer as queued, and returns its id.
+fn new_transfer(receiving: &Receiving, peer: EndpointId, offer: FileOffer) -> i64 {
+    let id = receiving.next_id.fetch_add(1, Ordering::SeqCst);
+    let now = contacts::now();
+    let transfer = Transfer {
+        id,
+        peer,
+        offer,
+        state: TransferState::Queued,
+        done: 0,
+        created: now,
+        updated: now,
+    };
+    if let Some(Err(error)) = receiving
+        .database
+        .as_ref()
+        .map(|db| db.insert_transfer(&transfer))
+    {
+        warn!(%error, "could not save a transfer");
+    }
+    lock_book(&receiving.book).insert(
+        id,
+        Slot {
+            transfer: transfer.clone(),
+            abort: None,
+        },
+    );
+    let _ = receiving.events.send(NodeEvent::TransferChanged(transfer));
+    id
+}
+
+/// Changes a transfer's state, and its progress if given. Saves it, and tells listeners.
+fn set_transfer(receiving: &Receiving, id: i64, state: Option<TransferState>, done: Option<u64>) {
+    let transfer = {
+        let mut book = lock_book(&receiving.book);
+        let Some(slot) = book.get_mut(&id) else {
+            return;
+        };
+        if let Some(state) = state {
+            slot.transfer.state = state;
+        }
+        if let Some(done) = done {
+            slot.transfer.done = done;
+        }
+        slot.transfer.updated = contacts::now();
+        slot.transfer.clone()
+    };
+    let saved = receiving
+        .database
+        .as_ref()
+        .map(|db| db.update_transfer(id, &transfer.state, transfer.done, transfer.updated));
+    if let Some(Err(error)) = saved {
+        warn!(%error, "could not save a transfer");
+    }
+    let _ = receiving.events.send(NodeEvent::TransferChanged(transfer));
+}
+
+/// Starts a transfer's receive in the background. It waits for a free slot, then fetches.
+/// The transfer's task is kept in the book, so it can be paused or cancelled.
+fn spawn_receive(receiving: &Receiving, id: i64, peer: EndpointId, offer: FileOffer) {
+    let task = receiving.clone();
+    let handle = tokio::spawn(async move {
+        let _slot = task.slots.clone().acquire_owned().await;
+        set_transfer(&task, id, Some(TransferState::Active), None);
+        match receive(&task, id, &offer).await {
+            Ok(()) => set_transfer(&task, id, Some(TransferState::Completed), Some(offer.bytes)),
+            Err(error) => {
+                let message = error.to_string();
+                set_transfer(
+                    &task,
+                    id,
+                    Some(TransferState::Failed(message.clone())),
+                    None,
+                );
+                let _ = task.events.send(NodeEvent::ReceiveFailed {
+                    transfer: id,
+                    peer,
+                    offer,
+                    error: message,
+                });
+            }
+        }
+    });
+    if let Some(slot) = lock_book(&receiving.book).get_mut(&id) {
+        slot.abort = Some(handle.abort_handle());
+    }
+}
+
+/// Fetches a transfer's files into the blob store, checking each block as it arrives.
 /// Bytes already in the store are not fetched again, so a retry picks up where it stopped.
 /// Then saves the files to the downloads folder, if there is one, and reports them.
-async fn receive(
-    receiving: &Receiving,
-    peer: EndpointId,
-    offer: &FileOffer,
-) -> Result<(), NodeError> {
+async fn receive(receiving: &Receiving, id: i64, offer: &FileOffer) -> Result<(), NodeError> {
     let store = receiving.store.as_ref().ok_or(NodeError::BlobsDisabled)?;
     let content = HashAndFormat::hash_seq(offer.root);
     let connection = receiving
@@ -736,16 +895,15 @@ async fn receive(
         .map_err(connection_error)?;
 
     let mut fetched = 0;
+    let mut last_report: Option<Instant> = None;
     let mut progress = store.remote().fetch(connection, content).stream();
     while let Some(item) = progress.next().await {
         match item {
             GetProgressItem::Progress(done) => {
-                let _ = receiving.events.send(NodeEvent::DownloadProgress {
-                    peer,
-                    root: offer.root,
-                    done,
-                    total: offer.bytes,
-                });
+                if last_report.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
+                    last_report = Some(Instant::now());
+                    set_transfer(receiving, id, None, Some(done));
+                }
             }
             GetProgressItem::Done(stats) => {
                 fetched = stats.payload_bytes_read;
@@ -766,13 +924,73 @@ async fn receive(
             .map_err(|error| NodeError::Files(error.to_string()))?,
         None => Vec::new(),
     };
+    let peer = offer_peer(receiving, id);
     let _ = receiving.events.send(NodeEvent::FileReceived {
+        transfer: id,
         peer,
         names: offer.names.clone(),
         root: offer.root,
         saved,
         fetched,
     });
+    Ok(())
+}
+
+/// The peer a transfer is from. A transfer that is in the book always has one.
+fn offer_peer(receiving: &Receiving, id: i64) -> EndpointId {
+    lock_book(&receiving.book)
+        .get(&id)
+        .map(|slot| slot.transfer.peer)
+        .expect("a transfer is in the book while it is received")
+}
+
+/// Locks the transfer book. A panic while it was locked leaves it usable.
+fn lock_book(book: &Book) -> std::sync::MutexGuard<'_, BTreeMap<i64, Slot>> {
+    book.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Resumes a paused or failed transfer. Only what is missing is fetched.
+fn resume_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    let (peer, offer) = {
+        let book = lock_book(&receiving.book);
+        let slot = book.get(&id).ok_or(NodeError::UnknownTransfer)?;
+        match slot.transfer.state {
+            TransferState::Paused | TransferState::Failed(_) => {}
+            _ => return Err(NodeError::WrongTransferState("resumed")),
+        }
+        (slot.transfer.peer, slot.transfer.offer.clone())
+    };
+    if receiving.store.is_none() {
+        return Err(NodeError::BlobsDisabled);
+    }
+    set_transfer(receiving, id, Some(TransferState::Queued), None);
+    spawn_receive(receiving, id, peer, offer);
+    Ok(())
+}
+
+/// Stops a transfer that is queued or receiving. Its bytes stay in the store.
+fn stop_transfer(receiving: &Receiving, id: i64, state: TransferState) -> Result<(), NodeError> {
+    let abort = {
+        let mut book = lock_book(&receiving.book);
+        let slot = book.get_mut(&id).ok_or(NodeError::UnknownTransfer)?;
+        let stoppable = matches!(
+            slot.transfer.state,
+            TransferState::Queued | TransferState::Active | TransferState::Paused
+        );
+        if !stoppable {
+            let verb = if state == TransferState::Paused {
+                "paused"
+            } else {
+                "cancelled"
+            };
+            return Err(NodeError::WrongTransferState(verb));
+        }
+        slot.abort.take()
+    };
+    if let Some(abort) = abort {
+        abort.abort();
+    }
+    set_transfer(receiving, id, Some(state), None);
     Ok(())
 }
 
@@ -984,6 +1202,7 @@ impl ProtocolHandler for GroovyProtocol {
 /// The node stops when shutdown is requested or when the last handle is dropped.
 #[derive(Clone)]
 pub struct NodeHandle {
+    book: Book,
     endpoint_id: EndpointId,
     profile: SharedProfile,
     commands: mpsc::Sender<Command>,
@@ -1072,12 +1291,40 @@ impl NodeHandle {
         response.await.map_err(|_| NodeError::Stopped)?
     }
 
-    /// Retries receiving an offer that failed. Bytes already received are kept, so only
-    /// the rest is fetched.
-    pub async fn resume_files(&self, peer: EndpointId, offer: FileOffer) -> Result<(), NodeError> {
+    /// Every transfer this node knows, oldest first.
+    pub fn transfers(&self) -> Vec<Transfer> {
+        lock_book(&self.book)
+            .values()
+            .map(|slot| slot.transfer.clone())
+            .collect()
+    }
+
+    /// Pauses a queued or receiving transfer. Its bytes stay in the store, so resuming
+    /// it fetches only what is missing.
+    pub async fn pause_transfer(&self, id: i64) -> Result<(), NodeError> {
+        self.transfer_command(|reply| Command::PauseTransfer(id, reply))
+            .await
+    }
+
+    /// Resumes a paused or failed transfer.
+    pub async fn resume_transfer(&self, id: i64) -> Result<(), NodeError> {
+        self.transfer_command(|reply| Command::ResumeTransfer(id, reply))
+            .await
+    }
+
+    /// Cancels a transfer that is not finished.
+    pub async fn cancel_transfer(&self, id: i64) -> Result<(), NodeError> {
+        self.transfer_command(|reply| Command::CancelTransfer(id, reply))
+            .await
+    }
+
+    async fn transfer_command(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<(), NodeError>>) -> Command,
+    ) -> Result<(), NodeError> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::ResumeFiles(peer, offer, reply))
+            .send(command(reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?
@@ -1213,6 +1460,7 @@ mod tests {
             relay: RelaySetting::Public,
             blobs: None,
             downloads: None,
+            database: None,
         }
     }
 

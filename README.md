@@ -190,6 +190,7 @@ crates/
     src/presence.rs      Presence: which trusted contacts are reachable, and how often to check
     src/blobs.rs         Blob store: serves content only to trusted contacts
     src/files.rs         Files to send: imported as one collection that keeps each file's path
+    src/transfers.rs     Transfer records: state and progress, kept in the database across restarts
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point
