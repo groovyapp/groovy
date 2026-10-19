@@ -13,6 +13,7 @@ pub mod logging;
 mod node;
 pub mod pairing;
 mod paths;
+pub mod presence;
 pub mod profile;
 pub mod protocol;
 pub mod ticket;
@@ -29,6 +30,7 @@ pub use node::{
 };
 pub use pairing::verification_code;
 pub use paths::{DataDir, PathsError, override_env_var};
+pub use presence::{Route, Tracker};
 pub use profile::{Profile, validate_display_name};
 pub use protocol::{PeerInfo, PeerProfile, ProtocolError, avatar_hash};
 pub use ticket::TicketError;

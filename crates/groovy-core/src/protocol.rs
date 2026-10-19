@@ -58,6 +58,8 @@ impl PeerProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Pair,
+    /// Asks a trusted peer whether it is reachable. Only trusted peers may send it.
+    Ping,
 }
 
 /// The answer to a [`Request::Pair`].
@@ -65,6 +67,8 @@ pub enum Request {
 pub enum Reply {
     Accepted,
     Declined,
+    /// The answer to [`Request::Ping`].
+    Pong,
 }
 
 /// A peer we have completed a handshake with.
