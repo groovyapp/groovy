@@ -21,6 +21,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         profile: PeerProfile::default(),
         gate: Arc::new(AllowAll),
         discovery: groovy_core::Discovery::default(),
+        relay: groovy_core::RelaySetting::Public,
     }
 }
 

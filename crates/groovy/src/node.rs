@@ -198,6 +198,7 @@ pub fn start(cx: &mut App) {
         profile: PeerProfile::default(),
         gate: Arc::new(ContactGate::new(database.clone())),
         discovery: cx.global::<AppData>().config.discovery,
+        relay: cx.global::<AppData>().config.relay.clone(),
     }) {
         Ok(started) => started,
         Err(error) => {

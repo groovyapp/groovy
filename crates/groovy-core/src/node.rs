@@ -14,14 +14,16 @@ use std::collections::HashMap;
 
 use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr, Watcher};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
+};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::config::Discovery;
+use crate::config::{Discovery, RelaySetting};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
@@ -48,6 +50,8 @@ pub enum NodeError {
     Bind(#[source] BindError),
     #[error("invalid bind address")]
     InvalidBindAddress(#[source] InvalidSocketAddr),
+    #[error("the relay setting is invalid: {0}")]
+    InvalidRelay(String),
     #[error("the peer could not be reached")]
     Connect(#[source] ProtocolError),
     #[error("this peer is blocked")]
@@ -113,6 +117,8 @@ pub struct NodeConfig {
     pub gate: Arc<dyn PeerGate>,
     /// Extra ways to find peers, beyond their endpoint ID. Used on the public network.
     pub discovery: Discovery,
+    /// Which relays to use. Used on the public network.
+    pub relay: RelaySetting,
 }
 
 /// Lifecycle events published by the node.
@@ -219,6 +225,23 @@ async fn bind(config: &NodeConfig) -> Result<Endpoint, NodeError> {
     let builder = match config.network {
         Network::Public => {
             let mut builder = Endpoint::builder(presets::N0);
+            builder = match &config.relay {
+                RelaySetting::Public => builder,
+                RelaySetting::Disabled => builder.relay_mode(RelayMode::Disabled),
+                RelaySetting::Custom { urls, auth_token } => {
+                    if urls.is_empty() {
+                        return Err(NodeError::InvalidRelay(
+                            "add at least one relay URL under [relay]".to_owned(),
+                        ));
+                    }
+                    let mut map = RelayMap::try_from_iter(urls.iter().map(String::as_str))
+                        .map_err(|error| NodeError::InvalidRelay(error.to_string()))?;
+                    if let Some(token) = auth_token {
+                        map = map.with_auth_token(token.clone());
+                    }
+                    builder.relay_mode(RelayMode::Custom(map))
+                }
+            };
             if config.discovery.local_network {
                 builder = builder.address_lookup(MdnsAddressLookup::builder());
             }
@@ -779,6 +802,7 @@ mod tests {
             },
             gate: Arc::new(AllowAll),
             discovery: Discovery::default(),
+            relay: RelaySetting::Public,
         }
     }
 
@@ -787,6 +811,48 @@ mod tests {
         let (handle, mut events) = Node::start(config).expect("node starts");
         assert_eq!(events.next().await, Some(NodeEvent::Started));
         (handle, events)
+    }
+
+    /// A public-network config with the given relay setting. Refused before any
+    /// network traffic, so these tests need no connection.
+    fn public_config_with_relay(relay: RelaySetting) -> NodeConfig {
+        NodeConfig {
+            network: Network::Public,
+            relay,
+            ..named_config("")
+        }
+    }
+
+    #[test]
+    fn a_relay_url_that_does_not_parse_is_refused() {
+        let config = public_config_with_relay(RelaySetting::Custom {
+            urls: vec!["not a url".to_owned()],
+            auth_token: None,
+        });
+
+        let result = Node::start(config);
+
+        assert!(
+            matches!(result, Err(NodeError::InvalidRelay(_))),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_custom_relay_list_with_no_relays_is_refused() {
+        let config = public_config_with_relay(RelaySetting::Custom {
+            urls: Vec::new(),
+            auth_token: None,
+        });
+
+        let result = Node::start(config);
+
+        assert!(
+            matches!(result, Err(NodeError::InvalidRelay(_))),
+            "{:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

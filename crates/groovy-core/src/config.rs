@@ -54,6 +54,31 @@ pub enum Appearance {
     Dark,
 }
 
+/// Which relay servers this node uses when a direct connection is not possible.
+///
+/// ```toml
+/// [relay]
+/// mode = "custom"
+/// urls = ["https://relay.example.org./"]
+/// auth_token = "optional shared token, if the relay requires one"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum RelaySetting {
+    /// n0's public relays. The default.
+    #[default]
+    Public,
+    /// No relays. Peers must be reachable directly.
+    Disabled,
+    /// Relays this node uses. `auth_token` is sent to them, for relays that check a
+    /// shared token.
+    Custom {
+        urls: Vec<String>,
+        #[serde(default)]
+        auth_token: Option<String>,
+    },
+}
+
 /// How this node finds peers beyond their endpoint ID. Each service reveals
 /// something, so each is opt-in: see the README's privacy section.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +103,9 @@ pub struct Config {
     /// Missing from older files, which get the default: both services off.
     #[serde(default)]
     pub discovery: Discovery,
+    /// Missing from older files, which get the default: n0's public relays.
+    #[serde(default)]
+    pub relay: RelaySetting,
     /// Keys this build does not know about. They are written back unchanged.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -89,6 +117,7 @@ impl Default for Config {
             version: CURRENT_VERSION,
             appearance: Appearance::default(),
             discovery: Discovery::default(),
+            relay: RelaySetting::default(),
             unknown: toml::Table::new(),
         }
     }
@@ -199,6 +228,32 @@ mod tests {
         assert_eq!(config.discovery, Discovery::default());
         assert!(!config.discovery.local_network);
         assert!(!config.discovery.dht);
+    }
+
+    #[test]
+    fn a_custom_relay_round_trips_through_the_config_file() {
+        let (_tmp, dir) = data_dir();
+        let config = Config {
+            relay: RelaySetting::Custom {
+                urls: vec!["https://relay.example.org./".to_owned()],
+                auth_token: Some("token".to_owned()),
+            },
+            ..Config::default()
+        };
+        config.save(&dir).unwrap();
+
+        assert_eq!(Config::load_or_create(&dir).unwrap().relay, config.relay);
+    }
+
+    #[test]
+    fn files_without_a_relay_setting_use_the_public_relays() {
+        let (_tmp, dir) = data_dir();
+        fs::write(dir.config_file(), "version = 1\n").unwrap();
+
+        assert_eq!(
+            Config::load_or_create(&dir).unwrap().relay,
+            RelaySetting::Public
+        );
     }
 
     #[test]
