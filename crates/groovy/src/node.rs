@@ -271,6 +271,22 @@ pub fn start(cx: &mut App) {
                     NodeEvent::PairingRequested { peer, code } => {
                         state.pairings.push(PairingRequest { peer, code });
                     }
+                    NodeEvent::FileOffered { peer, offer } => {
+                        // Accepting files needs the Files screen (#31), which does not exist
+                        // yet. Until it does, offers are declined, so nothing is received
+                        // without the user's say.
+                        info!(peer = %peer.endpoint_id, files = offer.files, "declining a file offer");
+                        if let Some(handle) = state.handle.clone() {
+                            cx.spawn(async move |_| {
+                                if let Err(error) = handle.answer_offer(peer.endpoint_id, false).await {
+                                    warn!(%error, "could not decline a file offer");
+                                }
+                            })
+                            .detach();
+                        }
+                    }
+                    // Progress and received files are shown once the Files screen exists (#31).
+                    NodeEvent::ImportProgress { .. } | NodeEvent::FileReceived { .. } => {}
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }

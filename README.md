@@ -189,6 +189,7 @@ crates/
     src/pairing.rs       Pairing: verification codes and the request rate limit
     src/presence.rs      Presence: which trusted contacts are reachable, and how often to check
     src/blobs.rs         Blob store: serves content only to trusted contacts
+    src/files.rs         Files to send: imported as one collection that keeps each file's path
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point
