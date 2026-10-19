@@ -70,7 +70,7 @@ An untrusted peer may send only `Pair`. Any other request is refused, and the co
 
 A trusted contact may be checked for presence with `Request::Ping`. The checking node dials the contact, runs the handshake, sends `Ping` on a new stream, and expects `Reply::Pong`. It then closes the connection, so nothing stays open between checks. A contact that is not trusted by the answering node gets no `Pong`, and the check fails.
 
-The route is read from the connection's selected path: `Direct` if it is a direct path, `Relayed` if it goes through a relay. A contact that does not answer is checked again after a delay that starts at one minute and doubles, up to 15 minutes.
+The route is read from the connection's selected path: `Direct` if it is a direct path, `Relayed` if it goes through a relay. A contact that does not answer is checked again after a delay that starts at one minute and doubles, up to 15 minutes. Each delay varies by up to a tenth either way, so contacts do not all retry together. When this node's network changes (its address changes), every contact is checked again at once.
 
 ## Not yet specified
 

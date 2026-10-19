@@ -49,6 +49,20 @@ pub fn next_delay(failures: u32) -> Duration {
     CHECK_INTERVAL.saturating_mul(factor).min(MAX_DELAY)
 }
 
+/// Spreads `delay` by up to a tenth either way, using the peer's ID, so many
+/// contacts do not all retry at the same moment after an outage.
+pub fn jittered(delay: Duration, peer: &EndpointId) -> Duration {
+    let first = u32::from_be_bytes([
+        peer.as_bytes()[0],
+        peer.as_bytes()[1],
+        peer.as_bytes()[2],
+        peer.as_bytes()[3],
+    ]);
+    // A value from -1.0 to 1.0, in steps of a thousandth.
+    let unit = f64::from(first % 2001) / 1000.0 - 1.0;
+    delay.mul_f64(1.0 + unit * 0.1)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     next_check: Instant,
@@ -69,6 +83,14 @@ impl Tracker {
                 next_check: now,
                 failures: 0,
             });
+        }
+    }
+
+    /// Makes every tracked peer due at `now`. Used when this node's network changes,
+    /// so contacts are rechecked at once rather than after their delay.
+    pub fn reset_all(&mut self, now: Instant) {
+        for entry in self.entries.values_mut() {
+            entry.next_check = now;
         }
     }
 
@@ -97,7 +119,7 @@ impl Tracker {
         } else {
             entry.failures.saturating_add(1)
         };
-        entry.next_check = now + next_delay(entry.failures);
+        entry.next_check = now + jittered(next_delay(entry.failures), &peer);
     }
 
     /// How many checks in a row have failed for `peer`.
@@ -137,7 +159,9 @@ mod tests {
         tracker.record(peer, true, start);
 
         assert!(tracker.due(start).is_empty());
-        assert_eq!(tracker.due(start + CHECK_INTERVAL), vec![peer]);
+        // Jitter moves the due time by a tenth either way, so check well clear of that.
+        assert!(tracker.due(start + CHECK_INTERVAL / 2).is_empty());
+        assert_eq!(tracker.due(start + CHECK_INTERVAL * 2), vec![peer]);
     }
 
     #[test]
@@ -154,6 +178,38 @@ mod tests {
 
         tracker.record(peer, true, start);
         assert_eq!(tracker.failures(&peer), 0);
+    }
+
+    #[test]
+    fn jitter_stays_within_a_tenth_and_differs_between_peers() {
+        let delay = Duration::from_secs(600);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let peer = SecretKey::generate().public();
+            let jittered = jittered(delay, &peer);
+            assert!(
+                jittered >= delay.mul_f64(0.9) && jittered <= delay.mul_f64(1.1),
+                "{jittered:?}"
+            );
+            seen.insert(jittered);
+        }
+        assert!(seen.len() > 1, "every peer got the same delay");
+    }
+
+    #[test]
+    fn a_network_change_makes_every_peer_due_at_once() {
+        let first = SecretKey::generate().public();
+        let second = SecretKey::generate().public();
+        let start = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.track([first, second], start);
+        tracker.record(first, false, start);
+        tracker.record(second, true, start);
+        assert!(tracker.due(start).is_empty());
+
+        tracker.reset_all(start);
+
+        assert_eq!(tracker.due(start).len(), 2);
     }
 
     #[test]
