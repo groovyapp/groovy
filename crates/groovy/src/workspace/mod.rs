@@ -12,11 +12,13 @@ use groovy_core::Database;
 use crate::{
     APP_NAME,
     data::AppData,
+    node::{NodeState, answer_pairing},
     onboarding::{self, Onboarding, OnboardingEvent},
     settings::SettingsScreen,
     theme::{self, ActiveTheme},
     tickets::TicketPanel,
     title_bar::TitleBar,
+    ui::dialog::ConfirmDialog,
     window_frame::{client_side_decorations, set_native_border_color},
 };
 pub use screen::{Screen, bind_keys};
@@ -166,6 +168,30 @@ fn save_onboarding(database: Arc<Database>, display_name: String, cx: &App) {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The oldest pairing request, asked as a dialog until the user answers it.
+        let pairing = cx
+            .try_global::<NodeState>()
+            .and_then(|node| node.pairings().first().cloned());
+        let pairing_dialog = pairing.map(|request| {
+            let id = request.peer.endpoint_id;
+            let name = if request.peer.profile.display_name.is_empty() {
+                "This peer".to_owned()
+            } else {
+                request.peer.profile.display_name.clone()
+            };
+            ConfirmDialog::new(
+                ("pairing", 0usize),
+                format!("Pair with {name}?"),
+                format!(
+                    "Check that {name} sees the same code: {}. Accept only if it matches.",
+                    request.code
+                ),
+            )
+            .confirm_label("Accept")
+            .on_confirm(move |_, cx| answer_pairing(cx, id, true))
+            .on_cancel(move |_, cx| answer_pairing(cx, id, false))
+        });
+
         let body = match &self.onboarding {
             Some((onboarding, _)) => div().flex_1().min_h_0().child(onboarding.clone()),
             None => self.shell_body(cx),
@@ -173,6 +199,7 @@ impl Render for Workspace {
         let theme = cx.theme();
 
         let content = div()
+            .relative()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .flex()
@@ -194,7 +221,8 @@ impl Render for Workspace {
             })
             .child(body)
             // The status bar is part of the shell, not onboarding.
-            .when(self.onboarding.is_none(), |d| d.child(StatusBar));
+            .when(self.onboarding.is_none(), |d| d.child(StatusBar))
+            .children(pairing_dialog);
 
         client_side_decorations(content, window, cx)
     }

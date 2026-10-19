@@ -11,6 +11,7 @@ pub mod db;
 pub mod identity;
 pub mod logging;
 mod node;
+pub mod pairing;
 mod paths;
 pub mod profile;
 pub mod protocol;
@@ -26,6 +27,7 @@ pub use node::{
     AllowAll, EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeError, NodeEvent,
     NodeHandle, PeerGate, relay_url,
 };
+pub use pairing::verification_code;
 pub use paths::{DataDir, PathsError, override_env_var};
 pub use profile::{Profile, validate_display_name};
 pub use protocol::{PeerInfo, PeerProfile, ProtocolError, avatar_hash};
