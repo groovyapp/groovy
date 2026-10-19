@@ -17,13 +17,18 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError};
+
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
 const WORKER_THREADS: usize = 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The ALPN for Groovy's protocol. Connections offering any other ALPN are refused.
-pub const GROOVY_ALPN: &[u8] = b"groovy/0";
+pub const GROOVY_ALPN: &[u8] = protocol::ALPN;
+
+/// The profile shared with peers, shared between the node's tasks and its handle.
+type SharedProfile = Arc<Mutex<PeerProfile>>;
 
 /// Errors from starting the node or sending it a command.
 #[derive(Debug, Error)]
@@ -36,6 +41,8 @@ pub enum NodeError {
     Bind(#[source] BindError),
     #[error("invalid bind address")]
     InvalidBindAddress(#[source] InvalidSocketAddr),
+    #[error("the peer could not be reached")]
+    Connect(#[source] ProtocolError),
     #[error("the node has stopped")]
     Stopped,
 }
@@ -56,6 +63,8 @@ pub struct NodeConfig {
     /// The node's identity. Its public key is the endpoint ID peers dial.
     pub secret_key: SecretKey,
     pub network: Network,
+    /// What peers see about this node. Change it later with [`NodeHandle::set_profile`].
+    pub profile: PeerProfile,
 }
 
 /// Lifecycle events published by the node.
@@ -64,12 +73,17 @@ pub enum NodeEvent {
     Started,
     /// The node's reachable addresses changed. Covers the home relay and direct addresses.
     AddressChanged(EndpointAddr),
+    /// A peer finished the handshake, either because it dialed us or because we dialed it.
+    PeerConnected(PeerInfo),
+    /// A connection to a peer closed.
+    PeerDisconnected(EndpointId),
     Stopped,
 }
 
 enum Command {
     Ping(oneshot::Sender<()>),
     Addr(oneshot::Sender<EndpointAddr>),
+    Connect(EndpointAddr, oneshot::Sender<Result<PeerInfo, NodeError>>),
 }
 
 /// The relay URL the node is reachable through, if it has a home relay.
@@ -96,6 +110,8 @@ impl Node {
             .map_err(NodeError::Runtime)?;
 
         let endpoint_id = config.secret_key.public();
+        let profile: SharedProfile = Arc::new(Mutex::new(config.profile.clone()));
+        let profile_for_handle = profile.clone();
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         // Subscribe before the thread starts so `Started` is never missed.
@@ -105,7 +121,14 @@ impl Node {
         let thread = thread::Builder::new()
             .name("groovy-node".into())
             .spawn(move || {
-                runtime.block_on(run(config, command_rx, shutdown_rx, event_tx, ready_tx))
+                runtime.block_on(run(
+                    config,
+                    profile,
+                    command_rx,
+                    shutdown_rx,
+                    event_tx,
+                    ready_tx,
+                ))
             })
             .map_err(NodeError::Spawn)?;
 
@@ -124,6 +147,7 @@ impl Node {
 
         let handle = NodeHandle {
             endpoint_id,
+            profile: profile_for_handle,
             commands: command_tx,
             shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
             thread: Arc::new(Mutex::new(Some(thread))),
@@ -150,6 +174,7 @@ async fn bind(config: &NodeConfig) -> Result<Endpoint, NodeError> {
 
 async fn run(
     config: NodeConfig,
+    profile: SharedProfile,
     mut commands: mpsc::Receiver<Command>,
     shutdown: oneshot::Receiver<()>,
     events: broadcast::Sender<NodeEvent>,
@@ -163,7 +188,13 @@ async fn run(
         }
     };
     let router = Router::builder(endpoint.clone())
-        .accept(GROOVY_ALPN, HoldOpen)
+        .accept(
+            protocol::ALPN,
+            GroovyProtocol {
+                profile: profile.clone(),
+                events: events.clone(),
+            },
+        )
         .spawn();
     let mut addresses = endpoint.watch_addr();
 
@@ -181,6 +212,15 @@ async fn run(
                 }
                 Some(Command::Addr(reply)) => {
                     let _ = reply.send(endpoint.addr());
+                }
+                Some(Command::Connect(addr, reply)) => {
+                    // Dialing takes a network round trip, so it runs on its own task.
+                    let endpoint = endpoint.clone();
+                    let profile = profile.clone();
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(dial(&endpoint, addr, &profile, &events).await);
+                    });
                 }
                 // Every handle has been dropped.
                 None => break,
@@ -207,14 +247,68 @@ async fn run(
     let _ = events.send(NodeEvent::Stopped);
 }
 
-/// Placeholder for Groovy's protocol handler, which lands in #17. It keeps a
-/// connection open until the peer closes it.
-#[derive(Debug)]
-struct HoldOpen;
+fn current_profile(profile: &SharedProfile) -> PeerProfile {
+    profile
+        .lock()
+        .map(|profile| profile.clone())
+        .unwrap_or_default()
+}
 
-impl ProtocolHandler for HoldOpen {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+/// Dials `addr` and runs the handshake. The connection stays open until the peer
+/// closes it, and a `PeerDisconnected` event follows.
+async fn dial(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    profile: &SharedProfile,
+    events: &broadcast::Sender<NodeEvent>,
+) -> Result<PeerInfo, NodeError> {
+    let connection = endpoint
+        .connect(addr, protocol::ALPN)
+        .await
+        .map_err(|error| {
+            // A peer on another protocol version does not offer our ALPN, so the TLS
+            // handshake fails with a message that names the protocol.
+            if error.to_string().contains("known protocol") {
+                NodeError::Connect(ProtocolError::UnsupportedProtocol)
+            } else {
+                NodeError::Connect(ProtocolError::Connection(Box::new(error)))
+            }
+        })?;
+    let peer = protocol::handshake_outgoing(&connection, current_profile(profile))
+        .await
+        .map_err(NodeError::Connect)?;
+
+    let _ = events.send(NodeEvent::PeerConnected(peer.clone()));
+    let endpoint_id = peer.endpoint_id;
+    let events = events.clone();
+    tokio::spawn(async move {
         connection.closed().await;
+        let _ = events.send(NodeEvent::PeerDisconnected(endpoint_id));
+    });
+    Ok(peer)
+}
+
+/// Groovy's protocol handler: answers handshakes from peers that dial us.
+///
+/// Trust is not checked yet. Contacts and pairing (#19, #20) will decide which
+/// endpoints may connect, and refuse the others here.
+#[derive(Debug)]
+struct GroovyProtocol {
+    profile: SharedProfile,
+    events: broadcast::Sender<NodeEvent>,
+}
+
+impl ProtocolHandler for GroovyProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        match protocol::handshake_incoming(&connection, current_profile(&self.profile)).await {
+            Ok(peer) => {
+                let endpoint_id = peer.endpoint_id;
+                let _ = self.events.send(NodeEvent::PeerConnected(peer));
+                connection.closed().await;
+                let _ = self.events.send(NodeEvent::PeerDisconnected(endpoint_id));
+            }
+            Err(error) => warn!(%error, "a peer's handshake failed"),
+        }
         Ok(())
     }
 }
@@ -225,6 +319,7 @@ impl ProtocolHandler for HoldOpen {
 #[derive(Clone)]
 pub struct NodeHandle {
     endpoint_id: EndpointId,
+    profile: SharedProfile,
     commands: mpsc::Sender<Command>,
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -234,6 +329,23 @@ impl NodeHandle {
     /// This node's endpoint ID, which is its public key.
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint_id
+    }
+
+    /// Replaces the profile peers see. Takes effect for handshakes from now on.
+    pub fn set_profile(&self, profile: PeerProfile) {
+        if let Ok(mut current) = self.profile.lock() {
+            *current = profile;
+        }
+    }
+
+    /// Dials a peer by its address and runs the handshake. Returns the peer's profile.
+    pub async fn connect(&self, addr: EndpointAddr) -> Result<PeerInfo, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Connect(addr, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
     }
 
     /// The node's current address, including its home relay and direct addresses.
@@ -317,9 +429,17 @@ mod tests {
     const TIMEOUT: Duration = Duration::from_secs(3);
 
     fn local_config() -> NodeConfig {
+        named_config("")
+    }
+
+    fn named_config(name: &str) -> NodeConfig {
         NodeConfig {
             secret_key: SecretKey::generate(),
             network: Network::LocalOnly,
+            profile: PeerProfile {
+                display_name: name.to_owned(),
+                avatar_hash: None,
+            },
         }
     }
 
@@ -408,5 +528,62 @@ mod tests {
         drop(handle);
 
         assert_eq!(events.next().await, Some(NodeEvent::Stopped));
+    }
+
+    /// Waits for the next event that matches `wanted`, skipping the rest.
+    async fn next_matching(
+        events: &mut EventStream,
+        wanted: impl Fn(&NodeEvent) -> bool,
+    ) -> NodeEvent {
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("the node keeps publishing events");
+            if wanted(&event) {
+                return event;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_nodes_exchange_profiles_when_one_dials_the_other() {
+        let (node_a, mut events_a) = start(named_config("Ada")).await;
+        let (node_b, mut events_b) = start(named_config("Grace")).await;
+        let addr_b = node_b.addr().await.unwrap();
+
+        let seen_by_a = node_a.connect(addr_b).await.expect("handshake completes");
+
+        assert_eq!(seen_by_a.endpoint_id, node_b.endpoint_id());
+        assert_eq!(seen_by_a.profile.display_name, "Grace");
+        let seen_by_b = next_matching(&mut events_b, |event| {
+            matches!(event, NodeEvent::PeerConnected(_))
+        })
+        .await;
+        assert!(matches!(
+            seen_by_b,
+            NodeEvent::PeerConnected(PeerInfo { ref profile, .. }) if profile.display_name == "Ada"
+        ));
+        let _ = &mut events_a;
+        assert!(node_a.shutdown(TIMEOUT));
+        assert!(node_b.shutdown(TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn a_changed_profile_is_what_later_handshakes_show() {
+        let (node_a, _events_a) = start(named_config("Ada")).await;
+        let (node_b, _events_b) = start(named_config("Grace")).await;
+        let addr_b = node_b.addr().await.unwrap();
+
+        node_b.set_profile(PeerProfile {
+            display_name: "Grace Hopper".to_owned(),
+            avatar_hash: Some([9; 32]),
+        });
+        let seen = node_a.connect(addr_b).await.unwrap();
+
+        assert_eq!(seen.profile.display_name, "Grace Hopper");
+        assert_eq!(seen.profile.avatar_hash, Some([9; 32]));
+        assert!(node_a.shutdown(TIMEOUT));
+        assert!(node_b.shutdown(TIMEOUT));
     }
 }

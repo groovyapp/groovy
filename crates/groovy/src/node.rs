@@ -2,8 +2,11 @@
 
 use std::time::Duration;
 
-use gpui::{App, Global};
-use groovy_core::{EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, relay_url};
+use gpui::{App, AppContext, Global};
+use groovy_core::{
+    EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, NodeHandle, PeerProfile,
+    relay_url,
+};
 use tracing::{error, info, warn};
 
 use crate::data::AppData;
@@ -33,11 +36,20 @@ pub struct NodeState {
     status: NodeStatus,
     endpoint_id: EndpointId,
     addr: Option<EndpointAddr>,
+    /// Kept so the UI can publish profile changes to peers.
+    handle: Option<NodeHandle>,
 }
 
 impl Global for NodeState {}
 
 impl NodeState {
+    /// Tells peers about a change to this node's profile.
+    fn publish(&self, profile: PeerProfile) {
+        if let Some(handle) = &self.handle {
+            handle.set_profile(profile);
+        }
+    }
+
     pub fn status(&self) -> NodeStatus {
         self.status
     }
@@ -49,6 +61,13 @@ impl NodeState {
     /// The relay the node is reachable through, once its address is known.
     pub fn relay(&self) -> Option<String> {
         self.addr.as_ref().and_then(relay_url)
+    }
+}
+
+/// Tells peers about a change to this node's profile. Does nothing if the node is not running.
+pub fn publish_profile(cx: &App, profile: PeerProfile) {
+    if let Some(state) = cx.try_global::<NodeState>() {
+        state.publish(profile);
     }
 }
 
@@ -65,6 +84,8 @@ pub fn start(cx: &mut App) {
     let (handle, events) = match Node::start(NodeConfig {
         secret_key,
         network: Network::Public,
+        // Replaced below with the stored profile, which is read in the background.
+        profile: PeerProfile::default(),
     }) {
         Ok(started) => started,
         Err(error) => {
@@ -73,6 +94,7 @@ pub fn start(cx: &mut App) {
                 status: NodeStatus::Offline,
                 endpoint_id,
                 addr: None,
+                handle: None,
             });
             return;
         }
@@ -81,7 +103,18 @@ pub fn start(cx: &mut App) {
         status: NodeStatus::Starting,
         endpoint_id,
         addr: None,
+        handle: Some(handle.clone()),
     });
+
+    // Publish the stored profile once it has been read.
+    let database = cx.global::<AppData>().database.clone();
+    let loaded = cx.background_spawn(async move { database.profile() });
+    cx.spawn(async move |cx| {
+        if let Ok(Some(profile)) = loaded.await {
+            cx.update(|cx| publish_profile(cx, PeerProfile::from_profile(&profile)));
+        }
+    })
+    .detach();
 
     cx.spawn(async move |cx| {
         let mut events = events;
@@ -93,6 +126,8 @@ pub fn start(cx: &mut App) {
                     NodeEvent::Started => state.status = NodeStatus::Online,
                     NodeEvent::AddressChanged(addr) => state.addr = Some(addr),
                     NodeEvent::Stopped => state.status = NodeStatus::Offline,
+                    // Peers are shown once the Peers screen exists (#25).
+                    NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }
                 cx.refresh_windows();
             });
