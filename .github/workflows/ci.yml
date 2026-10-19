@@ -44,3 +44,38 @@ jobs:
 
       - name: Build
         run: cargo build --release --workspace
+
+  # The oldest toolchain that builds the workspace. The pinned GPUI needs it;
+  # see the README. Raising it is a deliberate change, made here and in the README.
+  msrv:
+    name: Minimum supported Rust (1.99.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev libvulkan-dev libssl-dev libzstd-dev libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --all-targets
+
+  # Licenses, known vulnerabilities, and sources. Configured in deny.toml.
+  deny:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
