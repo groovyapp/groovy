@@ -41,7 +41,11 @@ After a successful handshake, each side emits `PeerConnected` with the other's e
 
 ## Trust
 
-Version 0 does not yet check who may connect. Contacts and pairing (#19, #20) will decide which endpoints may complete a handshake, and refuse the rest in the handler. Until then, any endpoint that offers the ALPN can handshake.
+Before a connection is accepted, the node asks its peer gate whether the remote endpoint may connect. A blocked endpoint's connection is closed with application code 2 before the handshake, so it learns nothing and uses no protocol. The same check applies when this node dials a peer, which it will not do for a blocked one.
+
+After each successful handshake, the peer is recorded as a contact with trust `pending`. Trust is only changed by the user, through pairing (#20) or a block. A handshake never changes it.
+
+Blob, gossip and docs protocols (#26, #41, #43) must use the same gate before serving anyone.
 
 ## Not yet specified
 

@@ -3,9 +3,11 @@
 use std::time::Duration;
 
 use gpui::{App, AppContext, Global};
+use std::sync::Arc;
+
 use groovy_core::{
-    EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, NodeHandle, PeerProfile,
-    relay_url,
+    ContactGate, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent, NodeHandle,
+    PeerProfile, relay_url,
 };
 use tracing::{error, info, warn};
 
@@ -90,12 +92,14 @@ pub fn start(cx: &mut App) {
     }
     let secret_key = cx.global::<AppData>().identity.secret_key().clone();
     let endpoint_id = secret_key.public();
+    let database = cx.global::<AppData>().database.clone();
 
     let (handle, events) = match Node::start(NodeConfig {
         secret_key,
         network: Network::Public,
         // Replaced below with the stored profile, which is read in the background.
         profile: PeerProfile::default(),
+        gate: Arc::new(ContactGate::new(database.clone())),
     }) {
         Ok(started) => started,
         Err(error) => {

@@ -2,11 +2,12 @@
 //! directory. Everything runs on loopback, so no network or relay is needed.
 
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use groovy_core::{
-    DataDir, Database, EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeEvent, NodeHandle,
-    PeerProfile, SecretKey,
+    AllowAll, ContactGate, DataDir, Database, EventStream, GROOVY_ALPN, Network, Node, NodeConfig,
+    NodeEvent, NodeHandle, PeerProfile, SecretKey, Trust,
 };
 use iroh::endpoint::presets::Minimal;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -18,6 +19,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         secret_key,
         network: Network::LocalOnly,
         profile: PeerProfile::default(),
+        gate: Arc::new(AllowAll),
     }
 }
 
@@ -196,4 +198,64 @@ async fn a_ticket_copied_from_one_node_lets_another_connect() {
     assert_eq!(peer.endpoint_id, node_a.endpoint_id());
     assert!(node_a.shutdown(TIMEOUT));
     assert!(node_b.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_blocked_peer_is_refused_and_an_ordinary_peer_is_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = DataDir::at(tmp.path());
+    dir.create_all().unwrap();
+    let db = Arc::new(Database::open(&dir.database_file()).unwrap());
+
+    let blocked = SecretKey::generate();
+    let ordinary = SecretKey::generate();
+    // This node knows the blocked peer and has blocked it.
+    db.record_handshake(
+        &groovy_core::PeerInfo {
+            endpoint_id: blocked.public(),
+            profile: PeerProfile::default(),
+        },
+        0,
+    )
+    .unwrap();
+    db.set_trust(blocked.public(), Trust::Blocked).unwrap();
+
+    let node_config = NodeConfig {
+        gate: Arc::new(ContactGate::new(db.clone())),
+        ..config(SecretKey::generate())
+    };
+    let (server, mut server_events) = Node::start(node_config).expect("server starts");
+    assert_eq!(server_events.next().await, Some(NodeEvent::Started));
+    let server_addr = server.addr().await.unwrap();
+
+    // The blocked peer is refused.
+    let (blocked_node, _events) = start(blocked).await;
+    let refused = blocked_node.connect(server_addr.clone()).await;
+    assert!(refused.is_err(), "a blocked peer connects: {refused:?}");
+
+    // An ordinary peer gets in, and the server records it.
+    let (ordinary_node, _events) = start(ordinary.clone()).await;
+    ordinary_node
+        .connect(server_addr)
+        .await
+        .expect("an ordinary peer connects");
+    loop {
+        if let NodeEvent::PeerConnected(_) = server_events.next().await.unwrap() {
+            break;
+        }
+    }
+    let recorded = db.contact(ordinary.public()).unwrap();
+    assert!(recorded.is_some(), "the ordinary peer is recorded");
+
+    // This node will not dial a peer it has blocked.
+    let blocked_addr = blocked_node.addr().await.unwrap();
+    let outgoing = server.connect(blocked_addr).await;
+    assert!(
+        matches!(outgoing, Err(groovy_core::NodeError::Blocked)),
+        "{outgoing:?}"
+    );
+
+    ordinary_node.shutdown(TIMEOUT);
+    blocked_node.shutdown(TIMEOUT);
+    assert!(server.shutdown(TIMEOUT));
 }

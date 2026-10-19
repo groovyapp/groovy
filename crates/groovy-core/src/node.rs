@@ -43,6 +43,8 @@ pub enum NodeError {
     InvalidBindAddress(#[source] InvalidSocketAddr),
     #[error("the peer could not be reached")]
     Connect(#[source] ProtocolError),
+    #[error("this peer is blocked")]
+    Blocked,
     #[error("the node has stopped")]
     Stopped,
 }
@@ -57,14 +59,37 @@ pub enum Network {
     LocalOnly,
 }
 
+/// Decides which peers may connect, and hears about each handshake.
+///
+/// `may_connect` is asked before a connection is accepted or dialed, so a refused
+/// peer never reaches a protocol. `handshook` is told about each peer that
+/// completes the handshake, in either direction.
+pub trait PeerGate: Send + Sync + 'static {
+    fn may_connect(&self, peer: &EndpointId) -> bool;
+    fn handshook(&self, peer: &PeerInfo);
+}
+
+/// A gate that lets every peer in and ignores handshakes.
+pub struct AllowAll;
+
+impl PeerGate for AllowAll {
+    fn may_connect(&self, _peer: &EndpointId) -> bool {
+        true
+    }
+
+    fn handshook(&self, _peer: &PeerInfo) {}
+}
+
 /// What a node needs to start.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeConfig {
     /// The node's identity. Its public key is the endpoint ID peers dial.
     pub secret_key: SecretKey,
     pub network: Network,
     /// What peers see about this node. Change it later with [`NodeHandle::set_profile`].
     pub profile: PeerProfile,
+    /// Decides which peers may connect. Use [`AllowAll`] where nothing is blocked.
+    pub gate: Arc<dyn PeerGate>,
 }
 
 /// Lifecycle events published by the node.
@@ -187,12 +212,14 @@ async fn run(
             return;
         }
     };
+    let gate = config.gate.clone();
     let router = Router::builder(endpoint.clone())
         .accept(
             protocol::ALPN,
             GroovyProtocol {
                 profile: profile.clone(),
                 events: events.clone(),
+                gate: gate.clone(),
             },
         )
         .spawn();
@@ -218,8 +245,9 @@ async fn run(
                     let endpoint = endpoint.clone();
                     let profile = profile.clone();
                     let events = events.clone();
+                    let gate = gate.clone();
                     tokio::spawn(async move {
-                        let _ = reply.send(dial(&endpoint, addr, &profile, &events).await);
+                        let _ = reply.send(dial(&endpoint, addr, &profile, &events, &gate).await);
                     });
                 }
                 // Every handle has been dropped.
@@ -261,7 +289,11 @@ async fn dial(
     addr: EndpointAddr,
     profile: &SharedProfile,
     events: &broadcast::Sender<NodeEvent>,
+    gate: &Arc<dyn PeerGate>,
 ) -> Result<PeerInfo, NodeError> {
+    if !gate.may_connect(&addr.id) {
+        return Err(NodeError::Blocked);
+    }
     let connection = endpoint
         .connect(addr, protocol::ALPN)
         .await
@@ -277,6 +309,7 @@ async fn dial(
     let peer = protocol::handshake_outgoing(&connection, current_profile(profile))
         .await
         .map_err(NodeError::Connect)?;
+    gate.handshook(&peer);
 
     let _ = events.send(NodeEvent::PeerConnected(peer.clone()));
     let endpoint_id = peer.endpoint_id;
@@ -292,16 +325,30 @@ async fn dial(
 ///
 /// Trust is not checked yet. Contacts and pairing (#19, #20) will decide which
 /// endpoints may connect, and refuse the others here.
-#[derive(Debug)]
 struct GroovyProtocol {
     profile: SharedProfile,
     events: broadcast::Sender<NodeEvent>,
+    gate: Arc<dyn PeerGate>,
 }
+
+impl std::fmt::Debug for GroovyProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroovyProtocol").finish_non_exhaustive()
+    }
+}
+
+/// The application close code sent to a peer that is refused by the gate.
+const CLOSE_BLOCKED: u32 = 2;
 
 impl ProtocolHandler for GroovyProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if !self.gate.may_connect(&connection.remote_id()) {
+            connection.close(CLOSE_BLOCKED.into(), b"blocked");
+            return Ok(());
+        }
         match protocol::handshake_incoming(&connection, current_profile(&self.profile)).await {
             Ok(peer) => {
+                self.gate.handshook(&peer);
                 let endpoint_id = peer.endpoint_id;
                 let _ = self.events.send(NodeEvent::PeerConnected(peer));
                 connection.closed().await;
@@ -440,6 +487,7 @@ mod tests {
                 display_name: name.to_owned(),
                 avatar_hash: None,
             },
+            gate: Arc::new(AllowAll),
         }
     }
 
