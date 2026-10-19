@@ -34,11 +34,8 @@ confidence-threshold = 0.8
 
 # Copyleft crates that reach us through GPUI or the Windows and UEFI toolchains.
 # Each needs a decision, recorded here. Remove the entry to fail the check again.
-[[licenses.exceptions]]
-allow = ["GPL-2.0-only"]
-crate = "self_cell"
-# Used by GPUI's text layout (cosmic-text / swash), inside the Zed revision we pin.
-# Undecided: confirm with the maintainer whether a GPL-2.0 dependency is acceptable.
+# self_cell is dual-licensed "Apache-2.0 OR GPL-2.0-only", so it is taken under
+# Apache-2.0 and needs no exception.
 
 [[licenses.exceptions]]
 allow = ["LGPL-2.1-or-later"]
