@@ -32,10 +32,10 @@ pub use identity::{Identity, IdentityError, Location};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 pub use node::{
     AllowAll, EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeError, NodeEvent,
-    NodeHandle, PeerGate, relay_url,
+    NodeHandle, PeerGate, SharePreview, ShareTicket, relay_url,
 };
 pub use pairing::verification_code;
-pub use paths::{DataDir, PathsError, override_env_var};
+pub use paths::{DataDir, DataLock, PathsError, override_env_var};
 pub use presence::{Route, Tracker};
 pub use profile::{Profile, validate_display_name};
 pub use protocol::{PeerInfo, PeerProfile, ProtocolError, avatar_hash};

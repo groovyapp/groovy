@@ -19,6 +19,21 @@ pub enum PathsError {
         #[source]
         source: io::Error,
     },
+    #[error("another Groovy is already using {path}; close it first")]
+    Locked { path: PathBuf },
+    #[error("failed to lock {path}")]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Holds a data directory's lock. The lock is released when this is dropped, or when
+/// the process exits.
+#[derive(Debug)]
+pub struct DataLock {
+    _file: fs::File,
 }
 
 /// The environment variable that overrides the data directory, derived from
@@ -60,6 +75,32 @@ impl DataDir {
         let dirs = ProjectDirs::from("", "", app_name)
             .ok_or_else(|| PathsError::NoDataDir(override_env_var(app_name)))?;
         Ok(Self::at(dirs.data_dir()))
+    }
+
+    /// Locks the data directory for this process, so the desktop app and the command-line
+    /// client never run on the same data at once. Fails if another Groovy holds the lock.
+    pub fn lock(&self) -> Result<DataLock, PathsError> {
+        fs::create_dir_all(&self.root).map_err(|source| PathsError::Create {
+            path: self.root.clone(),
+            source,
+        })?;
+        let path = self.root.join("lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|source| PathsError::Lock {
+                path: path.clone(),
+                source,
+            })?;
+        match file.try_lock() {
+            Ok(()) => Ok(DataLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(PathsError::Locked {
+                path: self.root.clone(),
+            }),
+            Err(fs::TryLockError::Error(source)) => Err(PathsError::Lock { path, source }),
+        }
     }
 
     /// A data directory rooted at `root`. Nothing is created until [`Self::create_all`].
@@ -157,5 +198,15 @@ mod tests {
         }
         // Calling it again on existing directories is fine.
         dir.create_all().unwrap();
+    }
+
+    #[test]
+    fn a_data_directory_is_locked_by_one_holder_at_a_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DataDir::at(tmp.path());
+        let first = dir.lock().unwrap();
+        assert!(matches!(dir.lock(), Err(PathsError::Locked { .. })));
+        drop(first);
+        dir.lock().expect("the lock is free once released");
     }
 }

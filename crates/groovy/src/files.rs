@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    App, Context, ExternalPaths, FontWeight, PathPromptOptions, SharedString, Window, div,
+    App, Context, Entity, ExternalPaths, FontWeight, PathPromptOptions, SharedString, Window, div,
     prelude::*, px,
 };
+use groovy_core::shares::Share;
 use groovy_core::transfers::{Transfer, TransferState};
-use groovy_core::{Database, EndpointAddr, EndpointId, Trust};
+use groovy_core::{Database, EndpointAddr, EndpointId, SharePreview, Trust};
 use tracing::warn;
 
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
     ui::{
         button::{Button, Variant},
         icon::Icon,
+        input::TextInput,
         progress::ProgressBar,
     },
 };
@@ -28,15 +30,130 @@ pub struct FilesView {
     /// Files and folders chosen or dropped, waiting for a contact to send them to.
     chosen: Vec<PathBuf>,
     status: Option<(bool, SharedString)>,
+    /// The ticket of the share made most recently, to copy.
+    new_ticket: Option<String>,
+    /// Where a share ticket is pasted.
+    ticket_input: Entity<TextInput>,
+    /// A ticket that has been read, and what it offers, waiting for the user to download it.
+    preview: Option<(String, SharePreview)>,
 }
 
 impl FilesView {
-    pub fn new(database: Arc<Database>) -> Self {
+    pub fn new(database: Arc<Database>, cx: &mut Context<Self>) -> Self {
+        let ticket_input = cx.new(|cx| TextInput::new("Paste a share ticket", cx));
         Self {
             database,
             chosen: Vec::new(),
             status: None,
+            new_ticket: None,
+            ticket_input,
+            preview: None,
         }
+    }
+
+    /// Makes a share of the chosen files and folders. Anyone with its ticket can download
+    /// them while this node is online.
+    fn make_share(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            self.set_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        let paths = self.chosen.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.create_share(paths).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(shared) => {
+                    view.new_ticket = Some(shared.ticket);
+                    view.set_status(
+                        false,
+                        "Share made. Anyone with its ticket can download it while this device is online.",
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "could not make a share");
+                    view.set_status(true, format!("The share could not be made: {error}"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops a share. Its content is refused to anyone who is not a contact from now on.
+    fn revoke_share(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            self.set_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.revoke_share(id).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(()) => view.set_status(false, "Share stopped.", cx),
+                Err(error) => {
+                    view.set_status(true, format!("The share could not be stopped: {error}"), cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads a pasted ticket: its names and sizes, without downloading anything.
+    fn read_ticket(&mut self, cx: &mut Context<Self>) {
+        let ticket = self.ticket_input.read(cx).text().trim().to_owned();
+        if ticket.is_empty() {
+            self.set_status(true, "Paste a share ticket first.", cx);
+            return;
+        }
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            self.set_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        self.set_status(false, "Reading the share...", cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.preview_share(ticket.clone()).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(preview) => {
+                    view.preview = Some((ticket, preview));
+                    view.status = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    view.preview = None;
+                    view.set_status(true, format!("That share cannot be read: {error}"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Downloads the share that was previewed. It then appears under Transfers.
+    fn download_preview(&mut self, cx: &mut Context<Self>) {
+        let Some((ticket, _)) = self.preview.clone() else {
+            return;
+        };
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            self.set_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.receive_share(ticket).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(_) => {
+                    view.preview = None;
+                    view.ticket_input
+                        .update(cx, |input, cx| input.set_text("", cx));
+                    view.set_status(false, "Downloading. It appears under Transfers.", cx);
+                }
+                Err(error) => {
+                    view.set_status(true, format!("The download could not start: {error}"), cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn add_chosen(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
@@ -438,6 +555,38 @@ impl Render for FilesView {
 
         let choose_view = view.clone();
         let clear_view = view.clone();
+        let make_view = view.clone();
+        let read_view = view.clone();
+        let download_view = view.clone();
+
+        // Shares, as the database has them, with a stop button for each active one.
+        let share_rows = self
+            .database
+            .shares()
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .map(|share| share_row(share, view.clone(), theme.text_muted));
+
+        let preview_rows = self.preview.as_ref().map(|(_, preview)| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .py_2()
+                .child(div().text_sm().child(preview.names.join(", ")))
+                .child(div().text_xs().text_color(theme.text_muted).child(format!(
+                    "{} files, {}, from {}",
+                    preview.files,
+                    format_bytes(preview.bytes),
+                    abbreviate_id(&preview.from.to_string())
+                )))
+                .child(
+                    Button::new("share-download", "Download").on_click(move |_, cx| {
+                        download_view.update(cx, |view, cx| view.download_preview(cx));
+                    }),
+                )
+        });
         div()
             .flex()
             .flex_col()
@@ -491,6 +640,69 @@ impl Render for FilesView {
                     ),
             )
             .children(status)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("Share a link", theme.text))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child(
+                                "A link lets anyone who has it download these files while this device is online. Stop the share to take them back.",
+                            ),
+                    )
+                    .child(
+                        Button::new("share-make", "Make a share link")
+                            .variant(Variant::Secondary)
+                            .icon(Icon::Upload)
+                            .disabled(!has_chosen)
+                            .on_click(move |_, cx| {
+                                make_view.update(cx, |view, cx| view.make_share(cx));
+                            }),
+                    )
+                    .when_some(self.new_ticket.clone(), |column, ticket| {
+                        let copy = ticket.clone();
+                        column
+                            .child(div().text_xs().child(ticket))
+                            .child(
+                                Button::new("share-copy", "Copy ticket")
+                                    .variant(Variant::Secondary)
+                                    .icon(Icon::Copy)
+                                    .on_click(move |_, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ));
+                                    }),
+                            )
+                    }),
+            )
+            .child(section("Your shares", theme.text_muted, share_rows))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("Receive a share", theme.text))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().child(self.ticket_input.clone()))
+                            .child(
+                                Button::new("share-preview", "Preview")
+                                    .variant(Variant::Secondary)
+                                    .on_click(move |_, cx| {
+                                        read_view.update(cx, |view, cx| view.read_ticket(cx));
+                                    }),
+                            ),
+                    )
+                    .children(preview_rows),
+            )
             .child(section("Send to", theme.text_muted, contact_rows))
             .child(section("Offers", theme.text_muted, offer_rows))
             .child(section("Transfers", theme.text_muted, transfer_rows))
@@ -500,6 +712,52 @@ impl Render for FilesView {
                 received.unwrap_or_default(),
             ))
     }
+}
+
+/// A heading for a block of controls.
+fn section_title(title: &'static str, color: gpui::Hsla) -> impl IntoElement {
+    div()
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color)
+        .child(title)
+}
+
+/// One of your shares: its names, and whether it is still being served.
+fn share_row(share: Share, view: Entity<FilesView>, muted: gpui::Hsla) -> impl IntoElement {
+    let id = share.id;
+    let revoke_view = view;
+    let active = share.is_active();
+    let status = if active { "Active" } else { "Stopped" };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .py_1()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(div().text_sm().child(share.names.join(", ")))
+                .child(div().text_xs().text_color(muted).child(format!(
+                    "{} · {} files, {}",
+                    status,
+                    share.files,
+                    format_bytes(share.bytes)
+                ))),
+        )
+        .when(active, |row| {
+            row.child(
+                Button::new(format!("share-stop-{id}"), "Stop sharing")
+                    .variant(Variant::Danger)
+                    .on_click(move |_, cx| {
+                        revoke_view.update(cx, |view, cx| view.revoke_share(id, cx));
+                    }),
+            )
+        })
 }
 
 /// A titled list of rows. An empty list says so.

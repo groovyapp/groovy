@@ -169,7 +169,7 @@ The following crates are the intended dependencies. They are not yet in `Cargo.t
 
 ## Project layout
 
-This is a Cargo workspace. `groovy-core` holds the UI-free services and must not depend on GPUI. `groovy` is the desktop app, built on [GPUI](https://www.gpui.rs), the UI framework behind Zed.
+This is a Cargo workspace. `groovy-core` holds the UI-free services and must not depend on GPUI. `groovy` is the desktop app, built on [GPUI](https://www.gpui.rs), the UI framework behind Zed. `groovy-cli` is the command-line client for sending, receiving and listing peers. It uses the desktop app's data directory, so the two cannot run at the same time.
 
 ```
 crates/

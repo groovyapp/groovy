@@ -85,7 +85,7 @@ impl Workspace {
 
         let settings = cx.new(|cx| SettingsScreen::new(database.clone(), cx));
         let peers = cx.new(|cx| PeersView::new(database.clone(), cx));
-        let files = cx.new(|_| FilesView::new(database.clone()));
+        let files = cx.new(|cx| FilesView::new(database.clone(), cx));
 
         Self {
             current,
