@@ -1,0 +1,14 @@
+[package]
+name = "groovy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Send and receive files with Groovy from the command line"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+groovy-core = { path = "../groovy-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

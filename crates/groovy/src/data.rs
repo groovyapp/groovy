@@ -4,13 +4,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use gpui::Global;
-use groovy_core::{Config, DataDir, Database, Identity, Location};
+use groovy_core::{Config, DataDir, DataLock, Database, Identity, Location};
 use tracing::{info, warn};
 
 use crate::APP_NAME;
 
 /// The data directory, config, database and identity, shared with the rest of the app.
 pub struct AppData {
+    /// Held for the life of the app, so no other Groovy uses this data directory.
+    _lock: DataLock,
     pub dir: DataDir,
     pub config: Config,
     pub database: Arc<Database>,
@@ -29,6 +31,7 @@ pub fn prepare() -> anyhow::Result<DataDir> {
 
 /// Loads the config, opens the database (migrating it if needed) and loads the identity.
 pub fn load(dir: DataDir) -> anyhow::Result<AppData> {
+    let lock = dir.lock().context("failed to lock the data directory")?;
     let config = Config::load_or_create(&dir).context("failed to load the config")?;
     let database = Database::open(&dir.database_file()).context("failed to open the database")?;
     let identity =
@@ -41,6 +44,7 @@ pub fn load(dir: DataDir) -> anyhow::Result<AppData> {
         ),
     }
     Ok(AppData {
+        _lock: lock,
         dir,
         config,
         database: Arc::new(database),

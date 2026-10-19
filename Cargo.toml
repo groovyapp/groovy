@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/groovy", "crates/groovy-core"]
+members = ["crates/groovy", "crates/groovy-cli", "crates/groovy-core"]
 # `cargo run` and `cargo build` at the root build the desktop app.
 default-members = ["crates/groovy"]
 
