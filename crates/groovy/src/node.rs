@@ -70,7 +70,6 @@ impl NodeState {
 
     /// How a trusted contact is reached, if it answered its last check. `None` means
     /// it is not reachable now.
-    #[expect(dead_code, reason = "shown on the Peers screen (#25)")]
     pub fn route(&self, peer: &EndpointId) -> Option<Route> {
         self.routes.get(peer).copied()
     }

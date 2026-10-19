@@ -14,9 +14,9 @@ use crate::{
     data::AppData,
     node::{NodeState, answer_pairing},
     onboarding::{self, Onboarding, OnboardingEvent},
+    peers::PeersView,
     settings::SettingsScreen,
     theme::{self, ActiveTheme},
-    tickets::TicketPanel,
     title_bar::TitleBar,
     ui::dialog::ConfirmDialog,
     window_frame::{client_side_decorations, set_native_border_color},
@@ -37,7 +37,7 @@ pub struct Workspace {
     /// Shown instead of the shell until onboarding is finished.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     settings: Entity<SettingsScreen>,
-    tickets: Entity<TicketPanel>,
+    peers: Entity<PeersView>,
     _appearance_subscription: Subscription,
 }
 
@@ -82,7 +82,7 @@ impl Workspace {
         window.focus(&focus_handle, cx);
 
         let settings = cx.new(|cx| SettingsScreen::new(database.clone(), cx));
-        let tickets = cx.new(TicketPanel::new);
+        let peers = cx.new(|cx| PeersView::new(database.clone(), cx));
 
         Self {
             current,
@@ -90,7 +90,7 @@ impl Workspace {
             focus_handle,
             onboarding,
             settings,
-            tickets,
+            peers,
             _appearance_subscription,
         }
     }
@@ -263,7 +263,7 @@ impl Workspace {
                         d.child(self.settings.clone())
                     })
                     .when(self.current == Screen::Peers, |d| {
-                        d.child(self.tickets.clone())
+                        d.child(self.peers.clone())
                     })
                     .when(
                         !matches!(self.current, Screen::Settings | Screen::Peers),

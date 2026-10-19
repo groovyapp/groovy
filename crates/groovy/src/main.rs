@@ -5,6 +5,7 @@ mod backup;
 mod data;
 mod node;
 mod onboarding;
+mod peers;
 mod settings;
 mod settings_profile;
 mod theme;
