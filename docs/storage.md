@@ -1,6 +1,6 @@
 # Storage model: shared folders and replication
 
-Status: **proposal**, for review. Nothing here is built yet, apart from blobs (#26), shares, and transfers (#27 to #30), which this builds on. The open decisions at the end need an answer before #35 starts.
+Status: **partly built**. Shared folders (#35) follow this model: a folder is an iroh-docs replica, paths are keys, hashes are values, and deletes are empty entries. Not built yet: conflict copies (the newest entry wins for now), garbage collection and quotas (#38), replication status (#37). The open decisions at the end are answered by the recommendations, which #35 follows.
 
 ## What a shared folder is
 

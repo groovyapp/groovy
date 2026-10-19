@@ -28,6 +28,9 @@ use iroh_blobs::hashseq::HashSeq;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
+use iroh_docs::NamespaceId;
+use iroh_docs::protocol::Docs;
+use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
@@ -39,6 +42,9 @@ use crate::config::{Discovery, RelaySetting};
 use crate::contacts;
 use crate::db::Database;
 use crate::files;
+use crate::folder_sync;
+use crate::folders::{self, ExportReport, Folder, FolderAccess, FolderEntry};
+use crate::gated::TrustedOnly;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
@@ -85,6 +91,8 @@ pub enum NodeError {
     OfferDeclined,
     #[error("there are no offered files from that peer to answer")]
     NoPendingOffer,
+    #[error("shared folder failed: {0}")]
+    Folder(String),
     #[error("there is no transfer with that id")]
     UnknownTransfer,
     #[error("there is no share with that id, or it was already revoked")]
@@ -239,6 +247,37 @@ enum Command {
     ListShares(oneshot::Sender<Result<Vec<Share>, NodeError>>),
     PreviewShare(String, oneshot::Sender<Result<SharePreview, NodeError>>),
     ReceiveShare(String, oneshot::Sender<Result<i64, NodeError>>),
+    CreateFolder(
+        String,
+        Option<PathBuf>,
+        oneshot::Sender<Result<Folder, NodeError>>,
+    ),
+    JoinFolder(
+        String,
+        Option<PathBuf>,
+        oneshot::Sender<Result<Folder, NodeError>>,
+    ),
+    FolderTicket(
+        NamespaceId,
+        FolderAccess,
+        oneshot::Sender<Result<String, NodeError>>,
+    ),
+    AddToFolder(
+        NamespaceId,
+        String,
+        PathBuf,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
+    RemoveFromFolder(NamespaceId, String, oneshot::Sender<Result<(), NodeError>>),
+    FolderEntries(
+        NamespaceId,
+        oneshot::Sender<Result<Vec<FolderEntry>, NodeError>>,
+    ),
+    ExportFolder(
+        NamespaceId,
+        oneshot::Sender<Result<ExportReport, NodeError>>,
+    ),
+    ListFolders(oneshot::Sender<Result<Vec<Folder>, NodeError>>),
     PauseTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     ResumeTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     CancelTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
@@ -465,6 +504,46 @@ async fn run(
             },
         },
     );
+    // Shared folders keep their replicas beside the blobs, and need both to work.
+    let folders = match (&blobs, &config.blobs, &config.database) {
+        (Some(store), Some(blobs_dir), Some(database)) => {
+            let gossip = Gossip::builder().spawn(endpoint.clone());
+            let docs_dir = blobs_dir.parent().unwrap_or(blobs_dir).join("docs");
+            if let Err(error) = std::fs::create_dir_all(&docs_dir) {
+                warn!(%error, "shared folders are not available");
+            }
+            let blob_api: iroh_blobs::api::Store = std::ops::Deref::deref(store).clone();
+            match Docs::persistent(docs_dir)
+                .spawn(endpoint.clone(), blob_api, gossip.clone())
+                .await
+            {
+                Ok(docs) => {
+                    let state = FolderState {
+                        docs: docs.clone(),
+                        store: store.clone(),
+                        database: database.clone(),
+                    };
+                    match database.folders() {
+                        Ok(saved) => saved.iter().for_each(|folder| state.sync(folder)),
+                        Err(error) => warn!(%error, "could not read the shared folders"),
+                    }
+                    router = router
+                        .accept(GOSSIP_ALPN, TrustedOnly::new(gossip.clone(), gate.clone()))
+                        .accept(
+                            iroh_docs::ALPN,
+                            TrustedOnly::new(docs.clone(), gate.clone()),
+                        );
+                    Some(state)
+                }
+                Err(error) => {
+                    warn!(%error, "shared folders are not available");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     if let Some(store) = &blobs {
         let (events, messages) = blobs::event_channel();
         tokio::spawn(blobs::decide(
@@ -607,6 +686,132 @@ async fn run(
                     tokio::spawn(async move {
                         let _ = reply.send(receive_share(&receiving, &ticket).await);
                     });
+                }
+                Some(Command::CreateFolder(name, path, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => match folders::create(
+                                &state.docs,
+                                &state.database,
+                                name,
+                                path,
+                                contacts::now(),
+                            )
+                            .await
+                            {
+                                Ok(folder) => {
+                                    state.sync(&folder);
+                                    Ok(folder)
+                                }
+                                Err(error) => Err(folder_error(error)),
+                            },
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::JoinFolder(ticket, path, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => match folders::join(
+                                &state.docs,
+                                &state.database,
+                                &ticket,
+                                path,
+                                contacts::now(),
+                            )
+                            .await
+                            {
+                                Ok(folder) => {
+                                    state.sync(&folder);
+                                    Ok(folder)
+                                }
+                                Err(error) => Err(folder_error(error)),
+                            },
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::FolderTicket(namespace, access, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => folders::ticket(&state.docs, namespace, access)
+                                .await
+                                .map_err(folder_error),
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::AddToFolder(namespace, key, source, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => folders::add_file(&state.docs, &state.store, namespace, &key, &source)
+                                .await
+                                .map_err(folder_error),
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::RemoveFromFolder(namespace, key, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => folders::remove(&state.docs, namespace, &key)
+                                .await
+                                .map_err(folder_error),
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::FolderEntries(namespace, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => folders::entries(&state.docs, namespace)
+                                .await
+                                .map_err(folder_error),
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::ExportFolder(namespace, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => match state.database.folder(namespace) {
+                                Ok(Some(Folder {
+                                    path: Some(dir), ..
+                                })) => folders::export(&state.docs, &state.store, namespace, &dir)
+                                    .await
+                                    .map_err(folder_error),
+                                Ok(_) => Err(NodeError::Folder(
+                                    "this device does not save that folder".to_owned(),
+                                )),
+                                Err(error) => Err(NodeError::Folder(error.to_string())),
+                            },
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::ListFolders(reply)) => {
+                    let outcome = match folder_state(&folders) {
+                        Ok(state) => state
+                            .database
+                            .folders()
+                            .map_err(|error| NodeError::Folder(error.to_string())),
+                        Err(error) => Err(error),
+                    };
+                    let _ = reply.send(outcome);
                 }
                 Some(Command::PauseTransfer(id, reply)) => {
                     let _ = reply.send(stop_transfer(&receiving, id, TransferState::Paused));
@@ -788,6 +993,40 @@ pub struct SharePreview {
     pub bytes: u64,
     /// The node that offers the share.
     pub from: EndpointId,
+}
+
+/// What shared folders need: the replicas, the blob store the files live in, and the
+/// database that records which folders this device is in.
+#[derive(Clone)]
+struct FolderState {
+    docs: Docs,
+    store: FsStore,
+    database: Arc<Database>,
+}
+
+impl FolderState {
+    /// Starts keeping a folder's directory in step with it, if this device saves it.
+    fn sync(&self, folder: &Folder) {
+        if let Some(dir) = &folder.path {
+            folder_sync::spawn(
+                self.docs.clone(),
+                std::ops::Deref::deref(&self.store).clone(),
+                folder.namespace,
+                dir.clone(),
+            );
+        }
+    }
+}
+
+/// The folder state, or the error to report when shared folders are not available.
+fn folder_state(folders: &Option<FolderState>) -> Result<FolderState, NodeError> {
+    folders.clone().ok_or_else(|| {
+        NodeError::Folder("shared folders need blob storage and a database".to_owned())
+    })
+}
+
+fn folder_error(error: folders::FolderError) -> NodeError {
+    NodeError::Folder(error.to_string())
 }
 
 /// What `start` hands the node thread: the transfer book, the next free transfer id,
@@ -1587,6 +1826,111 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::ReceiveShare(ticket, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Makes a shared folder. `path`, if given, is a local folder whose files are shared and
+    /// kept in step with it; the files already in it are shared at once.
+    pub async fn create_folder(
+        &self,
+        name: String,
+        path: Option<PathBuf>,
+    ) -> Result<Folder, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::CreateFolder(name, path, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Joins a shared folder from its ticket. `path`, if given, is where its files are saved.
+    pub async fn join_folder(
+        &self,
+        ticket: String,
+        path: Option<PathBuf>,
+    ) -> Result<Folder, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::JoinFolder(ticket, path, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// A ticket another member can use to join this folder, with the access it gives.
+    pub async fn folder_ticket(
+        &self,
+        namespace: NamespaceId,
+        access: FolderAccess,
+    ) -> Result<String, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::FolderTicket(namespace, access, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Copies a file into a folder at `key`, a relative path such as `photos/a.txt`.
+    pub async fn add_to_folder(
+        &self,
+        namespace: NamespaceId,
+        key: String,
+        source: PathBuf,
+    ) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::AddToFolder(namespace, key, source, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Removes the file at `key` from a folder. Members see it removed when they sync.
+    pub async fn remove_from_folder(
+        &self,
+        namespace: NamespaceId,
+        key: String,
+    ) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::RemoveFromFolder(namespace, key, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// The files a folder has now, as the newest entry for each path.
+    pub async fn folder_entries(
+        &self,
+        namespace: NamespaceId,
+    ) -> Result<Vec<FolderEntry>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::FolderEntries(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Writes the folder's downloaded files to the folder's save path on this device.
+    pub async fn export_folder(&self, namespace: NamespaceId) -> Result<ExportReport, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ExportFolder(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Every shared folder this device is in.
+    pub async fn folders(&self) -> Result<Vec<Folder>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ListFolders(reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

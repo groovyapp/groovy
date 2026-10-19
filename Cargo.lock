@@ -2468,6 +2468,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsevent-sys"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3165,9 +3174,12 @@ dependencies = [
  "image",
  "iroh",
  "iroh-blobs",
+ "iroh-docs",
+ "iroh-gossip",
  "iroh-mainline-address-lookup",
  "iroh-mdns-address-lookup",
  "keyring",
+ "notify",
  "postcard",
  "qrcode",
  "rusqlite",
@@ -3773,6 +3785,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
+dependencies = [
+ "bitflags 2.13.2",
+ "inotify-sys",
+ "libc",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c033f80b2c113cdf91ab7a33faa9cbc014726dcad99880c8609af2a370edf37d"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3955,7 +3987,7 @@ dependencies = [
  "postcard",
  "rand 0.10.3",
  "range-collections",
- "redb",
+ "redb 4.4.0",
  "ref-cast",
  "reflink-copy",
  "self_cell 1.3.0",
@@ -3986,6 +4018,73 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "iroh-docs"
+version = "0.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fd1bd5e39d0321a3c4a2bcef9650476c076e2df41a0e84577eca23d6de6c8ab"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "blake3",
+ "bytes",
+ "cfg_aliases",
+ "derive_more",
+ "futures-buffered",
+ "hex",
+ "iroh",
+ "iroh-blobs",
+ "iroh-gossip",
+ "iroh-metrics",
+ "iroh-tickets",
+ "irpc",
+ "n0-error",
+ "n0-future",
+ "noq",
+ "num_enum",
+ "postcard",
+ "rand 0.10.3",
+ "redb 3.1.3",
+ "redb 4.4.0",
+ "self_cell 1.3.0",
+ "serde",
+ "serde-error",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "iroh-gossip"
+version = "0.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e1dc4b05f73e7a1b9e83b531eb63c3fd671b0af3aeb13b59c546dd7ca747515"
+dependencies = [
+ "blake3",
+ "bytes",
+ "data-encoding",
+ "derive_more",
+ "futures-concurrency",
+ "hex",
+ "indexmap",
+ "iroh",
+ "iroh-base",
+ "iroh-metrics",
+ "irpc",
+ "n0-error",
+ "n0-future",
+ "postcard",
+ "rand 0.10.3",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -4338,6 +4437,26 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "kqueue"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d763e5b24120b4ddf50de6c92308156765aabfbbccebf401da7cff2d70a41ea"
+dependencies = [
+ "kqueue-sys",
+ "libc",
+]
+
+[[package]]
+name = "kqueue-sys"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+]
 
 [[package]]
 name = "kurbo"
@@ -4735,6 +4854,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -4786,6 +4906,7 @@ version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26c59ea174675ce6bc196878851e5049e11b8b1f9af3ba87e4d6df8d828bb001"
 dependencies = [
+ "anyhow",
  "n0-error-macros",
  "spez",
 ]
@@ -5204,6 +5325,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
+dependencies = [
+ "bitflags 2.13.2",
+ "fsevent-sys",
+ "inotify",
+ "kqueue",
+ "libc",
+ "log",
+ "mio",
+ "notify-types",
+ "walkdir",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "notify-rust"
 version = "4.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5215,6 +5354,15 @@ dependencies = [
  "serde",
  "tauri-winrt-notification",
  "zbus 5.19.0",
+]
+
+[[package]]
+name = "notify-types"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
+dependencies = [
+ "bitflags 2.13.2",
 ]
 
 [[package]]
@@ -6752,6 +6900,15 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redb"
+version = "3.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba239c1c1693315d3cc0e601db3b3965543afbf48c41730fdca2f069f510f4a"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "redb"
 version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
@@ -7401,6 +7558,15 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-error"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342110fb7a5d801060c885da03bf91bfa7c7ca936deafcc64bb6706375605d47"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -9056,6 +9222,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 
