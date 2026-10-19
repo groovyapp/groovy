@@ -15,10 +15,13 @@ use std::collections::HashMap;
 use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr, Watcher};
+use iroh_mainline_address_lookup::DhtAddressLookup;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::config::Discovery;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
@@ -108,6 +111,8 @@ pub struct NodeConfig {
     pub profile: PeerProfile,
     /// Decides which peers may connect. Use [`AllowAll`] where nothing is blocked.
     pub gate: Arc<dyn PeerGate>,
+    /// Extra ways to find peers, beyond their endpoint ID. Used on the public network.
+    pub discovery: Discovery,
 }
 
 /// Lifecycle events published by the node.
@@ -212,7 +217,16 @@ impl Node {
 
 async fn bind(config: &NodeConfig) -> Result<Endpoint, NodeError> {
     let builder = match config.network {
-        Network::Public => Endpoint::builder(presets::N0),
+        Network::Public => {
+            let mut builder = Endpoint::builder(presets::N0);
+            if config.discovery.local_network {
+                builder = builder.address_lookup(MdnsAddressLookup::builder());
+            }
+            if config.discovery.dht {
+                builder = builder.address_lookup(DhtAddressLookup::builder());
+            }
+            builder
+        }
         Network::LocalOnly => Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
             .clear_ip_transports()
@@ -764,6 +778,7 @@ mod tests {
                 avatar_hash: None,
             },
             gate: Arc::new(AllowAll),
+            discovery: Discovery::default(),
         }
     }
 

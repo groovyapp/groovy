@@ -20,6 +20,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         network: Network::LocalOnly,
         profile: PeerProfile::default(),
         gate: Arc::new(AllowAll),
+        discovery: groovy_core::Discovery::default(),
     }
 }
 

@@ -197,6 +197,7 @@ pub fn start(cx: &mut App) {
         // Replaced below with the stored profile, which is read in the background.
         profile: PeerProfile::default(),
         gate: Arc::new(ContactGate::new(database.clone())),
+        discovery: cx.global::<AppData>().config.discovery,
     }) {
         Ok(started) => started,
         Err(error) => {
