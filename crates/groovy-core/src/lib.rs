@@ -12,6 +12,7 @@ pub mod logging;
 mod node;
 mod paths;
 pub mod profile;
+pub mod protocol;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
 pub use config::{Appearance, CURRENT_VERSION, Config, ConfigError};
@@ -24,3 +25,4 @@ pub use node::{
 };
 pub use paths::{DataDir, PathsError, override_env_var};
 pub use profile::{Profile, validate_display_name};
+pub use protocol::{PeerInfo, PeerProfile, ProtocolError, avatar_hash};

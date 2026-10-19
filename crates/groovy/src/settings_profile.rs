@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, FontWeight, Image, ImageFormat, PathPromptOptions, SharedString, Subscription,
-    Window, div, prelude::*, px,
+    App, Context, Entity, FontWeight, Image, ImageFormat, PathPromptOptions, SharedString,
+    Subscription, Window, div, prelude::*, px,
 };
-use groovy_core::{Database, Profile, validate_display_name};
+use groovy_core::{Database, PeerProfile, Profile, validate_display_name};
 use tracing::warn;
 
 use crate::{
@@ -27,6 +27,8 @@ pub struct ProfileEditor {
     database: Arc<Database>,
     name: Entity<TextInput>,
     avatar: Option<Arc<Image>>,
+    /// The hash of the saved picture, which peers see instead of the picture.
+    avatar_hash: Option<[u8; 32]>,
     /// The last result, shown under the form: whether it was an error, and the message.
     status: Option<(bool, SharedString)>,
     busy: bool,
@@ -57,6 +59,7 @@ impl ProfileEditor {
             database,
             name,
             avatar: None,
+            avatar_hash: None,
             status: None,
             busy: false,
             _subscription,
@@ -72,6 +75,7 @@ impl ProfileEditor {
             Ok(Some(profile)) => {
                 self.name
                     .update(cx, |input, cx| input.set_text(profile.display_name, cx));
+                self.avatar_hash = profile.avatar_png.as_deref().map(groovy_core::avatar_hash);
                 self.avatar = profile.avatar_png.map(picture);
             }
             Ok(None) => {}
@@ -93,6 +97,20 @@ impl ProfileEditor {
         cx.notify();
     }
 
+    /// Tells peers the saved name and picture. Uses the name in the field, which
+    /// is what was just saved.
+    fn publish(&self, cx: &App) {
+        if let Some(display_name) = validate_display_name(self.name.read(cx).text()) {
+            crate::node::publish_profile(
+                cx,
+                PeerProfile {
+                    display_name,
+                    avatar_hash: self.avatar_hash,
+                },
+            );
+        }
+    }
+
     fn save_name(&mut self, cx: &mut Context<Self>) {
         let Some(name) = validate_display_name(self.name.read(cx).text()) else {
             return;
@@ -105,7 +123,10 @@ impl ProfileEditor {
             this.update(cx, |editor, cx| {
                 editor.busy = false;
                 match result {
-                    Ok(()) => editor.set_status(false, "Name saved.", cx),
+                    Ok(()) => {
+                        editor.publish(cx);
+                        editor.set_status(false, "Name saved.", cx);
+                    }
                     Err(error) => {
                         warn!(%error, "could not save the display name");
                         editor.set_status(true, "Could not save your name.", cx);
@@ -155,7 +176,9 @@ impl ProfileEditor {
                 editor.busy = false;
                 match result {
                     Ok(png) => {
+                        editor.avatar_hash = Some(groovy_core::avatar_hash(&png));
                         editor.avatar = Some(picture(png));
+                        editor.publish(cx);
                         editor.set_status(false, "Picture saved.", cx);
                     }
                     Err(message) => {
@@ -179,7 +202,9 @@ impl ProfileEditor {
                 editor.busy = false;
                 match result {
                     Ok(_) => {
+                        editor.avatar_hash = None;
                         editor.avatar = None;
+                        editor.publish(cx);
                         editor.set_status(false, "Picture removed.", cx);
                     }
                     Err(error) => {

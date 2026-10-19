@@ -171,6 +171,7 @@ crates/
     src/identity.rs      Ed25519 identity in the OS credential store, with a file fallback
       ui/                  Component kit (buttons, inputs, dialogs, toasts, menus, icons); see ui/mod.rs
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
+    src/protocol.rs      Groovy protocol: handshake, profile exchange, framing (see docs/protocol.md)
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point

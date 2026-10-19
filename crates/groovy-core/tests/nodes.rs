@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use groovy_core::{
     DataDir, Database, EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeEvent, NodeHandle,
-    SecretKey,
+    PeerProfile, SecretKey,
 };
 use iroh::endpoint::presets::Minimal;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -17,6 +17,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
     NodeConfig {
         secret_key,
         network: Network::LocalOnly,
+        profile: PeerProfile::default(),
     }
 }
 
@@ -116,4 +117,67 @@ fn data_written_to_a_directory_survives_reopening_it() {
 
     let reopened = Database::open(&dir.database_file()).unwrap();
     assert_eq!(reopened.profile().unwrap().unwrap().display_name, "Ada");
+}
+
+#[tokio::test]
+async fn a_peer_offering_another_protocol_version_is_refused() {
+    let (node, _events) = start(SecretKey::generate()).await;
+    let addr = node.addr().await.unwrap();
+    let dialer = dialer().await;
+
+    let result = tokio::time::timeout(TIMEOUT, dialer.connect(addr, b"groovy/1"))
+        .await
+        .expect("the refusal arrives in time");
+
+    let error = result.expect_err("a connection on another ALPN is refused");
+    // The node maps this iroh message to ProtocolError::UnsupportedProtocol when
+    // it dials a peer. This test dials raw, so it checks the text that mapping relies on.
+    assert!(error.to_string().contains("known protocol"), "{error}");
+    dialer.close().await;
+    assert!(node.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_handshake_with_another_version_gets_our_version_back() {
+    let (node, _events) = start(SecretKey::generate()).await;
+    let addr = node.addr().await.unwrap();
+    let dialer = dialer().await;
+    let connection = dialer.connect(addr, GROOVY_ALPN).await.unwrap();
+
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    let theirs = groovy_core::protocol::Hello {
+        protocol_version: groovy_core::protocol::PROTOCOL_VERSION + 1,
+        profile: PeerProfile::default(),
+    };
+    groovy_core::protocol::write_message(&mut send, &theirs)
+        .await
+        .unwrap();
+    let ours: groovy_core::protocol::Hello = groovy_core::protocol::read_message(&mut recv)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ours.protocol_version,
+        groovy_core::protocol::PROTOCOL_VERSION
+    );
+    dialer.close().await;
+    assert!(node.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_message_over_the_size_limit_closes_the_connection() {
+    let (node, _events) = start(SecretKey::generate()).await;
+    let addr = node.addr().await.unwrap();
+    let dialer = dialer().await;
+    let connection = dialer.connect(addr, GROOVY_ALPN).await.unwrap();
+
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    // Claim a body far larger than the limit, and never send it.
+    send.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+
+    tokio::time::timeout(TIMEOUT, connection.closed())
+        .await
+        .expect("the node closes the connection");
+    dialer.close().await;
+    assert!(node.shutdown(TIMEOUT));
 }
