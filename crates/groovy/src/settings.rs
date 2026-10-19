@@ -6,7 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use gpui::{App, Context, Entity, FontWeight, Window, div, prelude::*, px};
+use gpui::{App, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px};
 use groovy_core::{Appearance, DataDir, Database, RelaySetting};
 use tracing::warn;
 
@@ -19,6 +19,7 @@ use crate::{
     ui::{
         button::{Button, Variant},
         icon::Icon,
+        input::TextInput,
     },
 };
 
@@ -26,6 +27,9 @@ use crate::{
 pub struct SettingsScreen {
     profile: Entity<ProfileEditor>,
     backup: Entity<BackupSection>,
+    relay_input: Entity<TextInput>,
+    /// The last result of saving relays: whether it was an error, and the message.
+    relay_status: Option<(bool, SharedString)>,
 }
 
 impl SettingsScreen {
@@ -33,7 +37,35 @@ impl SettingsScreen {
         Self {
             profile: cx.new(|cx| ProfileEditor::new(database, cx)),
             backup: cx.new(BackupSection::new),
+            relay_input: cx.new(|cx| {
+                TextInput::new("https://relay.example.org./ (space or comma separated)", cx)
+            }),
+            relay_status: None,
         }
+    }
+
+    /// Uses the relay URLs typed in the field. Any token already set in config.toml is kept.
+    fn use_typed_relays(&mut self, cx: &mut Context<Self>) {
+        let text = self.relay_input.read(cx).text().to_owned();
+        match groovy_core::parse_relay_urls(&text) {
+            Ok(urls) => {
+                let auth_token = match &cx.global::<AppData>().config.relay {
+                    RelaySetting::Custom { auth_token, .. } => auth_token.clone(),
+                    _ => None,
+                };
+                self.set_relay(RelaySetting::Custom { urls, auth_token }, cx);
+                self.relay_input
+                    .update(cx, |input, cx| input.set_text("", cx));
+                self.relay_status = Some((
+                    false,
+                    "Saved. Takes effect the next time Groovy starts.".into(),
+                ));
+            }
+            Err(message) => {
+                self.relay_status = Some((true, message.into()));
+            }
+        }
+        cx.notify();
     }
 
     /// Changes which relays the node uses and saves it. Takes effect the next time Groovy starts.
@@ -110,8 +142,15 @@ fn section_heading(title: &'static str, detail: &'static str, cx: &App) -> impl 
         .child(div().text_xs().text_color(theme.text_muted).child(detail))
 }
 
-/// Which relays are used: n0's public relays, none, or a custom list set in config.toml.
-fn relay_row(relay: &RelaySetting, view: Entity<SettingsScreen>, cx: &App) -> impl IntoElement {
+/// Which relays are used: n0's public relays, none, or a custom list. Public and
+/// Off choose at once; a custom list is typed in the field and saved with its button.
+fn relay_row(
+    relay: &RelaySetting,
+    view: Entity<SettingsScreen>,
+    input: Entity<TextInput>,
+    status: Option<(bool, SharedString)>,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme();
     let (current, detail) = match relay {
         RelaySetting::Public => (
@@ -122,9 +161,13 @@ fn relay_row(relay: &RelaySetting, view: Entity<SettingsScreen>, cx: &App) -> im
             "Off",
             "No relays. Peers must be reachable directly, so some connections will fail.",
         ),
-        RelaySetting::Custom { .. } => (
+        RelaySetting::Custom { urls, .. } => (
             "Custom",
-            "Your own relays, set under [relay] in config.toml. Choosing Public or Off replaces them.",
+            if urls.len() == 1 {
+                "Your own relay."
+            } else {
+                "Your own relays."
+            },
         ),
     };
     let choose = |label: &'static str, id: &'static str, value: RelaySetting| {
@@ -141,32 +184,72 @@ fn relay_row(relay: &RelaySetting, view: Entity<SettingsScreen>, cx: &App) -> im
                 view.update(cx, |screen, cx| screen.set_relay(value, cx))
             })
     };
+    let custom_urls = match relay {
+        RelaySetting::Custom { urls, .. } => urls.join("  "),
+        _ => String::new(),
+    };
+    let save_view = view.clone();
+    let status_line = status.map(|(error, message)| {
+        let color = if error { theme.danger } else { theme.success };
+        div().text_xs().text_color(color).child(message)
+    });
+
     div()
         .flex()
-        .flex_row()
-        .items_start()
+        .flex_col()
         .gap_3()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_sm().child(format!("Relays: {current}")))
-                .child(div().text_xs().text_color(theme.text_muted).child(detail)),
-        )
         .child(
             div()
                 .flex()
                 .flex_row()
+                .items_start()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_sm().child(format!("Relays: {current}")))
+                        .child(div().text_xs().text_color(theme.text_muted).child(detail)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(choose(
+                            "Public",
+                            "settings-relay-public",
+                            RelaySetting::Public,
+                        ))
+                        .child(choose("Off", "settings-relay-off", RelaySetting::Disabled)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
                 .gap_2()
-                .child(choose(
-                    "Public",
-                    "settings-relay-public",
-                    RelaySetting::Public,
+                .child(div().text_xs().text_color(theme.text_muted).child(
+                    if custom_urls.is_empty() {
+                        "Use your own relays. Enter their URLs, then save.".to_owned()
+                    } else {
+                        format!("Current: {custom_urls}")
+                    },
                 ))
-                .child(choose("Off", "settings-relay-off", RelaySetting::Disabled)),
+                .child(input)
+                .child(
+                    div().flex().flex_row().child(
+                        Button::new("settings-relay-save", "Use these relays")
+                            .variant(Variant::Secondary)
+                            .on_click(move |_, cx| {
+                                save_view.update(cx, |screen, cx| screen.use_typed_relays(cx))
+                            }),
+                    ),
+                )
+                .children(status_line),
         )
 }
 
@@ -312,12 +395,6 @@ impl Render for SettingsScreen {
                 "How this device reaches peers. Discovery changes take effect the next time Groovy starts.",
                 cx,
             ))
-            .child(info_row(
-                "Relay",
-                "n0's public relays. Self-hosted relays arrive in #23.".to_owned(),
-                None::<gpui::Div>,
-                cx,
-            ))
             .child(discovery_row(
                 "Local network",
                 "Find devices on this network without the internet. Announces this device's ID and addresses there.",
@@ -336,7 +413,13 @@ impl Render for SettingsScreen {
                 |discovery, on| discovery.dht = on,
                 cx,
             ))
-            .child(relay_row(&relay, cx.entity().clone(), cx))
+            .child(relay_row(
+                &relay,
+                cx.entity().clone(),
+                self.relay_input.clone(),
+                self.relay_status.clone(),
+                cx,
+            ))
             .child(divider(cx))
             .child(section_heading(
                 "Identity",

@@ -7,7 +7,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use iroh::RelayUrl;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use thiserror::Error;
 
 use crate::paths::DataDir;
@@ -77,6 +79,28 @@ pub enum RelaySetting {
         #[serde(default)]
         auth_token: Option<String>,
     },
+}
+
+/// Reads relay URLs typed by a person: one or more, separated by spaces or commas.
+///
+/// Each URL is checked, and returned in the form the node will use.
+pub fn parse_relay_urls(text: &str) -> Result<Vec<String>, String> {
+    let urls: Vec<&str> = text
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if urls.is_empty() {
+        return Err("Enter at least one relay URL.".to_owned());
+    }
+    urls.into_iter()
+        .map(|url| {
+            RelayUrl::from_str(url)
+                .map(|parsed| parsed.to_string())
+                .map_err(|_| {
+                    format!("\"{url}\" is not a valid relay URL. Relay URLs start with https://.")
+                })
+        })
+        .collect()
 }
 
 /// How this node finds peers beyond their endpoint ID. Each service reveals
@@ -243,6 +267,25 @@ mod tests {
         config.save(&dir).unwrap();
 
         assert_eq!(Config::load_or_create(&dir).unwrap().relay, config.relay);
+    }
+
+    #[test]
+    fn relay_urls_can_be_separated_by_spaces_or_commas() {
+        let urls = parse_relay_urls("https://a.example.org./, https://b.example.org./").unwrap();
+
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].starts_with("https://a.example.org"));
+    }
+
+    #[test]
+    fn an_empty_or_malformed_relay_list_is_refused_with_a_reason() {
+        assert!(
+            parse_relay_urls("  ,  ")
+                .unwrap_err()
+                .contains("at least one")
+        );
+        let err = parse_relay_urls("not a url").unwrap_err();
+        assert!(err.contains("not a valid relay URL"), "{err}");
     }
 
     #[test]
