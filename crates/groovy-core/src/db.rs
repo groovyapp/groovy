@@ -44,6 +44,18 @@ const MIGRATIONS: &[&str] = &[
     // Whether files from a contact are accepted without asking.
     "ALTER TABLE contacts ADD COLUMN auto_accept_files INTEGER NOT NULL DEFAULT 0
         CHECK (auto_accept_files IN (0, 1));",
+    // Accepted file offers, and how far each has got. Kept so the transfer list
+    // survives a restart.
+    "CREATE TABLE transfers (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        peer    BLOB NOT NULL CHECK (length(peer) = 32),
+        offer   BLOB NOT NULL,
+        state   TEXT NOT NULL CHECK (state IN ('queued', 'active', 'paused', 'completed', 'failed', 'cancelled')),
+        error   TEXT,
+        done    INTEGER NOT NULL DEFAULT 0,
+        created INTEGER NOT NULL,
+        updated INTEGER NOT NULL
+    );",
 ];
 
 /// The schema version this build writes.

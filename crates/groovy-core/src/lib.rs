@@ -19,6 +19,7 @@ pub mod presence;
 pub mod profile;
 pub mod protocol;
 pub mod ticket;
+pub mod transfers;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
 pub use config::{

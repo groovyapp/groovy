@@ -87,7 +87,7 @@ Only a trusted peer's offer is shown to the user. An untrusted peer's offer gets
 
 A contact can be set to auto-accept. Its offers are then accepted at once, and the user is not asked.
 
-Receiving is checked as it goes, and saved to the downloads folder when it is done. Bytes already in the store are not fetched again, so an interrupted receive can be retried with the same offer. Each file is written under the path it had in the collection, with a number added if its name is taken. Each name from a peer is made safe before anything is written: empty, `.` and `..` parts are dropped, so nothing can be written outside the downloads folder. Saving received files to a folder is part of receiving (#28).
+Receiving is checked as it goes, and saved to the downloads folder when it is done. Bytes already in the store are not fetched again, so an interrupted receive can be retried with the same offer. Each file is written under the path it had in the collection, with a number added if its name is taken. Pausing and cancelling a transfer are local to the receiving node, and the sender is not told. Each name from a peer is made safe before anything is written: empty, `.` and `..` parts are dropped, so nothing can be written outside the downloads folder. Saving received files to a folder is part of receiving (#28).
 
 ## Blobs
 

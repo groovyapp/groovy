@@ -24,6 +24,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         relay: groovy_core::RelaySetting::Public,
         blobs: None,
         downloads: None,
+        database: None,
     }
 }
 
@@ -516,6 +517,7 @@ async fn blob_node(dir: &DataDir, key: SecretKey) -> (NodeHandle, EventStream) {
         gate: Arc::new(ContactGate::new(db)),
         blobs: Some(dir.blobs_dir()),
         downloads: Some(dir.root().join("Downloads")),
+        database: Some(Arc::new(Database::open(&dir.database_file()).unwrap())),
         ..config(key)
     };
     let (handle, mut events) = Node::start(config).expect("node starts");
@@ -831,6 +833,9 @@ async fn received_files_are_saved_and_a_name_taken_gets_a_number() {
     next_file_offer(&mut bob_events).await;
     bob.answer_offer(alice_key.public(), true).await.unwrap();
     send.await.unwrap().unwrap();
+    tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("bob has the files");
 
     // The folder keeps its structure on disk, and the file that was already there is kept.
     assert_eq!(
@@ -855,7 +860,7 @@ async fn received_files_are_saved_and_a_name_taken_gets_a_number() {
 }
 
 #[tokio::test]
-async fn receiving_an_offer_again_fetches_nothing_already_received() {
+async fn receiving_a_transfer_again_fetches_nothing_already_received() {
     let tmp = tempfile::tempdir().unwrap();
     let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
     let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
@@ -870,26 +875,201 @@ async fn receiving_an_offer_again_fetches_nothing_already_received() {
         let alice = alice.clone();
         async move { alice.send_files(bob_addr, paths).await }
     });
-    let offer = next_file_offer(&mut bob_events).await;
+    next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+    let transfer = match next_file_received(&mut bob_events).await {
+        NodeEvent::FileReceived { transfer, .. } => transfer,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(bob.transfers().len(), 1);
+    assert_eq!(
+        bob.transfers()[0].state,
+        groovy_core::transfers::TransferState::Completed
+    );
+
+    // The second receive finds every block already in the store.
+    bob.resume_transfer(transfer)
+        .await
+        .expect_err("a completed transfer is not resumed");
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_transfer_moves_from_queued_to_active_to_completed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
     bob.answer_offer(alice_key.public(), true).await.unwrap();
     send.await.unwrap().unwrap();
 
-    // The first receive's event is read first, so the retry's event is checked below.
-    next_file_received(&mut bob_events).await;
-
-    // The second receive finds every block already in the store.
-    bob.resume_files(alice_key.public(), offer.clone())
-        .await
-        .expect("the retry finds the files");
-    let received = tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
-        .await
-        .expect("the retry reports the files");
-    match received {
-        NodeEvent::FileReceived { fetched, .. } => {
-            assert_eq!(fetched, 0, "a retry fetched bytes it already had");
+    // Every change to the transfer is reported, in order.
+    let mut states = Vec::new();
+    loop {
+        let event = tokio::time::timeout(TIMEOUT, bob_events.next())
+            .await
+            .expect("the transfer reports its progress")
+            .unwrap();
+        if let NodeEvent::TransferChanged(transfer) = event {
+            if states.last() != Some(&transfer.state) {
+                states.push(transfer.state.clone());
+            }
+            if transfer.state == groovy_core::transfers::TransferState::Completed {
+                assert_eq!(transfer.done, transfer.offer.bytes);
+                break;
+            }
         }
-        other => panic!("{other:?}"),
     }
+    use groovy_core::transfers::TransferState::{Active, Completed, Queued};
+    assert_eq!(states, [Queued, Active, Completed]);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn transfers_survive_a_restart_and_unfinished_ones_resume() {
+    use groovy_core::transfers::{Transfer, TransferState};
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key.clone()).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    let offer = next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+    next_file_received(&mut bob_events).await;
+    let finished = bob.transfers();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].state, TransferState::Completed);
+    assert!(bob.shutdown(TIMEOUT));
+
+    // A transfer that was still queued when the app closed.
+    Database::open(&bob_dir.database_file())
+        .unwrap()
+        .insert_transfer(&Transfer {
+            id: 99,
+            peer: alice_key.public(),
+            offer,
+            state: TransferState::Queued,
+            done: 0,
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+
+    // Restarting shows the finished transfer, and receives the queued one again.
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let restored = tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("the queued transfer is received after the restart");
+    assert!(matches!(
+        restored,
+        NodeEvent::FileReceived { transfer: 99, .. }
+    ));
+
+    let all = bob.transfers();
+    assert_eq!(
+        all.iter().map(|t| t.id).collect::<Vec<_>>(),
+        [finished[0].id, 99]
+    );
+    assert!(all.iter().all(|t| t.state == TransferState::Completed));
+
+    // A finished transfer cannot be paused, and an unknown one cannot be cancelled.
+    assert!(matches!(
+        bob.pause_transfer(finished[0].id).await,
+        Err(groovy_core::NodeError::WrongTransferState(_))
+    ));
+    assert!(matches!(
+        bob.cancel_transfer(12345).await,
+        Err(groovy_core::NodeError::UnknownTransfer)
+    ));
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_paused_transfer_stays_paused_across_a_restart_until_resumed() {
+    use groovy_core::transfers::{Transfer, TransferState};
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key.clone()).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    let offer = next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+    next_file_received(&mut bob_events).await;
+    assert!(bob.shutdown(TIMEOUT));
+
+    Database::open(&bob_dir.database_file())
+        .unwrap()
+        .insert_transfer(&Transfer {
+            id: 7,
+            peer: alice_key.public(),
+            offer,
+            state: TransferState::Paused,
+            done: 0,
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let early = tokio::time::timeout(
+        Duration::from_millis(500),
+        next_file_received(&mut bob_events),
+    )
+    .await;
+    assert!(early.is_err(), "a paused transfer was received on its own");
+    assert_eq!(
+        bob.transfers().iter().find(|t| t.id == 7).unwrap().state,
+        TransferState::Paused
+    );
+
+    bob.resume_transfer(7)
+        .await
+        .expect("the paused transfer resumes");
+    let resumed = tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("the resumed transfer is received");
+    assert!(matches!(
+        resumed,
+        NodeEvent::FileReceived { transfer: 7, .. }
+    ));
 
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
