@@ -43,6 +43,16 @@ pub struct NodeState {
 impl Global for NodeState {}
 
 impl NodeState {
+    /// The node's latest reachable address, once it has been reported.
+    pub fn addr(&self) -> Option<&EndpointAddr> {
+        self.addr.as_ref()
+    }
+
+    /// The handle for talking to the node, once it has started.
+    pub fn handle(&self) -> Option<NodeHandle> {
+        self.handle.clone()
+    }
+
     /// Tells peers about a change to this node's profile.
     fn publish(&self, profile: PeerProfile) {
         if let Some(handle) = &self.handle {

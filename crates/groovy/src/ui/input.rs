@@ -2,7 +2,9 @@
 //!
 //! Multiline editing (the chat composer) is not part of this component yet.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     ElementInputHandler, EntityInputHandler, EventEmitter, FocusHandle, KeyBinding, TextRun,
@@ -13,7 +15,7 @@ use crate::theme::ActiveTheme;
 
 actions!(
     text_input,
-    [Backspace, Delete, Left, Right, Home, End, Enter]
+    [Backspace, Delete, Left, Right, Home, End, Enter, Paste]
 );
 
 const CONTEXT: &str = "TextInput";
@@ -28,6 +30,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", Home, Some(CONTEXT)),
         KeyBinding::new("end", End, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
+        // `secondary` is Ctrl on Linux and Windows, and Cmd on macOS.
+        KeyBinding::new("secondary-v", Paste, Some(CONTEXT)),
     ]);
 }
 
@@ -46,6 +50,8 @@ pub struct TextInput {
     placeholder: SharedString,
     /// Shows each character as a dot, for passphrases.
     masked: bool,
+    /// The field's width, measured while painting. Used to keep the caret in view.
+    view_width: Rc<Cell<Pixels>>,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -58,6 +64,7 @@ impl TextInput {
             cursor: 0,
             placeholder: placeholder.into(),
             masked: false,
+            view_width: Rc::new(Cell::new(px(0.))),
         }
     }
 
@@ -136,6 +143,22 @@ impl TextInput {
     fn on_end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.cursor = self.content.len();
         cx.notify();
+    }
+
+    /// Inserts the clipboard text at the caret. The field is one line, so line
+    /// breaks are removed and surrounding whitespace is trimmed.
+    fn on_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let line: String = text
+            .trim()
+            .chars()
+            .filter(|ch| !matches!(ch, '\r' | '\n'))
+            .collect();
+        if !line.is_empty() {
+            self.replace_range(self.cursor..self.cursor, &line, cx);
+        }
     }
 
     fn on_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
@@ -245,12 +268,20 @@ impl EntityInputHandler for TextInput {
     }
 }
 
+/// The field's text size, which is `text_sm` in the theme's scale.
+fn text_size() -> Rems {
+    rems(0.875)
+}
+
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let focused = self.focus_handle.is_focused(window);
         let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        // The caret is measured at the same size the text is drawn at. Measuring
+        // at the window's default size made the caret drift further from the
+        // text with every character.
+        let font_size = text_size().to_pixels(window.rem_size());
 
         let empty = self.content.is_empty();
         let shown = if self.masked {
@@ -270,6 +301,7 @@ impl Render for TextInput {
             self.cursor
         };
         let color = if empty { theme.text_muted } else { theme.text };
+        let view_width = self.view_width.clone();
 
         // Where the caret sits: shape the same text the user sees and ask for the x position.
         let caret_x = if empty {
@@ -298,6 +330,16 @@ impl Render for TextInput {
         };
         let caret = theme.text;
 
+        // While focused, text longer than the field scrolls so the caret stays at
+        // the right edge. Unfocused, it shows from the start.
+        const PADDING: Pixels = px(8.);
+        let inner_width = (view_width.get() - PADDING * 2.).max(px(0.));
+        let scroll = if focused {
+            (caret_x - inner_width + px(2.)).max(px(0.))
+        } else {
+            px(0.)
+        };
+
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -308,6 +350,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::on_home))
             .on_action(cx.listener(Self::on_end))
             .on_action(cx.listener(Self::on_enter))
+            .on_action(cx.listener(Self::on_paste))
             .relative()
             .flex()
             .items_center()
@@ -318,17 +361,27 @@ impl Render for TextInput {
             .border_1()
             .border_color(border)
             .bg(theme.input_background)
-            .text_sm()
+            .text_size(text_size())
             .text_color(color)
             .overflow_hidden()
-            .child(display)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .left(PADDING - scroll)
+                    .flex()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .child(display),
+            )
             .when(focused, |d| {
                 d.child(
                     div()
                         .absolute()
                         .top(px(6.))
                         .bottom(px(6.))
-                        .left(px(8.) + caret_x)
+                        .left(PADDING + caret_x - scroll)
                         .w(px(1.))
                         .bg(caret),
                 )
@@ -339,6 +392,7 @@ impl Render for TextInput {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
+                        view_width.set(bounds.size.width);
                         if focus.is_focused(window) {
                             window.handle_input(
                                 &focus,
@@ -447,6 +501,25 @@ mod gpui_tests {
         assert_eq!(
             input.read_with(cx, |input, _| input.text().to_owned()),
             "secret"
+        );
+    }
+
+    #[test]
+    fn ctrl_v_pastes_the_clipboard_at_the_caret() {
+        let mut cx = TestAppContext::single();
+        setup(&mut cx);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("Ticket", cx));
+        let focus = input.read_with(cx, |input, _| input.focus_handle().clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "  endpointabc\n".to_owned(),
+        ));
+
+        cx.simulate_keystrokes("ctrl-v");
+
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text().to_owned()),
+            "endpointabc"
         );
     }
 }

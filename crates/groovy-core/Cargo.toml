@@ -10,10 +10,12 @@ repository.workspace = true
 age = { version = "0.11", features = [] }
 blake3 = "1"
 directories = "6"
+data-encoding = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 iroh = "1.3"
 rusqlite = { version = "0.40", features = ["bundled"] }
 postcard = { version = "1", features = ["alloc"] }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
