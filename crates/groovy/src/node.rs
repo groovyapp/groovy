@@ -5,6 +5,7 @@ use std::time::Duration;
 use gpui::{App, AppContext, Global};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use groovy_core::{
@@ -111,11 +112,24 @@ impl NodeState {
 const PRESENCE_TICK: Duration = Duration::from_secs(15);
 
 /// Checks trusted contacts for presence on a schedule, and records how each is reached.
-fn spawn_presence(cx: &mut App, handle: NodeHandle, database: Arc<Database>) {
+fn spawn_presence(
+    cx: &mut App,
+    handle: NodeHandle,
+    database: Arc<Database>,
+    network_changes: Arc<AtomicU64>,
+) {
     cx.spawn(async move |cx| {
         let mut tracker = Tracker::default();
+        let mut seen_changes = 0;
         loop {
             cx.background_executor().timer(PRESENCE_TICK).await;
+
+            // A change of address means the network changed, so recheck every contact now.
+            let changes = network_changes.load(Ordering::SeqCst);
+            if changes != seen_changes {
+                seen_changes = changes;
+                tracker.reset_all(Instant::now());
+            }
 
             let db = database.clone();
             let contacts = cx
@@ -222,7 +236,13 @@ pub fn start(cx: &mut App) {
         routes: HashMap::new(),
     });
 
-    spawn_presence(cx, handle.clone(), database.clone());
+    let network_changes = Arc::new(AtomicU64::new(0));
+    spawn_presence(
+        cx,
+        handle.clone(),
+        database.clone(),
+        network_changes.clone(),
+    );
 
     // Publish the stored profile once it has been read.
     let database = cx.global::<AppData>().database.clone();
@@ -238,6 +258,9 @@ pub fn start(cx: &mut App) {
         let mut events = events;
         while let Some(event) = events.next().await {
             info!(?event, "node event");
+            if matches!(event, NodeEvent::AddressChanged(_)) {
+                network_changes.fetch_add(1, Ordering::SeqCst);
+            }
             cx.update(|cx| {
                 let state = cx.global_mut::<NodeState>();
                 match event {

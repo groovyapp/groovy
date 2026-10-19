@@ -458,3 +458,51 @@ async fn a_trusted_contact_is_reachable_and_an_untrusted_one_is_not() {
     assert!(bob.shutdown(TIMEOUT));
     assert!(carol.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_contact_that_drops_off_is_unreachable_and_reachable_again_when_it_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice, _alice_events, _alice_db) =
+        gated_node(&fresh_dir(&tmp, "alice"), alice_key.clone()).await;
+    let bob_dir = fresh_dir(&tmp, "bob");
+    {
+        let bob_db = Database::open(&bob_dir.database_file()).unwrap();
+        bob_db
+            .record_handshake(
+                &groovy_core::PeerInfo {
+                    endpoint_id: alice_key.public(),
+                    profile: PeerProfile::default(),
+                },
+                0,
+            )
+            .unwrap();
+        bob_db
+            .set_trust(alice_key.public(), Trust::Trusted)
+            .unwrap();
+    }
+
+    let (bob, _bob_events, _) = gated_node(&bob_dir, bob_key.clone()).await;
+    let first_address = bob.addr().await.unwrap();
+    assert!(alice.check_presence(first_address.clone()).await.is_ok());
+
+    // Bob goes away: the check fails, and does not hang.
+    assert!(bob.shutdown(TIMEOUT));
+    let down = tokio::time::timeout(TIMEOUT, alice.check_presence(first_address)).await;
+    assert!(
+        !matches!(down, Ok(Ok(_))),
+        "an offline contact answered: {down:?}"
+    );
+
+    // Bob comes back with the same identity and database, at a new address.
+    let (bob_again, _events, _) = gated_node(&bob_dir, bob_key.clone()).await;
+    let new_address = bob_again.addr().await.unwrap();
+    let back = alice.check_presence(new_address).await;
+    assert!(
+        back.is_ok(),
+        "the returning contact is not reachable: {back:?}"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob_again.shutdown(TIMEOUT));
+}
