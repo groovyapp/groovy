@@ -1,51 +1,89 @@
-//! Blob storage: content-addressed files kept on this device and served to
-//! trusted contacts over iroh-blobs.
-//!
-//! Blobs are stored by the BLAKE3 hash of their content, so each one can be
-//! checked as it arrives. Each blob is kept by a tag, which keeps it from being
-//! removed; a blob without a tag is eligible for garbage collection.
+//! Serving blobs. Each request is decided as it arrives: a trusted contact may fetch
+//! anything this node stores, and anyone may fetch the content of an active share.
+//! Every other request is refused. A blocked peer is refused before any request.
 
-use std::fmt;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use iroh::endpoint::Connection;
-use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh_blobs::BlobsProtocol;
+use iroh_blobs::Hash;
+use iroh_blobs::provider::events::{
+    AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode,
+};
+use tokio::sync::mpsc;
 
 use crate::node::PeerGate;
 
-/// The application close code sent to a peer that is not trusted.
-pub const CLOSE_NOT_TRUSTED: u32 = 3;
+/// The hashes anyone may fetch: the roots and files of active shares.
+pub type SharedHashes = Arc<Mutex<HashSet<Hash>>>;
 
-/// Serves blobs only to peers the user has paired with. Anyone else is refused
-/// before any blob is read.
-pub struct TrustedBlobs {
-    inner: BlobsProtocol,
+/// The event sender blob serving reports to, and the receiver the decisions are made on.
+pub fn event_channel() -> (EventSender, mpsc::Receiver<ProviderMessage>) {
+    let (tx, rx) = mpsc::channel(64);
+    let mask = EventMask {
+        connected: ConnectMode::Intercept,
+        get: RequestMode::Intercept,
+        get_many: RequestMode::Intercept,
+        ..EventMask::DEFAULT
+    };
+    (EventSender::new(tx, mask), rx)
+}
+
+/// Decides every connection and request until serving stops.
+pub async fn decide(
+    mut messages: mpsc::Receiver<ProviderMessage>,
     gate: Arc<dyn PeerGate>,
-}
-
-impl TrustedBlobs {
-    pub fn new(inner: BlobsProtocol, gate: Arc<dyn PeerGate>) -> Self {
-        Self { inner, gate }
-    }
-}
-
-impl fmt::Debug for TrustedBlobs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TrustedBlobs").finish_non_exhaustive()
-    }
-}
-
-impl ProtocolHandler for TrustedBlobs {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        if !self.gate.is_trusted(&connection.remote_id()) {
-            connection.close(CLOSE_NOT_TRUSTED.into(), b"not trusted");
-            return Ok(());
+    shared: SharedHashes,
+) {
+    // Which peer each connection belongs to, so a request can be checked against it.
+    let mut peers = HashMap::new();
+    while let Some(message) = messages.recv().await {
+        match message {
+            ProviderMessage::ClientConnected(msg) => {
+                let allowed = match msg.inner.endpoint_id {
+                    Some(peer) if gate.may_connect(&peer) => {
+                        peers.insert(msg.inner.connection_id, peer);
+                        true
+                    }
+                    _ => false,
+                };
+                let _ = msg.tx.send(verdict(allowed)).await;
+            }
+            ProviderMessage::ConnectionClosed(msg) => {
+                peers.remove(&msg.inner.connection_id);
+            }
+            ProviderMessage::GetRequestReceived(msg) => {
+                let hash = msg.inner.request.hash;
+                let trusted = trusted(&peers, &gate, msg.inner.connection_id);
+                let shared = shared
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&hash);
+                let _ = msg.tx.send(verdict(trusted || shared)).await;
+            }
+            // Asking for several blobs at once is for contacts only.
+            ProviderMessage::GetManyRequestReceived(msg) => {
+                let trusted = trusted(&peers, &gate, msg.inner.connection_id);
+                let _ = msg.tx.send(verdict(trusted)).await;
+            }
+            _ => {}
         }
-        ProtocolHandler::accept(&self.inner, connection).await
     }
+}
 
-    async fn shutdown(&self) {
-        ProtocolHandler::shutdown(&self.inner).await;
+fn trusted(
+    peers: &HashMap<u64, iroh::EndpointId>,
+    gate: &Arc<dyn PeerGate>,
+    connection: u64,
+) -> bool {
+    peers
+        .get(&connection)
+        .is_some_and(|peer| gate.is_trusted(peer))
+}
+
+fn verdict(allowed: bool) -> Result<(), AbortReason> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(AbortReason::Permission)
     }
 }

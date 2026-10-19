@@ -188,7 +188,8 @@ crates/
     src/contacts.rs      Contacts: known peers, trust, blocking, and the connection gate
     src/pairing.rs       Pairing: verification codes and the request rate limit
     src/presence.rs      Presence: which trusted contacts are reachable, and how often to check
-    src/blobs.rs         Blob store: serves content only to trusted contacts
+    src/blobs.rs         Blob serving: each request is decided, for trusted contacts and active shares
+    src/shares.rs        Shares: content offered by ticket to anyone, until revoked
     src/files.rs         Files to send: imported as one collection that keeps each file's path
     src/transfers.rs     Transfer records: state and progress, kept in the database across restarts
   groovy/                Desktop app (GPUI)

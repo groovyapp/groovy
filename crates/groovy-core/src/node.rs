@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,15 +21,20 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
 };
+use iroh_blobs::api::blobs::AddBytesOptions;
 use iroh_blobs::api::remote::GetProgressItem;
-use iroh_blobs::{BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
+use iroh_blobs::format::collection::Collection;
+use iroh_blobs::hashseq::HashSeq;
+use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::ticket::BlobTicket;
+use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, store::fs::FsStore};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::blobs::TrustedBlobs;
+use crate::blobs::{self, SharedHashes};
 use crate::config::{Discovery, RelaySetting};
 use crate::contacts;
 use crate::db::Database;
@@ -36,6 +42,7 @@ use crate::files;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
+use crate::shares::Share;
 use crate::transfers::{Transfer, TransferState};
 
 const COMMAND_CAPACITY: usize = 32;
@@ -80,6 +87,12 @@ pub enum NodeError {
     NoPendingOffer,
     #[error("there is no transfer with that id")]
     UnknownTransfer,
+    #[error("there is no share with that id, or it was already revoked")]
+    UnknownShare,
+    #[error("shares are kept in the database, which this node was started without")]
+    NoDatabase,
+    #[error("that is not a share ticket: {0}")]
+    InvalidTicket(String),
     #[error("that transfer cannot be {0} in its current state")]
     WrongTransferState(&'static str),
     #[error("sending or receiving the files failed: {0}")]
@@ -218,6 +231,14 @@ enum Command {
         oneshot::Sender<Result<(), NodeError>>,
     ),
     AnswerOffer(EndpointId, bool, oneshot::Sender<Result<(), NodeError>>),
+    CreateShare(
+        Vec<PathBuf>,
+        oneshot::Sender<Result<ShareTicket, NodeError>>,
+    ),
+    RevokeShare(i64, oneshot::Sender<Result<(), NodeError>>),
+    ListShares(oneshot::Sender<Result<Vec<Share>, NodeError>>),
+    PreviewShare(String, oneshot::Sender<Result<SharePreview, NodeError>>),
+    ReceiveShare(String, oneshot::Sender<Result<i64, NodeError>>),
     PauseTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     ResumeTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     CancelTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
@@ -292,10 +313,18 @@ impl Node {
                 Err(error) => warn!(%error, "could not load the transfers"),
             }
         }
+        let mut shared_hashes = Vec::new();
+        if let Some(db) = &config.database {
+            match db.active_share_hashes() {
+                Ok(hashes) => shared_hashes = hashes,
+                Err(error) => warn!(%error, "could not load the shares"),
+            }
+        }
         let startup = Startup {
             book: book.clone(),
             next_id: Arc::new(AtomicI64::new(next_id)),
             resume,
+            shared: Arc::new(Mutex::new(shared_hashes.into_iter().collect())),
             commands: weak_commands,
         };
         let thread = thread::Builder::new()
@@ -419,6 +448,7 @@ async fn run(
         slots: Arc::new(Semaphore::new(MAX_ACTIVE_RECEIVES)),
         next_id: startup.next_id.clone(),
         database: config.database.clone(),
+        shared: startup.shared.clone(),
     };
     let mut router = Router::builder(endpoint.clone()).accept(
         protocol::ALPN,
@@ -436,8 +466,13 @@ async fn run(
         },
     );
     if let Some(store) = &blobs {
-        let served = TrustedBlobs::new(BlobsProtocol::new(store, None), gate.clone());
-        router = router.accept(iroh_blobs::ALPN, served);
+        let (events, messages) = blobs::event_channel();
+        tokio::spawn(blobs::decide(
+            messages,
+            gate.clone(),
+            receiving.shared.clone(),
+        ));
+        router = router.accept(iroh_blobs::ALPN, BlobsProtocol::new(store, Some(events)));
     }
     let router = router.spawn();
     let mut addresses = endpoint.watch_addr();
@@ -543,6 +578,34 @@ async fn run(
                             }
                         };
                         let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::CreateShare(paths, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(create_share(&receiving, paths).await);
+                    });
+                }
+                Some(Command::RevokeShare(id, reply)) => {
+                    let _ = reply.send(revoke_share(&receiving, id, contacts::now()));
+                }
+                Some(Command::ListShares(reply)) => {
+                    let _ = reply.send(list_shares(&receiving));
+                }
+                Some(Command::PreviewShare(ticket, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = match parse_ticket(&ticket) {
+                            Ok(ticket) => preview_share(&receiving, &ticket).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::ReceiveShare(ticket, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(receive_share(&receiving, &ticket).await);
                     });
                 }
                 Some(Command::PauseTransfer(id, reply)) => {
@@ -707,12 +770,33 @@ const MAX_ACTIVE_RECEIVES: usize = 2;
 /// How often a transfer's progress is reported, at most.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
+/// A share as made, with the ticket to give out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareTicket {
+    pub share: Share,
+    /// Anyone with this can download the share while this node is online.
+    pub ticket: String,
+}
+
+/// What a share ticket offers, read before anything is downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharePreview {
+    pub root: Hash,
+    /// Every file's path inside the share.
+    pub names: Vec<String>,
+    pub files: u64,
+    pub bytes: u64,
+    /// The node that offers the share.
+    pub from: EndpointId,
+}
+
 /// What `start` hands the node thread: the transfer book, the next free transfer id,
 /// the transfers to pick up again, and a way to send the node its commands.
 struct Startup {
     book: Book,
     next_id: Arc<AtomicI64>,
     resume: Vec<i64>,
+    shared: SharedHashes,
     commands: mpsc::WeakSender<Command>,
 }
 
@@ -728,6 +812,7 @@ struct Receiving {
     slots: Arc<Semaphore>,
     next_id: Arc<AtomicI64>,
     database: Option<Arc<Database>>,
+    shared: SharedHashes,
 }
 
 /// Imports `paths` into the blob store, offers them to a trusted peer, and waits for
@@ -992,6 +1077,175 @@ fn stop_transfer(receiving: &Receiving, id: i64, state: TransferState) -> Result
     }
     set_transfer(receiving, id, Some(state), None);
     Ok(())
+}
+
+/// Imports `paths` and makes a share of them. Its blobs are served to anyone with the
+/// ticket until the share is revoked.
+async fn create_share(
+    receiving: &Receiving,
+    paths: Vec<PathBuf>,
+) -> Result<ShareTicket, NodeError> {
+    let store = receiving.store.as_ref().ok_or(NodeError::BlobsDisabled)?;
+    let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
+    let imported = files::import(store, &paths, |_, _| {})
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    // The root's links are the metadata and every file, all of which the share serves.
+    let root_bytes = store
+        .blobs()
+        .get_bytes(imported.root)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let links =
+        HashSeq::try_from(root_bytes).map_err(|error| NodeError::Files(error.to_string()))?;
+    let mut hashes = vec![imported.root];
+    hashes.extend(links.iter());
+    let mut share = Share {
+        id: 0,
+        root: imported.root,
+        names: imported.names,
+        files: imported.files,
+        bytes: imported.bytes,
+        hashes: hashes.clone(),
+        created: contacts::now(),
+        revoked: None,
+    };
+    share.id = database
+        .insert_share(&share)
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    lock_shared(&receiving.shared).extend(hashes);
+
+    let ticket = BlobTicket::new(
+        receiving.endpoint.addr(),
+        imported.root,
+        BlobFormat::HashSeq,
+    )
+    .to_string();
+    Ok(ShareTicket { share, ticket })
+}
+
+/// Stops a share at once. Its blobs are refused to anyone who is not a contact from now on.
+fn revoke_share(receiving: &Receiving, id: i64, now: i64) -> Result<(), NodeError> {
+    let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
+    let revoked = database
+        .revoke_share(id, now)
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    if !revoked {
+        return Err(NodeError::UnknownShare);
+    }
+    let active = database
+        .active_share_hashes()
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let mut shared = lock_shared(&receiving.shared);
+    shared.clear();
+    shared.extend(active);
+    Ok(())
+}
+
+fn list_shares(receiving: &Receiving) -> Result<Vec<Share>, NodeError> {
+    let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
+    database
+        .shares()
+        .map_err(|error| NodeError::Files(error.to_string()))
+}
+
+fn lock_shared(
+    shared: &SharedHashes,
+) -> std::sync::MutexGuard<'_, std::collections::HashSet<Hash>> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn parse_ticket(ticket: &str) -> Result<BlobTicket, NodeError> {
+    BlobTicket::from_str(ticket.trim()).map_err(|error| NodeError::InvalidTicket(error.to_string()))
+}
+
+/// Reads what a share offers, without downloading its files. Only the list of names and
+/// the sizes are fetched, which is what the user needs to decide.
+async fn preview_share(
+    receiving: &Receiving,
+    ticket: &BlobTicket,
+) -> Result<SharePreview, NodeError> {
+    let connection = receiving
+        .endpoint
+        .connect(ticket.addr().clone(), iroh_blobs::ALPN)
+        .await
+        .map_err(connection_error)?;
+    let root = ticket.hash();
+    let root_bytes = iroh_blobs::get::request::get_blob(connection.clone(), root)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let links = HashSeq::try_from(root_bytes.clone())
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let meta = links
+        .iter()
+        .next()
+        .ok_or_else(|| NodeError::Files("the share is empty".to_owned()))?;
+    let meta_bytes = iroh_blobs::get::request::get_blob(connection.clone(), meta)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+
+    // The names come from a scratch store that holds only the root and its metadata.
+    let scratch = MemStore::new();
+    scratch
+        .add_bytes_with_opts(AddBytesOptions {
+            data: root_bytes,
+            format: BlobFormat::HashSeq,
+        })
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    scratch
+        .add_bytes(meta_bytes)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let collection = Collection::load(root, scratch.as_ref())
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+
+    let mut bytes = 0;
+    for file in links.iter().skip(1) {
+        let (size, _) = iroh_blobs::get::request::get_unverified_size(&connection, &file)
+            .await
+            .map_err(|error| NodeError::Files(error.to_string()))?;
+        bytes += size;
+    }
+    Ok(SharePreview {
+        root,
+        names: collection.iter().map(|(name, _)| name.clone()).collect(),
+        files: collection.len() as u64,
+        bytes,
+        from: ticket.addr().id,
+    })
+}
+
+/// Receives a share as a transfer, from the node that offers it.
+async fn receive_share(receiving: &Receiving, ticket: &str) -> Result<i64, NodeError> {
+    let ticket = parse_ticket(ticket)?;
+    if receiving.store.is_none() {
+        return Err(NodeError::BlobsDisabled);
+    }
+    let preview = preview_share(receiving, &ticket).await?;
+    let offer = FileOffer {
+        names: top_level_names(&preview.names),
+        root: preview.root,
+        files: preview.files,
+        bytes: preview.bytes,
+        from: ticket.addr().clone(),
+    };
+    let id = new_transfer(receiving, preview.from, offer.clone());
+    spawn_receive(receiving, id, preview.from, offer);
+    Ok(id)
+}
+
+/// The names at the top of a share: `photos/a.txt` and `photos/b.txt` give `photos`.
+fn top_level_names(paths: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for path in paths {
+        let top = path.split('/').next().unwrap_or(path).to_owned();
+        if !names.contains(&top) {
+            names.push(top);
+        }
+    }
+    names
 }
 
 /// Reports a peer's disconnection once its connection closes.
@@ -1286,6 +1540,53 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::SendFiles(addr, paths, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Makes a share of files or folders. Anyone with the ticket can download them while
+    /// this node is online, until the share is revoked.
+    pub async fn create_share(&self, paths: Vec<PathBuf>) -> Result<ShareTicket, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::CreateShare(paths, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Stops a share. Its content is refused to anyone who is not a contact from now on.
+    pub async fn revoke_share(&self, id: i64) -> Result<(), NodeError> {
+        self.transfer_command(|reply| Command::RevokeShare(id, reply))
+            .await
+    }
+
+    /// Every share this node has made, including revoked ones.
+    pub async fn shares(&self) -> Result<Vec<Share>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ListShares(reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Reads what a share ticket offers, names and sizes only, before anything is downloaded.
+    pub async fn preview_share(&self, ticket: String) -> Result<SharePreview, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::PreviewShare(ticket, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Downloads a share as a transfer, and returns the transfer's id.
+    pub async fn receive_share(&self, ticket: String) -> Result<i64, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ReceiveShare(ticket, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?
