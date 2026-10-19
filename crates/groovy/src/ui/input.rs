@@ -268,12 +268,20 @@ impl EntityInputHandler for TextInput {
     }
 }
 
+/// The field's text size, which is `text_sm` in the theme's scale.
+fn text_size() -> Rems {
+    rems(0.875)
+}
+
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let focused = self.focus_handle.is_focused(window);
         let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        // The caret is measured at the same size the text is drawn at. Measuring
+        // at the window's default size made the caret drift further from the
+        // text with every character.
+        let font_size = text_size().to_pixels(window.rem_size());
 
         let empty = self.content.is_empty();
         let shown = if self.masked {
@@ -322,10 +330,15 @@ impl Render for TextInput {
         };
         let caret = theme.text;
 
-        // Text longer than the field scrolls left so the caret stays at the right edge.
+        // While focused, text longer than the field scrolls so the caret stays at
+        // the right edge. Unfocused, it shows from the start.
         const PADDING: Pixels = px(8.);
         let inner_width = (view_width.get() - PADDING * 2.).max(px(0.));
-        let scroll = (caret_x - inner_width + px(2.)).max(px(0.));
+        let scroll = if focused {
+            (caret_x - inner_width + px(2.)).max(px(0.))
+        } else {
+            px(0.)
+        };
 
         div()
             .key_context(CONTEXT)
@@ -348,7 +361,7 @@ impl Render for TextInput {
             .border_1()
             .border_color(border)
             .bg(theme.input_background)
-            .text_sm()
+            .text_size(text_size())
             .text_color(color)
             .overflow_hidden()
             .child(
