@@ -107,6 +107,12 @@ Revoking a share stops it at once: new requests for its content are refused. A d
 
 Previewing a ticket fetches the list of names and the sizes, not the files. Receiving a share makes it a transfer, the same as an accepted offer.
 
+## Shared folders
+
+A shared folder syncs over two protocols this node serves: the iroh-docs sync protocol (ALPN `/iroh-sync/1`) and iroh-gossip (ALPN `/iroh-gossip/1`). Both are served only to trusted contacts, and a connection from anyone else is closed with application code 3 before either protocol sees it.
+
+A folder's ticket names one of its members and the folder's capability, with read or write access. Joining a folder imports it and syncs with the members named in the ticket. Each entry is a relative path and the hash of its file. A delete is an entry with the empty hash. See `docs/storage.md` for the model, and for what is not built yet (conflict copies).
+
 ## Not yet specified
 
 Messages after the handshake: transfer management (#29), chat (#41), and groups (#43). Each will get a section here when it is built.

@@ -1173,3 +1173,201 @@ async fn a_non_contact_cannot_fetch_a_blob_that_is_in_no_share() {
     assert!(eve.shutdown(TIMEOUT));
     assert!(alice.shutdown(TIMEOUT));
 }
+
+/// Polls a folder until `check` is true, or fails after the timeout.
+async fn wait_for_folder(
+    node: &NodeHandle,
+    namespace: iroh_docs::NamespaceId,
+    what: &str,
+    check: impl Fn(&[groovy_core::folders::FolderEntry]) -> bool,
+) -> Vec<groovy_core::folders::FolderEntry> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let entries = node
+                .folder_entries(namespace)
+                .await
+                .expect("the folder can be read");
+            if check(&entries) {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the folder never {what}"))
+}
+
+/// Waits until `check` is true, or fails after twenty seconds.
+async fn wait_until(check: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the change arrives in time");
+}
+
+#[tokio::test]
+async fn a_shared_folder_syncs_between_trusted_members() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, _bob_events) = blob_node(&bob_dir, bob_key).await;
+
+    let folder = alice
+        .create_folder("photos".into(), None)
+        .await
+        .expect("the folder is made");
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(source.join("note.txt"), b"charlie").unwrap();
+    alice
+        .add_to_folder(
+            folder.namespace,
+            "photos/a.txt".into(),
+            source.join("a.txt"),
+        )
+        .await
+        .unwrap();
+    alice
+        .add_to_folder(folder.namespace, "note.txt".into(), source.join("note.txt"))
+        .await
+        .unwrap();
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+
+    bob.join_folder(ticket, None).await.expect("bob joins");
+    let entries = wait_for_folder(&bob, folder.namespace, "shows bob the files", |entries| {
+        entries.len() == 2
+    })
+    .await;
+    let keys: Vec<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, ["note.txt", "photos/a.txt"]);
+
+    // The bytes come with the entries, and are the same as alice's.
+    let alpha = entries
+        .iter()
+        .find(|entry| entry.key == "photos/a.txt")
+        .unwrap();
+    let fetched = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(bytes) = bob.read_blob(alpha.hash).await.unwrap() {
+                return bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("bob downloads the file");
+    assert_eq!(fetched, b"alpha");
+
+    // A delete on alice's side removes the entry on bob's.
+    alice
+        .remove_from_folder(folder.namespace, "note.txt".into())
+        .await
+        .unwrap();
+    wait_for_folder(
+        &bob,
+        folder.namespace,
+        "removed the deleted file",
+        |entries| entries.len() == 1,
+    )
+    .await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_peer_that_is_not_trusted_cannot_sync_a_shared_folder() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, carol_key) = (SecretKey::generate(), SecretKey::generate());
+    let alice_dir = fresh_dir(&tmp, "alice");
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (carol, _carol_events) = blob_node(&fresh_dir(&tmp, "carol"), carol_key).await;
+
+    let folder = alice.create_folder("secret".into(), None).await.unwrap();
+    let source = tmp.path().join("secret.txt");
+    std::fs::write(&source, b"private").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "secret.txt".into(), source)
+        .await
+        .unwrap();
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+
+    // Carol has the ticket, but alice does not trust her, so nothing syncs.
+    let _ = carol.join_folder(ticket, None).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let seen = carol
+        .folder_entries(folder.namespace)
+        .await
+        .unwrap_or_default();
+    assert!(
+        seen.is_empty(),
+        "an untrusted peer synced a folder: {seen:?}"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(carol.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn an_edit_on_one_device_reaches_another_member() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, _bob_events) = blob_node(&bob_dir, bob_key).await;
+
+    // Alice shares a folder made from a local directory that already has a file in it.
+    let alice_folder = tmp.path().join("alice-photos");
+    std::fs::create_dir_all(&alice_folder).unwrap();
+    std::fs::write(alice_folder.join("a.txt"), b"alpha").unwrap();
+    let folder = alice
+        .create_folder("photos".into(), Some(alice_folder.clone()))
+        .await
+        .expect("the folder is made from the directory");
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+
+    // Bob joins, and his directory receives the file.
+    let bob_folder = tmp.path().join("bob-photos");
+    bob.join_folder(ticket, Some(bob_folder.clone()))
+        .await
+        .expect("bob joins");
+    wait_until(|| bob_folder.join("a.txt").is_file()).await;
+    assert_eq!(std::fs::read(bob_folder.join("a.txt")).unwrap(), b"alpha");
+
+    // An edit on alice's side reaches bob's directory.
+    std::fs::write(alice_folder.join("a.txt"), b"alpha, edited").unwrap();
+    wait_until(|| {
+        std::fs::read(bob_folder.join("a.txt")).ok().as_deref() == Some(b"alpha, edited".as_slice())
+    })
+    .await;
+
+    // A new file on bob's side reaches alice's directory, and a delete there removes it.
+    std::fs::write(bob_folder.join("from-bob.txt"), b"hello").unwrap();
+    wait_until(|| alice_folder.join("from-bob.txt").is_file()).await;
+    std::fs::remove_file(bob_folder.join("from-bob.txt")).unwrap();
+    wait_until(|| !alice_folder.join("from-bob.txt").exists()).await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

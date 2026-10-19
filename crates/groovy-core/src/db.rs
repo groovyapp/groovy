@@ -68,6 +68,14 @@ const MIGRATIONS: &[&str] = &[
         created INTEGER NOT NULL,
         revoked INTEGER
     );",
+    // Shared folders this device is in. `path` is where this device saves the folder's
+    // files, if it does; it is never shared.
+    "CREATE TABLE folders (
+        namespace BLOB PRIMARY KEY NOT NULL CHECK (length(namespace) = 32),
+        name      TEXT NOT NULL,
+        path      TEXT,
+        created   INTEGER NOT NULL
+    );",
 ];
 
 /// The schema version this build writes.
