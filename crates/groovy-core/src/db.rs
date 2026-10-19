@@ -41,6 +41,9 @@ const MIGRATIONS: &[&str] = &[
         first_seen   INTEGER NOT NULL,
         last_seen    INTEGER NOT NULL
     );",
+    // Whether files from a contact are accepted without asking.
+    "ALTER TABLE contacts ADD COLUMN auto_accept_files INTEGER NOT NULL DEFAULT 0
+        CHECK (auto_accept_files IN (0, 1));",
 ];
 
 /// The schema version this build writes.
