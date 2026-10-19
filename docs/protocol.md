@@ -97,6 +97,16 @@ The same trust check applies before any blob is served. A connection from an end
 
 Each blob added on this device gets a persistent tag, so it is kept across restarts and garbage collection. Garbage collection is not enabled yet. When it is, it will delete only blobs that have no tag, so content added through the node is never removed by it.
 
+## Shares
+
+A share offers files to anyone who has its ticket, while this node is online. The ticket is an iroh-blobs ticket: this node's address and the root hash of the share's collection.
+
+Blob requests are decided one at a time. A trusted contact may fetch any blob this node holds. Anyone else may fetch only the root and the files of an active share, which includes the metadata that holds their names. Every other request is refused. A blocked peer is refused before any request.
+
+Revoking a share stops it at once: new requests for its content are refused. A download that is already running is not stopped. A ticket carries an address, so it works only while the node can be reached at that address.
+
+Previewing a ticket fetches the list of names and the sizes, not the files. Receiving a share makes it a transfer, the same as an accepted offer.
+
 ## Not yet specified
 
 Messages after the handshake: transfer management (#29), chat (#41), and groups (#43). Each will get a section here when it is built.

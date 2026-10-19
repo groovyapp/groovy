@@ -1074,3 +1074,102 @@ async fn a_paused_transfer_stays_paused_across_a_restart_until_resumed() {
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_share_is_downloaded_by_someone_who_is_not_a_contact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, carol_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, carol_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "carol"));
+    // Carol is not a contact of Alice: neither trusts the other.
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (carol, mut carol_events) = blob_node(&carol_dir, carol_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let share = alice.create_share(paths).await.expect("the share is made");
+    assert_eq!(share.share.files, 3);
+    assert_eq!(share.share.bytes, 17);
+
+    let preview = carol
+        .preview_share(share.ticket.clone())
+        .await
+        .expect("carol reads the share's listing");
+    assert_eq!(
+        preview.names,
+        ["note.txt", "photos/a.txt", "photos/sub/b.bin"]
+    );
+    assert_eq!(preview.files, 3);
+    assert_eq!(preview.bytes, 17);
+
+    let transfer = carol
+        .receive_share(share.ticket)
+        .await
+        .expect("carol starts downloading");
+    let received = tokio::time::timeout(TIMEOUT, next_file_received(&mut carol_events))
+        .await
+        .expect("carol receives the share");
+    assert!(matches!(received, NodeEvent::FileReceived { transfer: t, .. } if t == transfer));
+    assert_eq!(
+        std::fs::read(carol_dir.root().join("Downloads/photos/sub/b.bin")).unwrap(),
+        b"bravo"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(carol.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_revoked_share_cannot_be_downloaded_by_someone_who_is_not_a_contact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, dave_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, dave_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "dave"));
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (dave, _dave_events) = blob_node(&dave_dir, dave_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let share = alice.create_share(paths).await.unwrap();
+    alice
+        .revoke_share(share.share.id)
+        .await
+        .expect("the share is revoked");
+
+    assert!(alice.shares().await.unwrap()[0].revoked.is_some());
+    assert!(
+        dave.receive_share(share.ticket.clone()).await.is_err(),
+        "a revoked share was downloaded"
+    );
+    assert!(dave.preview_share(share.ticket).await.is_err());
+    assert!(matches!(
+        alice.revoke_share(share.share.id).await,
+        Err(groovy_core::NodeError::UnknownShare)
+    ));
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(dave.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_non_contact_cannot_fetch_a_blob_that_is_in_no_share() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, eve_key) = (SecretKey::generate(), SecretKey::generate());
+    let alice_dir = fresh_dir(&tmp, "alice");
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (eve, _eve_events) = blob_node(&fresh_dir(&tmp, "eve"), eve_key.clone()).await;
+    let private = alice.add_blob(b"private to alice".to_vec()).await.unwrap();
+    alice
+        .create_share(write_sample_files(&tmp.path().join("source")))
+        .await
+        .unwrap();
+
+    let alice_addr = alice.addr().await.unwrap();
+    let eve_dialer = dialer_with(eve_key).await;
+    let connection = eve_dialer
+        .connect(alice_addr, iroh_blobs::ALPN)
+        .await
+        .expect("a non-contact may connect to the blob protocol");
+    let fetched = iroh_blobs::get::request::get_blob(connection, private).await;
+    assert!(fetched.is_err(), "a non-contact fetched a private blob");
+
+    eve_dialer.close().await;
+    assert!(eve.shutdown(TIMEOUT));
+    assert!(alice.shutdown(TIMEOUT));
+}

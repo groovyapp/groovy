@@ -18,6 +18,7 @@ mod paths;
 pub mod presence;
 pub mod profile;
 pub mod protocol;
+pub mod shares;
 pub mod ticket;
 pub mod transfers;
 

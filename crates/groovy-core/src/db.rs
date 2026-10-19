@@ -56,6 +56,18 @@ const MIGRATIONS: &[&str] = &[
         created INTEGER NOT NULL,
         updated INTEGER NOT NULL
     );",
+    // Shares: content offered to anyone with the ticket, until revoked. `hashes` holds
+    // the root and every file in the collection, which are the only blobs the share serves.
+    "CREATE TABLE shares (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        root    BLOB NOT NULL CHECK (length(root) = 32),
+        hashes  BLOB NOT NULL,
+        names   BLOB NOT NULL,
+        files   INTEGER NOT NULL,
+        bytes   INTEGER NOT NULL,
+        created INTEGER NOT NULL,
+        revoked INTEGER
+    );",
 ];
 
 /// The schema version this build writes.
