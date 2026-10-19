@@ -12,6 +12,7 @@ use groovy_core::Database;
 use crate::{
     APP_NAME,
     data::AppData,
+    files::FilesView,
     node::{NodeState, answer_pairing},
     onboarding::{self, Onboarding, OnboardingEvent},
     peers::PeersView,
@@ -38,6 +39,7 @@ pub struct Workspace {
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     settings: Entity<SettingsScreen>,
     peers: Entity<PeersView>,
+    files: Entity<FilesView>,
     _appearance_subscription: Subscription,
 }
 
@@ -83,6 +85,7 @@ impl Workspace {
 
         let settings = cx.new(|cx| SettingsScreen::new(database.clone(), cx));
         let peers = cx.new(|cx| PeersView::new(database.clone(), cx));
+        let files = cx.new(|_| FilesView::new(database.clone()));
 
         Self {
             current,
@@ -91,6 +94,7 @@ impl Workspace {
             onboarding,
             settings,
             peers,
+            files,
             _appearance_subscription,
         }
     }
@@ -265,8 +269,14 @@ impl Workspace {
                     .when(self.current == Screen::Peers, |d| {
                         d.child(self.peers.clone())
                     })
+                    .when(self.current == Screen::Files, |d| {
+                        d.child(self.files.clone())
+                    })
                     .when(
-                        !matches!(self.current, Screen::Settings | Screen::Peers),
+                        !matches!(
+                            self.current,
+                            Screen::Settings | Screen::Peers | Screen::Files
+                        ),
                         |d| {
                             d.child(
                                 div()

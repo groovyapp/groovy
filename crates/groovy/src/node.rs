@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use gpui::{App, AppContext, Global};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use groovy_core::protocol::FileOffer;
+use groovy_core::transfers::Transfer;
 use groovy_core::{
     ContactGate, Database, EndpointAddr, EndpointId, Network, Node, NodeConfig, NodeEvent,
     NodeHandle, PeerInfo, PeerProfile, Route, Tracker, Trust, relay_url,
@@ -47,7 +50,32 @@ pub struct NodeState {
     pairings: Vec<PairingRequest>,
     /// Trusted contacts that answered their last check, and how they are reached.
     routes: HashMap<EndpointId, Route>,
+    /// Accepted transfers, by id, as the node last reported them.
+    transfers: BTreeMap<i64, Transfer>,
+    /// How fast each transfer has been moving, from its last few reports.
+    speeds: HashMap<i64, Speed>,
+    /// The files each received transfer saved, where they are on disk.
+    saved: HashMap<i64, Vec<PathBuf>>,
+    /// Offers from trusted peers that the user has not answered, oldest first.
+    offers: Vec<FileOfferRequest>,
 }
+
+/// A trusted peer offering files, waiting for the user to accept or decline.
+#[derive(Debug, Clone)]
+pub struct FileOfferRequest {
+    pub peer: PeerInfo,
+    pub offer: FileOffer,
+}
+
+/// The bytes a transfer had when it was last sampled, and its speed since then.
+struct Speed {
+    done: u64,
+    at: Instant,
+    bytes_per_second: f64,
+}
+
+/// How often a transfer's speed is worked out, at most.
+const SPEED_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A peer asking to pair, and the code the user compares with theirs.
 #[derive(Debug, Clone)]
@@ -67,6 +95,43 @@ impl NodeState {
     /// Pairing requests waiting for the user, oldest first.
     pub fn pairings(&self) -> &[PairingRequest] {
         &self.pairings
+    }
+
+    /// Every accepted transfer, oldest first.
+    pub fn transfers(&self) -> impl Iterator<Item = &Transfer> {
+        self.transfers.values()
+    }
+
+    /// How fast a transfer is moving, in bytes per second, once it has been sampled.
+    pub fn speed(&self, id: i64) -> Option<f64> {
+        self.speeds.get(&id).map(|speed| speed.bytes_per_second)
+    }
+
+    /// The files a received transfer saved, where they are on disk.
+    pub fn saved_files(&self, id: i64) -> &[PathBuf] {
+        self.saved.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// File offers waiting for the user, oldest first.
+    pub fn offers(&self) -> &[FileOfferRequest] {
+        &self.offers
+    }
+
+    /// Stores a transfer's latest state, and works out its speed when it has moved on.
+    fn record_transfer(&mut self, transfer: Transfer) {
+        let now = Instant::now();
+        let speed = self.speeds.entry(transfer.id).or_insert(Speed {
+            done: transfer.done,
+            at: now,
+            bytes_per_second: 0.,
+        });
+        let elapsed = now.duration_since(speed.at);
+        if elapsed >= SPEED_INTERVAL && transfer.done >= speed.done {
+            speed.bytes_per_second = (transfer.done - speed.done) as f64 / elapsed.as_secs_f64();
+            speed.done = transfer.done;
+            speed.at = now;
+        }
+        self.transfers.insert(transfer.id, transfer);
     }
 
     /// How a trusted contact is reached, if it answered its last check. `None` means
@@ -186,6 +251,28 @@ pub fn answer_pairing(cx: &mut App, peer: EndpointId, accept: bool) {
     .detach();
 }
 
+/// Accepts or declines a file offer. The offer is removed at once, and the answer is sent
+/// in the background.
+pub fn answer_offer(cx: &mut App, peer: EndpointId, accept: bool) {
+    if !cx.has_global::<NodeState>() {
+        return;
+    }
+    let state = cx.global_mut::<NodeState>();
+    state
+        .offers
+        .retain(|request| request.peer.endpoint_id != peer);
+    let Some(handle) = state.handle.clone() else {
+        return;
+    };
+    cx.refresh_windows();
+    cx.spawn(async move |_| {
+        if let Err(error) = handle.answer_offer(peer, accept).await {
+            warn!(%error, "could not answer a file offer");
+        }
+    })
+    .detach();
+}
+
 /// Tells peers about a change to this node's profile. Does nothing if the node is not running.
 pub fn publish_profile(cx: &App, profile: PeerProfile) {
     if let Some(state) = cx.try_global::<NodeState>() {
@@ -226,6 +313,10 @@ pub fn start(cx: &mut App) {
                 handle: None,
                 pairings: Vec::new(),
                 routes: HashMap::new(),
+                transfers: BTreeMap::new(),
+                speeds: HashMap::new(),
+                saved: HashMap::new(),
+                offers: Vec::new(),
             });
             return;
         }
@@ -237,6 +328,14 @@ pub fn start(cx: &mut App) {
         handle: Some(handle.clone()),
         pairings: Vec::new(),
         routes: HashMap::new(),
+        transfers: handle
+            .transfers()
+            .into_iter()
+            .map(|transfer| (transfer.id, transfer))
+            .collect(),
+        speeds: HashMap::new(),
+        saved: HashMap::new(),
+        offers: Vec::new(),
     });
 
     let network_changes = Arc::new(AtomicU64::new(0));
@@ -274,27 +373,17 @@ pub fn start(cx: &mut App) {
                         state.pairings.push(PairingRequest { peer, code });
                     }
                     NodeEvent::FileOffered { peer, offer } => {
-                        // Accepting files needs the Files screen (#31), which does not exist
-                        // yet. Until it does, offers are declined, so nothing is received
-                        // without the user's say.
-                        info!(peer = %peer.endpoint_id, files = offer.files, "declining a file offer");
-                        if let Some(handle) = state.handle.clone() {
-                            cx.spawn(async move |_| {
-                                if let Err(error) = handle.answer_offer(peer.endpoint_id, false).await {
-                                    warn!(%error, "could not decline a file offer");
-                                }
-                            })
-                            .detach();
-                        }
+                        state.offers.push(FileOfferRequest { peer, offer });
                     }
-                    // Progress and received files are shown once the Files screen exists (#31).
-                    NodeEvent::ReceiveFailed { peer, error, .. } => {
-                        // Retrying a failed receive needs the Files screen (#31).
-                        warn!(peer = %peer, %error, "could not receive files");
+                    NodeEvent::TransferChanged(transfer) => state.record_transfer(transfer),
+                    NodeEvent::FileReceived {
+                        transfer, saved, ..
+                    } => {
+                        state.saved.insert(transfer, saved);
                     }
-                    NodeEvent::ImportProgress { .. }
-                    | NodeEvent::TransferChanged(_)
-                    | NodeEvent::FileReceived { .. } => {}
+                    // A failed receive shows as a failed transfer, which the transfer list
+                    // already reports.
+                    NodeEvent::ReceiveFailed { .. } | NodeEvent::ImportProgress { .. } => {}
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }
