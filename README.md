@@ -173,6 +173,7 @@ crates/
     src/paths.rs         Data directory layout and GROOVY_DATA_DIR override
     src/protocol.rs      Groovy protocol: handshake, profile exchange, framing (see docs/protocol.md)
     src/ticket.rs        Tickets: encode, parse (ticket or groovy:// link), QR codes
+    src/contacts.rs      Contacts: known peers, trust, blocking, and the connection gate
   groovy/                Desktop app (GPUI)
     src/
       main.rs            Entry point

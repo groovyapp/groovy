@@ -6,6 +6,7 @@
 mod avatar;
 pub mod backup;
 mod config;
+pub mod contacts;
 pub mod db;
 pub mod identity;
 pub mod logging;
@@ -17,12 +18,13 @@ pub mod ticket;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
 pub use config::{Appearance, CURRENT_VERSION, Config, ConfigError};
+pub use contacts::{Contact, ContactGate, Trust};
 pub use db::{Database, DbError, SCHEMA_VERSION};
 pub use identity::{Identity, IdentityError, Location};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 pub use node::{
-    EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeError, NodeEvent, NodeHandle,
-    relay_url,
+    AllowAll, EventStream, GROOVY_ALPN, Network, Node, NodeConfig, NodeError, NodeEvent,
+    NodeHandle, PeerGate, relay_url,
 };
 pub use paths::{DataDir, PathsError, override_env_var};
 pub use profile::{Profile, validate_display_name};

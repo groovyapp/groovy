@@ -31,6 +31,16 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO profile (id, display_name)
         SELECT 1, value FROM settings WHERE key = 'profile.display_name';
     DELETE FROM settings WHERE key = 'profile.display_name';",
+    // Peers this node has handshaken with. Trust decides whether they may connect.
+    "CREATE TABLE contacts (
+        endpoint_id  BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
+        display_name TEXT NOT NULL,
+        nickname     TEXT,
+        avatar_hash  BLOB CHECK (avatar_hash IS NULL OR length(avatar_hash) = 32),
+        trust        TEXT NOT NULL CHECK (trust IN ('pending', 'trusted', 'blocked')),
+        first_seen   INTEGER NOT NULL,
+        last_seen    INTEGER NOT NULL
+    );",
 ];
 
 /// The schema version this build writes.
