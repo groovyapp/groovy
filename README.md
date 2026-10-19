@@ -215,7 +215,7 @@ scripts/
   generate_icons.py      Regenerates the PNGs and .ico from app-icon.svg
 .github/workflows/       CI: fmt, clippy and release build on Windows and Linux
 docs/
-  decisions/             Architecture decision records (0001: SQLite for local state)
+  decisions/             Architecture decision records (0001: SQLite for local state; 0002: encryption at rest relies on the OS)
   benchmarks.md          How to run the benchmarks, and the results
   storage.md             Storage model: shared folders, replication, garbage collection (proposal)
   protocol.md            Groovy protocol: handshake, trust, pairing, presence, files, shares
