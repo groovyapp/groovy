@@ -54,6 +54,10 @@ Machine: Intel Core i5-8365U (4 cores, 8 threads), 7 GB RAM, NVMe SSD, Linux 7.2
 
 `cargo run --release -p groovy-core --example resume_check` shares a 5 GiB file over loopback, pauses the receive once a quarter of it has arrived, resumes it, and checks that the resume fetched only what was missing and that the file is intact.
 
-Result on the same machine as above: paused with 1,285 MiB of 5,120 MiB received. The resume took 61 s and fetched 3,834 MiB, which is what was still missing (3,835 MiB). The file arrived intact.
+Pause result on the same machine: paused with 1,285 MiB of 5,120 MiB received. The resume took 61 s and fetched 3,834 MiB, which is what was still missing (3,835 MiB). The file arrived intact.
 
-This interrupts with a pause, not a crash or a dropped network connection. Those are not covered by this check yet.
+The same check can interrupt by stopping the node and starting it again, which is what closing the app does: `--interrupt restart`. The node stops the receive and queues it, and the next start picks it up from what it has, without anything asking for it.
+
+Result with a restart on the same machine: stopped with 1,283 MiB of 5,120 MiB received. After the restart the receive fetched 3,837 MiB, which is what was missing. The file arrived intact.
+
+Neither covers a crash of the process or a dropped network connection. Those are not covered by this check yet.

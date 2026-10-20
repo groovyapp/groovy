@@ -972,6 +972,22 @@ async fn run(
         }
     }
 
+    // Receives still running stop now, and are queued again, so the next start picks them
+    // up from what they have. Stopping them is not a failure.
+    let running: Vec<(i64, Option<tokio::task::AbortHandle>)> = lock_book(&receiving.book)
+        .iter_mut()
+        .filter(|(_, slot)| {
+            slot.transfer.direction == Direction::Receive && slot.transfer.state.is_unfinished()
+        })
+        .map(|(id, slot)| (*id, slot.abort.take()))
+        .collect();
+    for (id, abort) in running {
+        if let Some(abort) = abort {
+            abort.abort();
+        }
+        set_transfer(&receiving, id, Some(TransferState::Queued), None);
+    }
+
     if let Err(error) = router.shutdown().await {
         warn!(%error, "router did not shut down cleanly");
     }
