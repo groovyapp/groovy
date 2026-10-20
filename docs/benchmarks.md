@@ -49,3 +49,11 @@ Machine: Intel Core i5-8365U (4 cores, 8 threads), 7 GB RAM, NVMe SSD, Linux 7.2
 - The loopback transfer is slower than the import, because the received bytes are checked as they arrive and then written to the store and the downloads folder. The full-size run was slower per byte than the default run, probably because it also wrote far more data to the same disk.
 - Small files cost more per byte, because each one is a separate import. The rate is limited by files per second, not by bytes.
 - These are one machine and one run each, so expect some variation from run to run. Compare numbers from the same machine.
+
+## Resume after an interruption
+
+`cargo run --release -p groovy-core --example resume_check` shares a 5 GiB file over loopback, pauses the receive once a quarter of it has arrived, resumes it, and checks that the resume fetched only what was missing and that the file is intact.
+
+Result on the same machine as above: paused with 1,285 MiB of 5,120 MiB received. The resume took 61 s and fetched 3,834 MiB, which is what was still missing (3,835 MiB). The file arrived intact.
+
+This interrupts with a pause, not a crash or a dropped network connection. Those are not covered by this check yet.
