@@ -518,6 +518,66 @@ impl Database {
         }))
     }
 
+    /// Up to `limit` messages of a group before `before`, in group order. With no cursor it
+    /// starts from the newest message.
+    pub fn group_messages_before(
+        &self,
+        group: &GroupId,
+        before: Option<(i64, MessageId)>,
+        limit: usize,
+    ) -> Result<Vec<GroupMessage>, DbError> {
+        let (timestamp, id) = before.unwrap_or((i64::MAX, [0xff; 16]));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_conn(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {COLUMNS} FROM group_messages
+                 WHERE group_id = ?1 AND (timestamp < ?2 OR (timestamp = ?2 AND id < ?3))
+                 ORDER BY timestamp DESC, id DESC LIMIT ?4"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![group.as_slice(), timestamp, id.as_slice(), limit],
+                    read_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let mut messages: Vec<GroupMessage> = rows
+            .into_iter()
+            .filter_map(decode_row)
+            .map(|envelope| GroupMessage {
+                id: envelope.id,
+                group: envelope.group,
+                author: envelope.author,
+                timestamp: envelope.timestamp,
+                body: envelope.body,
+                reply_to: envelope.reply_to,
+            })
+            .collect();
+        messages.reverse();
+        Ok(messages)
+    }
+
+    /// Deletes a group message from this device. Other members keep theirs. Returns whether one
+    /// was deleted.
+    pub fn delete_group_message(&self, id: MessageId) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            let deleted =
+                conn.execute("DELETE FROM group_messages WHERE id = ?1", [id.as_slice()])?;
+            Ok(deleted > 0)
+        })
+    }
+
+    /// Deletes every message of a group from this device. The group itself stays.
+    pub fn clear_group_messages(&self, group: &GroupId) -> Result<usize, DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM group_messages WHERE group_id = ?1",
+                [group.as_slice()],
+            )
+        })
+    }
+
     /// The timestamp of an author's latest message in a group, if it has one.
     pub fn latest_author_timestamp(
         &self,

@@ -2915,3 +2915,193 @@ async fn a_file_sent_with_a_message_is_fetched_on_request_and_an_image_comes_wit
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+/// Stores a direct message straight into a node's database, with a given timestamp, so tests can
+/// set the order of messages exactly.
+fn store_direct(
+    dir: &DataDir,
+    conversation: iroh::EndpointId,
+    own: iroh::EndpointId,
+    timestamp: i64,
+    body: &str,
+) -> [u8; 16] {
+    use groovy_core::messages::{DeliveryState, Message, new_id};
+    let db = Database::open(&dir.database_file()).unwrap();
+    let id = new_id();
+    db.insert_message(&Message {
+        id,
+        conversation,
+        author: own,
+        timestamp,
+        body: body.to_owned(),
+        reply_to: None,
+        state: DeliveryState::Delivered,
+        attachments: Vec::new(),
+    })
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn search_finds_words_in_direct_and_group_messages_newest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ada_key, ben_key) = (SecretKey::generate(), SecretKey::generate());
+    let dir = fresh_dir(&tmp, "ada");
+    let (ada, _events) = blob_node_collecting(&dir, ada_key.clone(), None).await;
+    store_direct(
+        &dir,
+        ben_key.public(),
+        ada_key.public(),
+        1_000,
+        "I like Rust a lot",
+    );
+    store_direct(
+        &dir,
+        ben_key.public(),
+        ben_key.public(),
+        2_000,
+        "rusty pipes",
+    );
+    store_direct(
+        &dir,
+        ben_key.public(),
+        ben_key.public(),
+        3_000,
+        "nothing here",
+    );
+
+    let group = ada.create_group("coders".into()).await.unwrap();
+    ada.send_group_message(group, "the group talks about rust".into(), None)
+        .await
+        .unwrap();
+
+    // A word matches the words that start with it, so "rust" finds "rusty" too. The group message
+    // is the newest, so it comes first.
+    let hits = ada.search_messages("rust".into(), 10).await.unwrap();
+    let bodies: Vec<&str> = hits.iter().map(|hit| hit.body.as_str()).collect();
+    assert_eq!(
+        bodies,
+        [
+            "the group talks about rust",
+            "rusty pipes",
+            "I like Rust a lot"
+        ]
+    );
+    assert!(matches!(
+        hits[0].kind,
+        groovy_core::messages::HitKind::Group(_)
+    ));
+    assert!(matches!(
+        hits[1].kind,
+        groovy_core::messages::HitKind::Direct(_)
+    ));
+
+    let exact = ada.search_messages("rusty".into(), 10).await.unwrap();
+    assert_eq!(exact.len(), 1);
+
+    // Every word is required, and quotes in the query do not break the search.
+    assert_eq!(
+        ada.search_messages("rust pipes".into(), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ada.search_messages("rusty lot".into(), 10)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(ada.search_messages("\"rust".into(), 10).await.is_ok());
+    assert!(
+        ada.search_messages("   ".into(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(ada.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn history_pages_back_through_a_conversation_and_deletes_locally() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ada_key, ben_key) = (SecretKey::generate(), SecretKey::generate());
+    let dir = fresh_dir(&tmp, "ada");
+    let (ada, _events) = blob_node_collecting(&dir, ada_key.clone(), None).await;
+    let mut ids = Vec::new();
+    for n in 1..=25 {
+        ids.push(store_direct(
+            &dir,
+            ben_key.public(),
+            ben_key.public(),
+            n,
+            &format!("message {n}"),
+        ));
+    }
+
+    let latest = ada
+        .messages_before(ben_key.public(), None, 10)
+        .await
+        .unwrap();
+    let times: Vec<i64> = latest.iter().map(|m| m.timestamp).collect();
+    assert_eq!(
+        times,
+        (16..=25).collect::<Vec<_>>(),
+        "the first page is the latest ten, in order"
+    );
+
+    let first = &latest[0];
+    let older = ada
+        .messages_before(ben_key.public(), Some((first.timestamp, first.id)), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        older.iter().map(|m| m.timestamp).collect::<Vec<_>>(),
+        (6..=15).collect::<Vec<_>>()
+    );
+    let oldest = &older[0];
+    let rest = ada
+        .messages_before(ben_key.public(), Some((oldest.timestamp, oldest.id)), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|m| m.timestamp).collect::<Vec<_>>(),
+        (1..=5).collect::<Vec<_>>()
+    );
+
+    // Deleting one message removes it here only, and it is no longer in the history.
+    assert!(ada.delete_message(ids[24]).await.unwrap());
+    assert!(
+        !ada.delete_message(ids[24]).await.unwrap(),
+        "already deleted"
+    );
+    let after = ada
+        .messages_before(ben_key.public(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.iter().map(|m| m.timestamp).collect::<Vec<_>>(),
+        (15..=24).collect::<Vec<_>>()
+    );
+    assert!(
+        ada.search_messages("message".into(), 100)
+            .await
+            .unwrap()
+            .len()
+            == 24
+    );
+
+    // Clearing a conversation removes what is left of it, and nothing else.
+    assert_eq!(ada.clear_conversation(ben_key.public()).await.unwrap(), 24);
+    assert!(
+        ada.messages_before(ben_key.public(), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(ada.shutdown(TIMEOUT));
+}

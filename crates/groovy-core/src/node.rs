@@ -342,6 +342,26 @@ enum Command {
         oneshot::Sender<Result<Message, NodeError>>,
     ),
     DownloadAttachment(MessageId, usize, oneshot::Sender<Result<i64, NodeError>>),
+    Search(
+        String,
+        usize,
+        oneshot::Sender<Result<Vec<messages::SearchHit>, NodeError>>,
+    ),
+    MessagesBefore(
+        EndpointId,
+        Option<messages::Cursor>,
+        usize,
+        oneshot::Sender<Result<Vec<Message>, NodeError>>,
+    ),
+    GroupMessagesBefore(
+        GroupId,
+        Option<messages::Cursor>,
+        usize,
+        oneshot::Sender<Result<Vec<GroupMessage>, NodeError>>,
+    ),
+    DeleteMessage(MessageId, oneshot::Sender<Result<bool, NodeError>>),
+    ClearConversation(EndpointId, oneshot::Sender<Result<usize, NodeError>>),
+    ClearGroup(GroupId, oneshot::Sender<Result<usize, NodeError>>),
     Messages(EndpointId, oneshot::Sender<Result<Vec<Message>, NodeError>>),
     CreateGroup(String, oneshot::Sender<Result<GroupId, NodeError>>),
     JoinGroup(String, oneshot::Sender<Result<GroupId, NodeError>>),
@@ -1094,6 +1114,56 @@ async fn run(
                 }
                 Some(Command::DownloadAttachment(message, index, reply)) => {
                     let outcome = download_attachment(&receiving, message, index);
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::Search(query, limit, reply)) => {
+                    let outcome = messages_database(&receiving).and_then(|database| {
+                        database
+                            .search_messages(&query, limit)
+                            .map_err(|error| NodeError::Message(error.to_string()))
+                    });
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::MessagesBefore(peer, before, limit, reply)) => {
+                    let outcome = messages_database(&receiving).and_then(|database| {
+                        database
+                            .messages_before(&peer, before, limit)
+                            .map_err(|error| NodeError::Message(error.to_string()))
+                    });
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::GroupMessagesBefore(group, before, limit, reply)) => {
+                    let outcome = group_database(&receiving).and_then(|database| {
+                        database
+                            .group_messages_before(&group, before, limit)
+                            .map_err(group_error)
+                    });
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::DeleteMessage(id, reply)) => {
+                    let outcome = messages_database(&receiving).and_then(|database| {
+                        // A direct message and a group message have different tables; the id is
+                        // in one of them.
+                        let direct = database
+                            .delete_message(id)
+                            .map_err(|error| NodeError::Message(error.to_string()))?;
+                        let group = database.delete_group_message(id).map_err(group_error)?;
+                        Ok(direct || group)
+                    });
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::ClearConversation(peer, reply)) => {
+                    let outcome = messages_database(&receiving).and_then(|database| {
+                        database
+                            .clear_conversation(&peer)
+                            .map_err(|error| NodeError::Message(error.to_string()))
+                    });
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::ClearGroup(group, reply)) => {
+                    let outcome = group_database(&receiving).and_then(|database| {
+                        database.clear_group_messages(&group).map_err(group_error)
+                    });
                     let _ = reply.send(outcome);
                 }
                 Some(Command::CreateGroup(name, reply)) => {
@@ -1902,6 +1972,10 @@ fn download_attachment(
 
 /// The database that messages are kept in.
 fn group_database_for_messages(receiving: &Receiving) -> Result<Arc<Database>, NodeError> {
+    messages_database(receiving)
+}
+
+fn messages_database(receiving: &Receiving) -> Result<Arc<Database>, NodeError> {
     receiving
         .database
         .clone()
@@ -4458,6 +4532,84 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::SendMessage(to, body, reply_to, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Searches every conversation and group for messages with these words, newest first.
+    /// A word matches any word that starts with it.
+    pub async fn search_messages(
+        &self,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<messages::SearchHit>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Search(query, limit, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Up to `limit` messages with a contact before `before`, in conversation order. With no
+    /// cursor, the latest messages.
+    pub async fn messages_before(
+        &self,
+        peer: EndpointId,
+        before: Option<messages::Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Message>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::MessagesBefore(peer, before, limit, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Up to `limit` messages of a group before `before`, in group order. With no cursor, the
+    /// latest messages.
+    pub async fn group_messages_before(
+        &self,
+        group: GroupId,
+        before: Option<messages::Cursor>,
+        limit: usize,
+    ) -> Result<Vec<GroupMessage>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::GroupMessagesBefore(group, before, limit, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Deletes a message from this device. The contact keeps its copy. Returns whether a message
+    /// was deleted.
+    pub async fn delete_message(&self, id: MessageId) -> Result<bool, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::DeleteMessage(id, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Deletes every message with a contact from this device. Returns how many were deleted.
+    pub async fn clear_conversation(&self, peer: EndpointId) -> Result<usize, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ClearConversation(peer, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Deletes every message of a group from this device. The group stays.
+    pub async fn clear_group_messages(&self, group: GroupId) -> Result<usize, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ClearGroup(group, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

@@ -175,6 +175,28 @@ const MIGRATIONS: &[&str] = &[
         preview  BLOB,
         PRIMARY KEY (message, position)
     );",
+    // Full-text search over message bodies, kept in step with the tables by triggers. Both
+    // tables use their own rowid, so the index refers to a row, not an id.
+    "CREATE VIRTUAL TABLE message_search USING fts5(
+        body, content = 'messages', content_rowid = 'rowid', tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER messages_search_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO message_search (rowid, body) VALUES (new.rowid, new.body);
+    END;
+    CREATE TRIGGER messages_search_delete AFTER DELETE ON messages BEGIN
+        INSERT INTO message_search (message_search, rowid, body) VALUES ('delete', old.rowid, old.body);
+    END;
+    CREATE VIRTUAL TABLE group_search USING fts5(
+        body, content = 'group_messages', content_rowid = 'rowid', tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER group_messages_search_insert AFTER INSERT ON group_messages BEGIN
+        INSERT INTO group_search (rowid, body) VALUES (new.rowid, new.body);
+    END;
+    CREATE TRIGGER group_messages_search_delete AFTER DELETE ON group_messages BEGIN
+        INSERT INTO group_search (group_search, rowid, body) VALUES ('delete', old.rowid, old.body);
+    END;
+    INSERT INTO message_search (message_search) VALUES ('rebuild');
+    INSERT INTO group_search (group_search) VALUES ('rebuild');",
 ];
 
 /// The schema version this build writes.
