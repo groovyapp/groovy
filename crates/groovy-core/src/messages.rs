@@ -406,6 +406,195 @@ impl Database {
     }
 }
 
+/// Where a search hit was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    /// A direct message, in the conversation with this contact.
+    Direct(EndpointId),
+    /// A group message, in this group.
+    Group([u8; 32]),
+}
+
+/// A message that matches a search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    pub kind: HitKind,
+    pub id: MessageId,
+    pub timestamp: i64,
+    pub body: String,
+}
+
+/// Where to continue reading a conversation from: the message to read before.
+pub type Cursor = (i64, MessageId);
+
+/// A search expression for the words typed: each word must match, and a word matches any word
+/// that starts with it. Returns `None` when there are no words.
+pub fn match_expression(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+impl Database {
+    /// Messages in a conversation that match a search, newest first. Covers direct messages
+    /// and group messages.
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, DbError> {
+        let Some(expression) = match_expression(query) else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut hits = self
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT m.id, m.conversation, m.timestamp, m.body FROM message_search s
+                 JOIN messages m ON m.rowid = s.rowid
+                 WHERE message_search MATCH ?1
+                 ORDER BY m.timestamp DESC LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map(params![expression, limit], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })?
+            .into_iter()
+            .filter_map(|(id, conversation, timestamp, body)| {
+                Some(SearchHit {
+                    kind: HitKind::Direct(
+                        EndpointId::from_bytes(
+                            &<[u8; 32]>::try_from(conversation.as_slice()).ok()?,
+                        )
+                        .ok()?,
+                    ),
+                    id: <MessageId>::try_from(id.as_slice()).ok()?,
+                    timestamp,
+                    body,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let group_rows = self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT g.id, g.group_id, g.timestamp, g.body FROM group_search s
+                 JOIN group_messages g ON g.rowid = s.rowid
+                 WHERE group_search MATCH ?1
+                 ORDER BY g.timestamp DESC LIMIT ?2",
+            )?;
+            let rows = statement
+                .query_map(params![expression, limit], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        hits.extend(
+            group_rows
+                .into_iter()
+                .filter_map(|(id, group, timestamp, body)| {
+                    Some(SearchHit {
+                        kind: HitKind::Group(<[u8; 32]>::try_from(group.as_slice()).ok()?),
+                        id: <MessageId>::try_from(id.as_slice()).ok()?,
+                        timestamp,
+                        body,
+                    })
+                }),
+        );
+        hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.id.cmp(&a.id)));
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    /// Up to `limit` messages of a conversation before `before`, in conversation order. With no
+    /// cursor it starts from the newest message, so the first page is the latest messages.
+    pub fn messages_before(
+        &self,
+        conversation: &EndpointId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Message>, DbError> {
+        let (timestamp, id) = before.unwrap_or((i64::MAX, [0xff; 16]));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_conn(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "{SELECT} WHERE conversation = ?1
+                   AND (timestamp < ?2 OR (timestamp = ?2 AND id < ?3))
+                 ORDER BY timestamp DESC, id DESC LIMIT ?4"
+            ))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        conversation.as_bytes().as_slice(),
+                        timestamp,
+                        id_bytes(&id),
+                        limit
+                    ],
+                    row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let mut messages: Vec<Message> = rows
+            .into_iter()
+            .filter_map(|row| decode(*conversation, row))
+            .collect();
+        for message in &mut messages {
+            message.attachments = self.attachments_of(&message.id)?;
+        }
+        // Newest first was the order read; give the page in conversation order.
+        messages.reverse();
+        Ok(messages)
+    }
+
+    /// Deletes a message from this device, with its attachments and any delivery still waiting
+    /// for it. Returns whether a message was deleted. This does not delete it for the contact.
+    pub fn delete_message(&self, id: MessageId) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM outbox WHERE message = ?1", [id_bytes(&id)])?;
+            conn.execute(
+                "DELETE FROM message_attachments WHERE message = ?1",
+                [id_bytes(&id)],
+            )?;
+            let deleted = conn.execute("DELETE FROM messages WHERE id = ?1", [id_bytes(&id)])?;
+            Ok(deleted > 0)
+        })
+    }
+
+    /// Deletes every message in a conversation from this device. Other devices keep their copies.
+    pub fn clear_conversation(&self, conversation: &EndpointId) -> Result<usize, DbError> {
+        let key = conversation.as_bytes().as_slice();
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM outbox WHERE message IN
+                    (SELECT id FROM messages WHERE conversation = ?1)",
+                [key],
+            )?;
+            conn.execute(
+                "DELETE FROM message_attachments WHERE message IN
+                    (SELECT id FROM messages WHERE conversation = ?1)",
+                [key],
+            )?;
+            conn.execute("DELETE FROM messages WHERE conversation = ?1", [key])
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use iroh::SecretKey;
