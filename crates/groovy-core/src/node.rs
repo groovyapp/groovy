@@ -50,6 +50,7 @@ use crate::folders::{
 };
 use crate::gated::TrustedOnly;
 use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
+use crate::messages::{self, DeliveryState, MESSAGE_VERSION, Message, MessageId, WireMessage};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
@@ -101,6 +102,8 @@ pub enum NodeError {
     NoPendingOffer,
     #[error("shared folder failed: {0}")]
     Folder(String),
+    #[error("message failed: {0}")]
+    Message(String),
     #[error("linking devices failed: {0}")]
     User(String),
     #[error("there is no transfer with that id")]
@@ -223,6 +226,8 @@ pub enum NodeEvent {
         done: u64,
         total: u64,
     },
+    /// A direct message arrived from a contact and is stored.
+    MessageReceived(Message),
     /// A transfer was added, or its state or progress changed. Progress updates come
     /// at most every 100 ms for each transfer.
     TransferChanged(Transfer),
@@ -309,6 +314,13 @@ enum Command {
     UserDevices(oneshot::Sender<Result<Vec<UserDevice>, NodeError>>),
     RevokeDevice(EndpointId, oneshot::Sender<Result<(), NodeError>>),
     LeaveFolder(NamespaceId, oneshot::Sender<Result<(), NodeError>>),
+    SendMessage(
+        EndpointAddr,
+        String,
+        Option<MessageId>,
+        oneshot::Sender<Result<Message, NodeError>>,
+    ),
+    Messages(EndpointId, oneshot::Sender<Result<Vec<Message>, NodeError>>),
     FolderStatus(
         NamespaceId,
         oneshot::Sender<Result<FolderStatus, NodeError>>,
@@ -570,6 +582,7 @@ async fn run(
                 offers: offers.clone(),
                 commands: startup.commands.clone(),
                 limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
+                database: config.database.clone(),
             },
         },
     );
@@ -978,6 +991,22 @@ async fn run(
                         };
                         let _ = reply.send(outcome);
                     });
+                }
+                Some(Command::SendMessage(addr, body, reply_to, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = send_message(&receiving, addr, body, reply_to).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::Messages(peer, reply)) => {
+                    let outcome = match &receiving.database {
+                        Some(database) => database
+                            .messages(&peer)
+                            .map_err(|error| NodeError::Message(error.to_string())),
+                        None => Err(NodeError::Message("messages need a database".to_owned())),
+                    };
+                    let _ = reply.send(outcome);
                 }
                 Some(Command::FolderStatus(namespace, reply)) => {
                     let folders = folders.clone();
@@ -1486,6 +1515,92 @@ fn unsent_offer(receiving: &Receiving) -> FileOffer {
     }
 }
 
+/// Sends a message to a trusted contact and keeps it here. Returns the message with the state
+/// it ended in: `Delivered` once the contact has stored it, or `Failed`.
+async fn send_message(
+    receiving: &Receiving,
+    addr: EndpointAddr,
+    body: String,
+    reply_to: Option<MessageId>,
+) -> Result<Message, NodeError> {
+    let database = receiving
+        .database
+        .clone()
+        .ok_or_else(|| NodeError::Message("messages need a database".to_owned()))?;
+    let body =
+        messages::clean_body(&body).map_err(|error| NodeError::Message(error.to_string()))?;
+    if !receiving.gate.is_trusted(&addr.id) {
+        return Err(NodeError::Message(
+            "messages go only to trusted contacts".to_owned(),
+        ));
+    }
+    let own = receiving.endpoint.id();
+    // Never earlier than this device's previous message to the contact, so its own order holds.
+    let timestamp = match database.last_sent_timestamp(&addr.id, &own) {
+        Ok(Some(last)) => messages::now_millis().max(last + 1),
+        Ok(None) => messages::now_millis(),
+        Err(error) => return Err(NodeError::Message(error.to_string())),
+    };
+    let mut message = Message {
+        id: messages::new_id(),
+        conversation: addr.id,
+        author: own,
+        timestamp,
+        body: body.clone(),
+        reply_to,
+        state: DeliveryState::Sending,
+    };
+    database
+        .insert_message(&message)
+        .map_err(|error| NodeError::Message(error.to_string()))?;
+    let wire = WireMessage {
+        version: MESSAGE_VERSION,
+        id: message.id,
+        timestamp,
+        body,
+        reply_to,
+    };
+    message.state = match deliver(receiving, addr, &wire).await {
+        Ok(()) => DeliveryState::Delivered,
+        Err(error) => {
+            warn!(%error, "a message could not be delivered");
+            DeliveryState::Failed
+        }
+    };
+    database
+        .set_message_state(message.id, message.state)
+        .map_err(|error| NodeError::Message(error.to_string()))?;
+    Ok(message)
+}
+
+/// Sends one message on a connection to the contact, and waits for the contact to store it.
+async fn deliver(
+    receiving: &Receiving,
+    addr: EndpointAddr,
+    wire: &WireMessage,
+) -> Result<(), NodeError> {
+    let (connection, _peer) = open_peer(
+        &receiving.endpoint,
+        addr,
+        &receiving.profile,
+        &receiving.events,
+        &receiving.gate,
+    )
+    .await?;
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &Request::Message(wire.clone()))
+        .await
+        .map_err(NodeError::Connect)?;
+    let reply: Reply = protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)?;
+    connection.close(0u32.into(), b"sent");
+    match reply {
+        Reply::Stored => Ok(()),
+        _ => Err(NodeError::Connect(ProtocolError::Closed)),
+    }
+}
+
 /// Offers `paths` to a trusted peer, as transfer `id`, and waits for its answer. An accepted
 /// offer is fetched by the peer from this node's store. The send can be cancelled while it
 /// waits, which stops it at once.
@@ -1587,7 +1702,7 @@ async fn exchange_offer(
     match reply {
         Reply::Accepted => Ok(()),
         Reply::Declined => Err(NodeError::OfferDeclined),
-        Reply::Pong => Err(NodeError::Connect(ProtocolError::Closed)),
+        Reply::Pong | Reply::Stored => Err(NodeError::Connect(ProtocolError::Closed)),
     }
 }
 
@@ -2513,7 +2628,7 @@ async fn ask_to_pair(
         }
         Reply::Declined => Err(NodeError::PairingDeclined),
         // A pairing request is never answered with a pong, so this is a protocol error.
-        Reply::Pong => Err(NodeError::Connect(ProtocolError::Closed)),
+        Reply::Pong | Reply::Stored => Err(NodeError::Connect(ProtocolError::Closed)),
     }
 }
 
@@ -2527,6 +2642,7 @@ struct Inbox {
     offers: PendingOffers,
     commands: mpsc::WeakSender<Command>,
     limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    database: Option<Arc<Database>>,
 }
 
 impl Inbox {
@@ -2569,6 +2685,44 @@ impl Inbox {
                     pending.insert(id, send);
                 }
                 let _ = self.events.send(NodeEvent::PairingRequested { peer, code });
+            }
+            Request::Message(wire) => {
+                let id = peer.endpoint_id;
+                // Only a trusted peer may send messages. Anyone else gets no answer.
+                if !self.gate.is_trusted(&id) {
+                    return;
+                }
+                let Some(database) = self.database.clone() else {
+                    return;
+                };
+                if wire.version != MESSAGE_VERSION {
+                    warn!(peer = %id, "a peer sent a message in a version this build does not read");
+                    return;
+                }
+                let Ok(body) = messages::clean_body(&wire.body) else {
+                    return;
+                };
+                let message = Message {
+                    id: wire.id,
+                    conversation: id,
+                    author: id,
+                    timestamp: wire.timestamp,
+                    body,
+                    reply_to: wire.reply_to,
+                    state: DeliveryState::Delivered,
+                };
+                match database.insert_message(&message) {
+                    // A message seen before is acknowledged again, without a second event.
+                    Ok(true) => {
+                        let _ = self.events.send(NodeEvent::MessageReceived(message));
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(%error, "could not store a message");
+                        return;
+                    }
+                }
+                reply_and_finish(&mut send, Reply::Stored).await;
             }
             Request::Offer(offer) => {
                 let id = peer.endpoint_id;
@@ -2935,6 +3089,32 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::LeaveFolder(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Sends a direct message to a trusted contact. Returns the message once the contact has
+    /// stored it, or with the state `Failed` if it could not be delivered.
+    pub async fn send_message(
+        &self,
+        to: EndpointAddr,
+        body: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<Message, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SendMessage(to, body, reply_to, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// The messages with a contact, in conversation order.
+    pub async fn messages(&self, peer: EndpointId) -> Result<Vec<Message>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Messages(peer, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

@@ -96,6 +96,18 @@ const MIGRATIONS: &[&str] = &[
     // Whether this device keeps a full copy of a shared folder. Folders recorded before this
     // were kept in full.
     "ALTER TABLE folders ADD COLUMN keep_copy INTEGER NOT NULL DEFAULT 1;",
+    // Direct messages with contacts. `conversation` is the contact on the other side, and
+    // `author` is who wrote the message. A message is `sending`, `delivered` or `failed`.
+    "CREATE TABLE messages (
+        id           BLOB PRIMARY KEY NOT NULL CHECK (length(id) = 16),
+        conversation BLOB NOT NULL CHECK (length(conversation) = 32),
+        author       BLOB NOT NULL CHECK (length(author) = 32),
+        timestamp    INTEGER NOT NULL,
+        body         TEXT NOT NULL,
+        reply_to     BLOB CHECK (reply_to IS NULL OR length(reply_to) = 16),
+        state        TEXT NOT NULL CHECK (state IN ('sending', 'delivered', 'failed'))
+    );
+    CREATE INDEX messages_by_conversation ON messages (conversation, timestamp, id);",
 ];
 
 /// The schema version this build writes.

@@ -2400,3 +2400,115 @@ async fn a_device_that_does_not_keep_a_folder_fetches_no_files_and_is_not_counte
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+/// Waits until a node's stored messages with a contact satisfy `check`.
+async fn wait_for_messages(
+    node: &NodeHandle,
+    peer: iroh::EndpointId,
+    what: &str,
+    check: impl Fn(&[groovy_core::messages::Message]) -> bool,
+) -> Vec<groovy_core::messages::Message> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let listed = node.messages(peer).await.expect("messages can be read");
+            if check(&listed) {
+                return listed;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the messages never {what}"))
+}
+
+#[tokio::test]
+async fn messages_between_contacts_arrive_in_order_on_both_sides() {
+    use groovy_core::messages::DeliveryState;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, mut bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+    let bob_addr = bob.addr().await.unwrap();
+
+    let first = alice
+        .send_message(bob_addr.clone(), "one".into(), None)
+        .await
+        .unwrap();
+    let second = alice
+        .send_message(bob_addr.clone(), "  two  ".into(), Some(first.id))
+        .await
+        .unwrap();
+    let third = alice
+        .send_message(bob_addr, "three".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(first.state, DeliveryState::Delivered);
+    assert_eq!(second.body, "two", "the body is trimmed");
+
+    // Bob sees all three, in order, and each reply points at the message it answers.
+    let received = wait_for_messages(&bob, alice_key.public(), "reached bob", |listed| {
+        listed.len() == 3
+    })
+    .await;
+    let bodies: Vec<&str> = received.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(bodies, ["one", "two", "three"]);
+    assert_eq!(received[1].reply_to, Some(first.id));
+    assert!(received.iter().all(|m| m.author == alice_key.public()));
+    assert_eq!(received[2].id, third.id);
+
+    // Bob's event came for each message that was new to him.
+    let mut announced = 0;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), bob_events.next()).await
+    {
+        if matches!(event, NodeEvent::MessageReceived(_)) {
+            announced += 1;
+        }
+    }
+    assert_eq!(announced, 3);
+
+    // Alice keeps her own copy, in the same order, all delivered.
+    let sent = wait_for_messages(&alice, bob_key.public(), "kept alice's copy", |listed| {
+        listed.len() == 3
+    })
+    .await;
+    assert!(sent.iter().all(|m| m.state == DeliveryState::Delivered));
+    assert!(sent.iter().all(|m| m.author == alice_key.public()));
+    let timestamps: Vec<i64> = sent.iter().map(|m| m.timestamp).collect();
+    assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_message_to_someone_who_is_not_a_contact_is_refused_and_not_stored() {
+    use groovy_core::messages::DeliveryState;
+    let tmp = tempfile::tempdir().unwrap();
+    let (carol_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (carol_dir, bob_dir) = (fresh_dir(&tmp, "carol"), fresh_dir(&tmp, "bob"));
+    // Carol trusts bob, but bob has not paired with carol.
+    trust_in(&carol_dir, &bob_key);
+    let (carol, _carol_events) = blob_node_collecting(&carol_dir, carol_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key, None).await;
+
+    let outcome = carol
+        .send_message(bob.addr().await.unwrap(), "hello".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.state, DeliveryState::Failed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(bob.messages(carol_key.public()).await.unwrap().is_empty());
+
+    // An empty message is refused before anything is sent.
+    let refused = carol
+        .send_message(bob.addr().await.unwrap(), "   ".into(), None)
+        .await;
+    assert!(refused.is_err());
+
+    assert!(carol.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

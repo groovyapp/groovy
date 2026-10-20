@@ -67,6 +67,9 @@ pub enum Request {
     /// Offers files to a trusted peer. The peer answers with [`Reply::Accepted`] or
     /// [`Reply::Declined`] once its user has decided.
     Offer(FileOffer),
+    /// Delivers a direct message to a trusted peer, which stores it and answers with
+    /// [`Reply::Stored`].
+    Message(crate::messages::WireMessage),
 }
 
 /// What a sender offers: the top-level names being sent, and the collection that
@@ -93,6 +96,8 @@ pub enum Reply {
     Declined,
     /// The answer to [`Request::Ping`].
     Pong,
+    /// The answer to [`Request::Message`]: the message is stored on the receiving device.
+    Stored,
 }
 
 /// A peer we have completed a handshake with.
