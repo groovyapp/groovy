@@ -34,6 +34,8 @@ pub struct PeerProfile {
     pub display_name: String,
     /// BLAKE3 hash of the avatar's PNG. The picture itself is fetched separately.
     pub avatar_hash: Option<[u8; 32]>,
+    /// Which user this device belongs to, when it has been linked to one.
+    pub user: Option<crate::user::UserClaim>,
 }
 
 /// The first message each side sends.
@@ -49,6 +51,7 @@ impl PeerProfile {
         Self {
             display_name: profile.display_name.clone(),
             avatar_hash: profile.avatar_png.as_deref().map(avatar_hash),
+            user: None,
         }
     }
 }
@@ -244,6 +247,7 @@ mod tests {
             profile: PeerProfile {
                 display_name: "Ada".to_owned(),
                 avatar_hash: Some([7; 32]),
+                user: None,
             },
         };
 

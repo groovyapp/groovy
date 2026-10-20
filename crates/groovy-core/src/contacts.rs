@@ -256,6 +256,33 @@ impl ContactGate {
     }
 }
 
+impl ContactGate {
+    /// Takes in what a device says about the user it belongs to. A certificate counts only if it is
+    /// for the device that is connecting, and the user's key signed it. The revocations it brings
+    /// count only if they are the same user's, and signed by their key.
+    fn record_claim(&self, device: EndpointId, claim: &crate::user::UserClaim) {
+        let cert = &claim.certificate;
+        if cert.device != device || !cert.verify() {
+            warn!(peer = %device, "a peer showed a certificate that does not check; ignoring it");
+            return;
+        }
+        if let Err(error) = self.database.save_device(cert) {
+            warn!(%error, "could not record a device certificate");
+            return;
+        }
+        if let Err(error) = self.database.set_contact_user(device, &cert.user) {
+            warn!(%error, "could not record a contact's user");
+        }
+        for revocation in &claim.revocations {
+            if revocation.user == cert.user
+                && let Err(error) = self.database.save_revocation(revocation)
+            {
+                warn!(%error, "could not record a revocation");
+            }
+        }
+    }
+}
+
 impl PeerGate for ContactGate {
     fn may_connect(&self, peer: &EndpointId) -> bool {
         match self.database.is_blocked(*peer) {
@@ -271,6 +298,9 @@ impl PeerGate for ContactGate {
         if let Err(error) = self.database.record_handshake(peer, now()) {
             warn!(%error, "could not record a handshake");
         }
+        if let Some(claim) = &peer.profile.user {
+            self.record_claim(peer.endpoint_id, claim);
+        }
     }
 
     fn accepts_files_automatically(&self, peer: &EndpointId) -> bool {
@@ -284,10 +314,13 @@ impl PeerGate for ContactGate {
     }
 
     fn is_trusted(&self, peer: &EndpointId) -> bool {
-        self.database
-            .contact(*peer)
-            .map(|contact| contact.is_some_and(|contact| contact.trust == Trust::Trusted))
-            .unwrap_or(false)
+        match self.database.is_trusted_device(*peer) {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                warn!(%error, "could not check a peer's trust; refusing it");
+                false
+            }
+        }
     }
 
     fn pair(&self, peer: &EndpointId) {
@@ -316,6 +349,7 @@ mod tests {
             profile: PeerProfile {
                 display_name: name.to_owned(),
                 avatar_hash: avatar,
+                user: None,
             },
         }
     }
@@ -342,6 +376,7 @@ mod tests {
         grace.profile = PeerProfile {
             display_name: "Grace Hopper".to_owned(),
             avatar_hash: Some([3; 32]),
+            user: None,
         };
 
         let contact = db.record_handshake(&grace, 200).unwrap();

@@ -106,6 +106,7 @@ impl ProfileEditor {
                 PeerProfile {
                     display_name,
                     avatar_hash: self.avatar_hash,
+                    user: None,
                 },
             );
         }

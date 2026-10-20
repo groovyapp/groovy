@@ -14,6 +14,7 @@ pub mod folder_sync;
 pub mod folders;
 pub mod gated;
 pub mod identity;
+pub mod link;
 pub mod logging;
 mod node;
 pub mod pairing;
@@ -25,6 +26,7 @@ pub mod shares;
 pub mod storage;
 pub mod ticket;
 pub mod transfers;
+pub mod user;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
 pub use config::{

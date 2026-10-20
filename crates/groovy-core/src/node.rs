@@ -19,7 +19,8 @@ use futures_util::StreamExt;
 use iroh::endpoint::{BindError, Connection, InvalidSocketAddr, RecvStream, SendStream, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMap, RelayMode, SecretKey, TransportAddr,
+    Watcher,
 };
 use iroh_blobs::api::blobs::AddBytesOptions;
 use iroh_blobs::api::remote::GetProgressItem;
@@ -48,12 +49,14 @@ use crate::folders::{
     self, ExportReport, Folder, FolderAccess, FolderEntry, FolderStatus, Protected,
 };
 use crate::gated::TrustedOnly;
+use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
 use crate::shares::Share;
 use crate::storage::StorageUsage;
 use crate::transfers::{Direction, Transfer, TransferState};
+use crate::user::{DeviceCert, Revocation, UserClaim, UserDevice, UserKeyStore};
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -97,6 +100,8 @@ pub enum NodeError {
     NoPendingOffer,
     #[error("shared folder failed: {0}")]
     Folder(String),
+    #[error("linking devices failed: {0}")]
+    User(String),
     #[error("there is no transfer with that id")]
     UnknownTransfer,
     #[error("there is no share with that id, or it was already revoked")]
@@ -182,6 +187,9 @@ pub struct NodeConfig {
     /// How often content nothing references is removed from the blob store. `None` never
     /// removes it.
     pub garbage_interval: Option<Duration>,
+    /// Where the user's key is kept, once this device belongs to a user. `None` turns linking
+    /// devices off.
+    pub user_keys: Option<Arc<dyn UserKeyStore>>,
 }
 
 /// Lifecycle events published by the node.
@@ -291,6 +299,14 @@ enum Command {
         oneshot::Sender<Result<ExportReport, NodeError>>,
     ),
     ListFolders(oneshot::Sender<Result<Vec<Folder>, NodeError>>),
+    LinkDevice(String, oneshot::Sender<Result<String, NodeError>>),
+    AcceptLink(
+        String,
+        String,
+        oneshot::Sender<Result<PublicKey, NodeError>>,
+    ),
+    UserDevices(oneshot::Sender<Result<Vec<UserDevice>, NodeError>>),
+    RevokeDevice(EndpointId, oneshot::Sender<Result<(), NodeError>>),
     LeaveFolder(NamespaceId, oneshot::Sender<Result<(), NodeError>>),
     FolderStatus(
         NamespaceId,
@@ -530,6 +546,8 @@ async fn run(
         shared: startup.shared.clone(),
         withdrawn: withdrawn.clone(),
         in_flight: in_flight.clone(),
+        user_keys: config.user_keys.clone(),
+        open_link: Arc::new(Mutex::new(None)),
         profile: profile.clone(),
         gate: gate.clone(),
     };
@@ -610,6 +628,16 @@ async fn run(
         ));
         router = router.accept(iroh_blobs::ALPN, BlobsProtocol::new(store, Some(events)));
     }
+    if let (Some(database), Some(keys)) = (&config.database, &config.user_keys) {
+        router = router.accept(
+            LINK_ALPN,
+            LinkProtocol {
+                links: receiving.open_link.clone(),
+                keys: keys.clone(),
+                database: database.clone(),
+            },
+        );
+    }
     let router = router.spawn();
     let mut addresses = endpoint.watch_addr();
 
@@ -629,6 +657,10 @@ async fn run(
         }
     }
 
+    // The user claim this device shows is read from the database, which a handshake or a link can
+    // change, so it is refreshed now and every few seconds.
+    refresh_claim(&receiving);
+    let mut claim_tick = tokio::time::interval(Duration::from_secs(5));
     tokio::pin!(shutdown);
     let mut watching = true;
     loop {
@@ -960,6 +992,21 @@ async fn run(
                     };
                     let _ = reply.send(outcome);
                 }
+                Some(Command::LinkDevice(name, reply)) => {
+                    let _ = reply.send(link_device(&receiving, &name));
+                }
+                Some(Command::AcceptLink(ticket, name, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(accept_link(&receiving, &ticket, &name).await);
+                    });
+                }
+                Some(Command::UserDevices(reply)) => {
+                    let _ = reply.send(user_devices(&receiving));
+                }
+                Some(Command::RevokeDevice(device, reply)) => {
+                    let _ = reply.send(revoke_device(&receiving, device));
+                }
                 Some(Command::ListFolders(reply)) => {
                     let outcome = match folder_state(&folders) {
                         Ok(state) => state
@@ -1034,6 +1081,7 @@ async fn run(
             },
             // Shutdown was requested, or its sender was dropped.
             _ = &mut shutdown => break,
+            _ = claim_tick.tick() => refresh_claim(&receiving),
             update = addresses.updated(), if watching => match update {
                 Ok(addr) => {
                     let _ = events.send(NodeEvent::AddressChanged(addr));
@@ -1286,6 +1334,9 @@ struct Receiving {
     withdrawn: Withdrawn,
     /// Content being downloaded, which collection must not remove.
     in_flight: Protected,
+    user_keys: Option<Arc<dyn UserKeyStore>>,
+    /// The link this device has open for a new device, if any.
+    open_link: OpenLinks,
     profile: SharedProfile,
     gate: Arc<dyn PeerGate>,
 }
@@ -1597,6 +1648,137 @@ async fn forget_in_flight(receiving: &Receiving, root: Hash) {
     for hash in hashes {
         in_flight.remove(&hash);
     }
+}
+
+/// Sets the user claim this device shows in handshakes from the database: its certificate, and the
+/// revocations the user has made. A device with no certificate shows none.
+fn refresh_claim(receiving: &Receiving) {
+    let Some(database) = &receiving.database else {
+        return;
+    };
+    let device = receiving.endpoint.id();
+    let claim = database.own_user().ok().flatten().and_then(|user| {
+        let cert = database
+            .devices_of(&user)
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.cert.device == device && entry.revoked.is_none())?
+            .cert;
+        Some(UserClaim {
+            certificate: cert,
+            revocations: database.revocations_of(&user).unwrap_or_default(),
+        })
+    });
+    if let Ok(mut profile) = receiving.profile.lock() {
+        profile.user = claim;
+    }
+}
+
+fn user_error(error: impl std::fmt::Display) -> NodeError {
+    NodeError::User(error.to_string())
+}
+
+/// The database and key store linking needs, or why this node has none.
+fn link_parts(
+    receiving: &Receiving,
+) -> Result<(&Arc<Database>, &Arc<dyn UserKeyStore>), NodeError> {
+    let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
+    let keys = receiving
+        .user_keys
+        .as_ref()
+        .ok_or_else(|| user_error("this node has no place to keep a user key"))?;
+    Ok((database, keys))
+}
+
+/// Opens a link for a new device, and returns its ticket. The first time, this device becomes a
+/// user: a key is made, and this device gets its certificate, named `device_name`.
+fn link_device(receiving: &Receiving, device_name: &str) -> Result<String, NodeError> {
+    let (database, keys) = link_parts(receiving)?;
+    let device = receiving.endpoint.id();
+    let user = match keys.load() {
+        Some(user) => user,
+        None => {
+            let user = SecretKey::generate();
+            keys.save(&user).map_err(user_error)?;
+            user
+        }
+    };
+    let public = user.public();
+    database.set_own_user(&public).map_err(user_error)?;
+    let has_certificate = database
+        .devices_of(&public)
+        .map_err(user_error)?
+        .iter()
+        .any(|entry| entry.cert.device == device);
+    if !has_certificate {
+        let cert = DeviceCert::issue(&user, device, device_name, contacts::now());
+        database.save_device(&cert).map_err(user_error)?;
+    }
+    refresh_claim(receiving);
+    let secret = link::open_link(&receiving.open_link);
+    Ok(LinkTicket {
+        user: public,
+        secret,
+        addr: receiving.endpoint.addr(),
+    }
+    .encode())
+}
+
+/// Links this device to the user in a ticket from one of their devices.
+async fn accept_link(
+    receiving: &Receiving,
+    ticket: &str,
+    device_name: &str,
+) -> Result<PublicKey, NodeError> {
+    let (database, keys) = link_parts(receiving)?;
+    if keys.load().is_some() {
+        return Err(user_error("this device already belongs to a user"));
+    }
+    let ticket = LinkTicket::parse(ticket).map_err(user_error)?;
+    let user = link::accept_link(
+        &receiving.endpoint,
+        &ticket,
+        device_name,
+        keys.as_ref(),
+        database,
+    )
+    .await
+    .map_err(user_error)?;
+    refresh_claim(receiving);
+    Ok(user)
+}
+
+/// The devices of the user this device belongs to, including itself.
+fn user_devices(receiving: &Receiving) -> Result<Vec<UserDevice>, NodeError> {
+    let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
+    match database.own_user().map_err(user_error)? {
+        Some(user) => database.devices_of(&user).map_err(user_error),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Revokes one of the user's devices. Contacts refuse it once they have the revocation, which
+/// they get the next time they connect to a device of this user.
+fn revoke_device(receiving: &Receiving, device: EndpointId) -> Result<(), NodeError> {
+    let (database, keys) = link_parts(receiving)?;
+    if device == receiving.endpoint.id() {
+        return Err(user_error("a device cannot revoke itself"));
+    }
+    let user = keys
+        .load()
+        .ok_or_else(|| user_error("this device does not belong to a user"))?;
+    let known = database
+        .devices_of(&user.public())
+        .map_err(user_error)?
+        .iter()
+        .any(|entry| entry.cert.device == device);
+    if !known {
+        return Err(user_error("that is not one of this user's devices"));
+    }
+    let revocation = Revocation::issue(&user, device, contacts::now());
+    database.save_revocation(&revocation).map_err(user_error)?;
+    refresh_claim(receiving);
+    Ok(())
 }
 
 /// Cancels a transfer, whichever way it goes.
@@ -2372,7 +2554,10 @@ impl NodeHandle {
     /// Replaces the profile peers see. Takes effect for handshakes from now on.
     pub fn set_profile(&self, profile: PeerProfile) {
         if let Ok(mut current) = self.profile.lock() {
-            *current = profile;
+            // The user this device belongs to is not part of the profile the user edits, so it
+            // is kept.
+            let user = current.user.take();
+            *current = PeerProfile { user, ..profile };
         }
     }
 
@@ -2645,6 +2830,53 @@ impl NodeHandle {
         response.await.map_err(|_| NodeError::Stopped)?
     }
 
+    /// Opens a link so another device can join this user, and returns the ticket to give it. The
+    /// ticket works once, for ten minutes. The first time, this device becomes a user, and its
+    /// own certificate is named `device_name`.
+    pub async fn link_device(&self, device_name: String) -> Result<String, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::LinkDevice(device_name, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Links this device to the user in a ticket from one of their devices. This device is then
+    /// trusted by that user's contacts. Returns the user.
+    pub async fn accept_link(
+        &self,
+        ticket: String,
+        device_name: String,
+    ) -> Result<PublicKey, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::AcceptLink(ticket, device_name, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// The devices of the user this device belongs to, including this one.
+    pub async fn user_devices(&self) -> Result<Vec<UserDevice>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::UserDevices(reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Revokes one of this user's devices. A device cannot revoke itself.
+    pub async fn revoke_device(&self, device: EndpointId) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::RevokeDevice(device, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
     /// Every shared folder this device is in.
     pub async fn folders(&self) -> Result<Vec<Folder>, NodeError> {
         let (reply, response) = oneshot::channel();
@@ -2856,6 +3088,7 @@ mod tests {
             profile: PeerProfile {
                 display_name: name.to_owned(),
                 avatar_hash: None,
+                user: None,
             },
             gate: Arc::new(AllowAll),
             discovery: Discovery::default(),
@@ -2864,6 +3097,7 @@ mod tests {
             downloads: None,
             database: None,
             garbage_interval: None,
+            user_keys: None,
         }
     }
 
@@ -3044,6 +3278,7 @@ mod tests {
         node_b.set_profile(PeerProfile {
             display_name: "Grace Hopper".to_owned(),
             avatar_hash: Some([9; 32]),
+            user: None,
         });
         let seen = node_a.connect(addr_b).await.unwrap();
 

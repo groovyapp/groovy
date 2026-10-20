@@ -107,6 +107,7 @@ fn node_config(dir: &DataDir, database: &Arc<Database>) -> NodeConfig {
         downloads: Some(dir.root().join("Downloads")),
         database: Some(database.clone()),
         garbage_interval: None,
+        user_keys: None,
     }
 }
 
