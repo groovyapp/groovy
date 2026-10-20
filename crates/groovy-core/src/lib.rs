@@ -17,6 +17,7 @@ pub mod groups;
 pub mod identity;
 pub mod link;
 pub mod logging;
+pub mod membership;
 pub mod messages;
 mod node;
 pub mod outbox;

@@ -159,6 +159,11 @@ const MIGRATIONS: &[&str] = &[
         signature BLOB NOT NULL
     );
     CREATE INDEX group_messages_by_group ON group_messages (group_id, timestamp, id);",
+    // Who founded each group, its membership document, and the key it is at. Groups recorded
+    // before these existed have no document, and are not used for membership.
+    "ALTER TABLE chat_groups ADD COLUMN founder BLOB CHECK (founder IS NULL OR length(founder) = 32);
+    ALTER TABLE chat_groups ADD COLUMN doc BLOB CHECK (doc IS NULL OR length(doc) = 32);
+    ALTER TABLE chat_groups ADD COLUMN key_record BLOB;",
 ];
 
 /// The schema version this build writes.
