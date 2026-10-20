@@ -1551,3 +1551,127 @@ async fn clearing_the_cache_drops_received_history_and_keeps_folders() {
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+/// The keys of a folder's entries, sorted.
+fn keys_of(entries: &[groovy_core::folders::FolderEntry]) -> Vec<String> {
+    entries.iter().map(|entry| entry.key.clone()).collect()
+}
+
+#[tokio::test]
+async fn concurrent_edits_keep_both_versions_as_a_conflict_copy() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key, None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key, None).await;
+
+    let folder = alice.create_folder("docs".into(), None).await.unwrap();
+    let write = |name: &str, text: &str| {
+        let path = tmp.path().join(format!("{name}-{}.txt", text.len()));
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    alice
+        .add_to_folder(folder.namespace, "a.txt".into(), write("a", "version zero"))
+        .await
+        .unwrap();
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+    bob.join_folder(ticket, None).await.expect("bob joins");
+    wait_for_folder(
+        &bob,
+        folder.namespace,
+        "shows bob version zero",
+        |entries| entries.len() == 1,
+    )
+    .await;
+
+    // Alice edits a version bob has not received. Bob edits from the version he had before
+    // he saw alice's, so neither write saw the other.
+    alice
+        .add_to_folder(
+            folder.namespace,
+            "a.txt".into(),
+            write("alice", "alice's edit"),
+        )
+        .await
+        .unwrap();
+    bob.add_to_folder_seeing(
+        folder.namespace,
+        "a.txt".into(),
+        write("bob", "bob's edit"),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    // Both sides end with the same two entries: the file, and a copy of the other version.
+    let alice_keys = wait_for_folder(&alice, folder.namespace, "shows both versions", |entries| {
+        entries.len() == 2
+    })
+    .await;
+    let bob_keys = wait_for_folder(&bob, folder.namespace, "shows both versions", |entries| {
+        entries.len() == 2
+    })
+    .await;
+    assert_eq!(keys_of(&alice_keys), keys_of(&bob_keys));
+    let copy = keys_of(&alice_keys)
+        .into_iter()
+        .find(|key| key.contains("(conflict from"))
+        .expect("one entry is a conflict copy");
+    assert!(
+        copy.starts_with("a (conflict from ") && copy.ends_with(").txt"),
+        "{copy}"
+    );
+
+    // A write that has seen both versions replaces them, and the copy goes.
+    alice
+        .add_to_folder(
+            folder.namespace,
+            "a.txt".into(),
+            write("alice2", "resolved"),
+        )
+        .await
+        .unwrap();
+    wait_for_folder(
+        &bob,
+        folder.namespace,
+        "drops the conflict copy",
+        |entries| keys_of(entries) == ["a.txt"],
+    )
+    .await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn deleting_a_file_leaves_files_whose_names_start_the_same() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice_dir = fresh_dir(&tmp, "alice");
+    let (alice, _alice_events) =
+        blob_node_collecting(&alice_dir, SecretKey::generate(), None).await;
+    let folder = alice.create_folder("names".into(), None).await.unwrap();
+    for name in ["x.txt", "x.txt2"] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, name).unwrap();
+        alice
+            .add_to_folder(folder.namespace, name.into(), path)
+            .await
+            .unwrap();
+    }
+
+    alice
+        .remove_from_folder(folder.namespace, "x.txt".into())
+        .await
+        .unwrap();
+    let entries = alice.folder_entries(folder.namespace).await.unwrap();
+    assert_eq!(keys_of(&entries), ["x.txt2"]);
+
+    assert!(alice.shutdown(TIMEOUT));
+}

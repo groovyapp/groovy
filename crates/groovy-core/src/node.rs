@@ -271,6 +271,7 @@ enum Command {
         NamespaceId,
         String,
         PathBuf,
+        Option<Vec<Hash>>,
         oneshot::Sender<Result<(), NodeError>>,
     ),
     RemoveFromFolder(NamespaceId, String, oneshot::Sender<Result<(), NodeError>>),
@@ -780,14 +781,21 @@ async fn run(
                         let _ = reply.send(outcome);
                     });
                 }
-                Some(Command::AddToFolder(namespace, key, source, reply)) => {
+                Some(Command::AddToFolder(namespace, key, source, seen, reply)) => {
                     let folders = folders.clone();
                     let live = folder_live.clone();
                     tokio::spawn(async move {
                         let outcome = match folder_state(&folders) {
                             Ok(state) => {
-                                match folders::add_file(&state.docs, &state.store, namespace, &key, &source)
-                                    .await
+                                match folders::add_file_seeing(
+                                    &state.docs,
+                                    &state.store,
+                                    namespace,
+                                    &key,
+                                    &source,
+                                    seen,
+                                )
+                                .await
                                 {
                                     Ok(hash) => {
                                         lock_live(&live).insert(hash);
@@ -2101,9 +2109,33 @@ impl NodeHandle {
         key: String,
         source: PathBuf,
     ) -> Result<(), NodeError> {
+        self.add_file_to_folder(namespace, key, source, None).await
+    }
+
+    /// Adds a file as a write made after the versions in `seen`, rather than the latest one.
+    /// This is how a change made offline, from an older copy, is recorded. Versions it did
+    /// not see are kept as conflict copies when the folder syncs.
+    pub async fn add_to_folder_seeing(
+        &self,
+        namespace: NamespaceId,
+        key: String,
+        source: PathBuf,
+        seen: Vec<Hash>,
+    ) -> Result<(), NodeError> {
+        self.add_file_to_folder(namespace, key, source, Some(seen))
+            .await
+    }
+
+    async fn add_file_to_folder(
+        &self,
+        namespace: NamespaceId,
+        key: String,
+        source: PathBuf,
+        seen: Option<Vec<Hash>>,
+    ) -> Result<(), NodeError> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::AddToFolder(namespace, key, source, reply))
+            .send(Command::AddToFolder(namespace, key, source, seen, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

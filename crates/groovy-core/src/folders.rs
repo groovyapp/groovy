@@ -8,6 +8,7 @@
 //! Each path has one file: the newest entry for it. A conflict between members is not
 //! yet kept as a second copy.
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
@@ -227,13 +228,157 @@ pub async fn ticket(
     Ok(ticket.to_string())
 }
 
-/// Copies a file into the blob store, and sets it at `key` in the folder.
+/// What a deleted path holds instead of a file. It is written as content, not as an empty
+/// entry, because iroh-docs deletes by key prefix, and that would also remove other keys
+/// that begin with the same name.
+const TOMBSTONE: &[u8] = b"groovy:deleted";
+
+/// The key prefix of the records of which versions a write had seen. A record
+/// `history:<version>:<seen>:<key>` says that `version` was written after `seen`, so `seen`
+/// is superseded. Keys cannot contain `:`, so the prefix cannot clash with a file.
+const HISTORY: &str = "history:";
+
+fn tombstone() -> Hash {
+    Hash::new(TOMBSTONE)
+}
+
+/// Whether a hash is a deleted path rather than a file.
+fn is_deleted(hash: Hash) -> bool {
+    hash == Hash::EMPTY || hash == tombstone()
+}
+
+/// The key a file is stored under. iroh-docs removes a key's entries when a key that
+/// starts with it is written, so every stored key ends in a NUL byte: no stored key is then
+/// a prefix of another, and `x.txt` cannot remove `x.txt2`. Paths cannot contain NUL.
+fn stored_key(key: &str) -> Vec<u8> {
+    let mut bytes = key.as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+/// The key of the record that `version` was written after `seen`, in stored form.
+fn history_key(key: &str, version: Hash, seen: Hash) -> Vec<u8> {
+    stored_key(&format!("{HISTORY}{version}:{seen}:{key}"))
+}
+
+/// The key an entry was stored under, without its terminator.
+fn unstored(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// One entry in the folder, as written by one author.
+#[derive(Debug, Clone)]
+struct Version {
+    key: String,
+    hash: Hash,
+    size: u64,
+    author: String,
+    timestamp: u64,
+}
+
+/// Every entry in the replica, including old versions and history records.
+async fn all_entries(
+    docs: &iroh_docs::protocol::Docs,
+    namespace: NamespaceId,
+) -> Result<Vec<Version>, FolderError> {
+    let doc = docs
+        .open(namespace)
+        .await
+        .map_err(replica)?
+        .ok_or(FolderError::UnknownFolder)?;
+    let mut stream = Box::pin(doc.get_many(Query::all()).await.map_err(replica)?);
+    let mut all = Vec::new();
+    while let Some(entry) = stream.next().await {
+        let entry = entry.map_err(replica)?;
+        all.push(Version {
+            key: unstored(entry.key()),
+            hash: entry.content_hash(),
+            size: entry.content_len(),
+            author: entry.author().to_string(),
+            timestamp: entry.timestamp(),
+        });
+    }
+    Ok(all)
+}
+
+/// The newest version each author wrote for `key`, without versions that another write has
+/// seen and superseded, and one per distinct content.
+fn leaves(all: &[Version], key: &str) -> Vec<Version> {
+    let mut latest: HashMap<&str, &Version> = HashMap::new();
+    for version in all.iter().filter(|version| version.key == key) {
+        let slot = latest.entry(version.author.as_str()).or_insert(version);
+        if version.timestamp > slot.timestamp {
+            *slot = version;
+        }
+    }
+    let seen: HashSet<Hash> = all
+        .iter()
+        .filter(|version| version.key.starts_with(HISTORY))
+        .filter_map(|version| parse_history(&version.key))
+        .filter(|(_, _, history_key)| history_key == key)
+        .map(|(_, seen, _)| seen)
+        .collect();
+    let mut by_hash: HashMap<Hash, Version> = HashMap::new();
+    for version in latest.values() {
+        if seen.contains(&version.hash) {
+            continue;
+        }
+        let keep = match by_hash.get(&version.hash) {
+            Some(existing) => version.timestamp > existing.timestamp,
+            None => true,
+        };
+        if keep {
+            by_hash.insert(version.hash, (*version).clone());
+        }
+    }
+    by_hash.into_values().collect()
+}
+
+/// Splits a history key into the version, the seen version and the file key.
+fn parse_history(full: &str) -> Option<(Hash, Hash, String)> {
+    let rest = full.strip_prefix(HISTORY)?;
+    let mut parts = rest.splitn(3, ':');
+    let version = parts.next()?.parse().ok()?;
+    let seen = parts.next()?.parse().ok()?;
+    let key = parts.next()?.to_owned();
+    Some((version, seen, key))
+}
+
+/// The file at `key` as the replica has it: the newest live version, and the other live
+/// versions written at the same time, which are conflicts.
+fn current(all: &[Version], key: &str) -> (Option<Version>, Vec<Version>) {
+    let mut live: Vec<Version> = leaves(all, key)
+        .into_iter()
+        .filter(|version| !is_deleted(version.hash))
+        .collect();
+    live.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(a.author.cmp(&b.author)));
+    let mut live = live.into_iter();
+    (live.next(), live.collect())
+}
+
+/// Copies a file into the blob store, and sets it at `key` in the folder. The write is
+/// recorded as made after the latest version the folder has, so it replaces that version.
 pub async fn add_file(
     docs: &iroh_docs::protocol::Docs,
     store: &Store,
     namespace: NamespaceId,
     key: &str,
     source: &Path,
+) -> Result<Hash, FolderError> {
+    add_file_seeing(docs, store, namespace, key, source, None).await
+}
+
+/// Like [`add_file`], but records that the write was made after `seen` rather than the
+/// latest version. A write made offline, from an older copy, uses this. The versions it did
+/// not see stay as conflicts. `None` means the latest version the folder has.
+pub async fn add_file_seeing(
+    docs: &iroh_docs::protocol::Docs,
+    store: &Store,
+    namespace: NamespaceId,
+    key: &str,
+    source: &Path,
+    seen: Option<Vec<Hash>>,
 ) -> Result<Hash, FolderError> {
     let key = key_for(key)?;
     let doc = docs
@@ -255,8 +400,20 @@ pub async fn add_file(
         .await
         .map_err(|error| FolderError::Store(error.to_string()))?;
     // No tag: the folder's entries are what keeps this blob, and garbage collection reads them.
+    let seen = match seen {
+        Some(seen) => seen,
+        None => leaves(&all_entries(docs, namespace).await?, &key)
+            .into_iter()
+            .map(|version| version.hash)
+            .collect(),
+    };
     let author = docs.author_default().await.map_err(replica)?;
-    doc.set_hash(author, key.into_bytes(), temp.hash(), size)
+    for seen in seen {
+        doc.set_bytes(author, history_key(&key, temp.hash(), seen), b"1".to_vec())
+            .await
+            .map_err(replica)?;
+    }
+    doc.set_hash(author, stored_key(&key), temp.hash(), size)
         .await
         .map_err(replica)?;
     Ok(temp.hash())
@@ -274,40 +431,92 @@ pub async fn remove(
         .await
         .map_err(replica)?
         .ok_or(FolderError::UnknownFolder)?;
+    let seen: Vec<Hash> = leaves(&all_entries(docs, namespace).await?, &key)
+        .into_iter()
+        .map(|version| version.hash)
+        .collect();
     let author = docs.author_default().await.map_err(replica)?;
-    doc.del(author, key.into_bytes()).await.map_err(replica)?;
+    for seen in seen {
+        doc.set_bytes(author, history_key(&key, tombstone(), seen), b"1".to_vec())
+            .await
+            .map_err(replica)?;
+    }
+    doc.set_bytes(author, stored_key(&key), TOMBSTONE.to_vec())
+        .await
+        .map_err(replica)?;
     Ok(())
 }
 
-/// The files in the folder, as the newest entry for each path. Deleted paths are left out.
+/// The files in the folder. Each path has its newest version. A path with conflicting
+/// versions also gets a copy of each other version, named for who wrote it and when.
 pub async fn entries(
     docs: &iroh_docs::protocol::Docs,
     namespace: NamespaceId,
 ) -> Result<Vec<FolderEntry>, FolderError> {
-    let doc = docs
-        .open(namespace)
-        .await
-        .map_err(replica)?
-        .ok_or(FolderError::UnknownFolder)?;
-    let mut stream = Box::pin(
-        doc.get_many(Query::single_latest_per_key())
-            .await
-            .map_err(replica)?,
-    );
+    let all = all_entries(docs, namespace).await?;
+    let keys: BTreeSet<&str> = all
+        .iter()
+        .filter(|version| !version.key.starts_with(HISTORY))
+        .map(|version| version.key.as_str())
+        .collect();
     let mut entries = Vec::new();
-    while let Some(entry) = stream.next().await {
-        let entry = entry.map_err(replica)?;
-        if entry.content_hash() == Hash::EMPTY {
-            continue;
+    for key in keys {
+        let (winner, conflicts) = current(&all, key);
+        if let Some(winner) = winner {
+            entries.push(FolderEntry {
+                key: key.to_owned(),
+                hash: winner.hash,
+                size: winner.size,
+            });
         }
-        entries.push(FolderEntry {
-            key: String::from_utf8_lossy(entry.key()).into_owned(),
-            hash: entry.content_hash(),
-            size: entry.content_len(),
-        });
+        for conflict in conflicts {
+            entries.push(FolderEntry {
+                key: conflict_name(key, &conflict),
+                hash: conflict.hash,
+                size: conflict.size,
+            });
+        }
     }
     entries.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(entries)
+}
+
+/// The name a conflicting version is kept under: `photos/a.txt` becomes
+/// `photos/a (conflict from 1a2b3c4d, 2026-10-20).txt`.
+fn conflict_name(key: &str, version: &Version) -> String {
+    let (dir, file) = match key.rsplit_once('/') {
+        Some((dir, file)) => (Some(dir), file),
+        None => (None, key),
+    };
+    let (stem, extension) = match file.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (file, String::new()),
+    };
+    let author: String = version.author.chars().take(8).collect();
+    let name = format!(
+        "{stem} (conflict from {author}, {}){extension}",
+        date_of(version.timestamp)
+    );
+    match dir {
+        Some(dir) => format!("{dir}/{name}"),
+        None => name,
+    }
+}
+
+/// The calendar date of a replica timestamp, which counts microseconds since the Unix epoch.
+fn date_of(timestamp: u64) -> String {
+    let days = (timestamp / 1_000_000 / 86_400) as i64;
+    // Days since 1970-01-01 to a civil date, after Howard Hinnant's algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Writes every file that is downloaded here into `dir`, at its path in the folder.
