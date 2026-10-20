@@ -138,6 +138,27 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE messages;
     ALTER TABLE messages_rebuilt RENAME TO messages;
     CREATE INDEX messages_by_conversation ON messages (conversation, timestamp, id);",
+    // Group chat: the groups this device is in, who else is in them, and their signed messages.
+    "CREATE TABLE chat_groups (
+        id      BLOB PRIMARY KEY NOT NULL CHECK (length(id) = 32),
+        name    TEXT NOT NULL,
+        created INTEGER NOT NULL
+    );
+    CREATE TABLE chat_members (
+        group_id BLOB NOT NULL CHECK (length(group_id) = 32),
+        endpoint BLOB NOT NULL CHECK (length(endpoint) = 32),
+        PRIMARY KEY (group_id, endpoint)
+    );
+    CREATE TABLE group_messages (
+        id        BLOB PRIMARY KEY NOT NULL CHECK (length(id) = 16),
+        group_id  BLOB NOT NULL CHECK (length(group_id) = 32),
+        author    BLOB NOT NULL CHECK (length(author) = 32),
+        timestamp INTEGER NOT NULL,
+        body      TEXT NOT NULL,
+        reply_to  BLOB CHECK (reply_to IS NULL OR length(reply_to) = 16),
+        signature BLOB NOT NULL
+    );
+    CREATE INDEX group_messages_by_group ON group_messages (group_id, timestamp, id);",
 ];
 
 /// The schema version this build writes.

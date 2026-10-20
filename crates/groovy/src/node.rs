@@ -399,6 +399,8 @@ pub fn start(cx: &mut App) {
                     NodeEvent::ReceiveFailed { .. } | NodeEvent::ImportProgress { .. } => {}
                     // Shown once the conversations screen exists (#47).
                     NodeEvent::MessageReceived(_) => {}
+                    // Shown once the conversations screen exists (#47).
+                    NodeEvent::GroupMessageReceived(_) => {}
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }

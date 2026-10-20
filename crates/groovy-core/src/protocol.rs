@@ -70,6 +70,12 @@ pub enum Request {
     /// Delivers a direct message to a trusted peer, which stores it and answers with
     /// [`Reply::Stored`].
     Message(crate::messages::WireMessage),
+    /// Asks a trusted peer for the messages of a group after a position in its order. The
+    /// peer answers with a [`crate::groups::GroupPage`].
+    GroupHistory {
+        group: [u8; 32],
+        after: Option<(i64, [u8; 16])>,
+    },
 }
 
 /// What a sender offers: the top-level names being sent, and the collection that

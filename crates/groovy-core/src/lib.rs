@@ -13,6 +13,7 @@ pub mod files;
 pub mod folder_sync;
 pub mod folders;
 pub mod gated;
+pub mod groups;
 pub mod identity;
 pub mod link;
 pub mod logging;
