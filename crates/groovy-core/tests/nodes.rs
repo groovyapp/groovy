@@ -2445,7 +2445,11 @@ async fn messages_between_contacts_arrive_in_order_on_both_sides() {
         .send_message(bob_addr, "three".into(), None)
         .await
         .unwrap();
-    assert_eq!(first.state, DeliveryState::Delivered);
+    assert_eq!(
+        first.state,
+        DeliveryState::Sending,
+        "queued until the contact takes it"
+    );
     assert_eq!(second.body, "two", "the body is trimmed");
 
     // Bob sees all three, in order, and each reply points at the message it answers.
@@ -2471,11 +2475,10 @@ async fn messages_between_contacts_arrive_in_order_on_both_sides() {
     assert_eq!(announced, 3);
 
     // Alice keeps her own copy, in the same order, all delivered.
-    let sent = wait_for_messages(&alice, bob_key.public(), "kept alice's copy", |listed| {
-        listed.len() == 3
+    let sent = wait_for_messages(&alice, bob_key.public(), "were all delivered", |listed| {
+        listed.len() == 3 && listed.iter().all(|m| m.state == DeliveryState::Delivered)
     })
     .await;
-    assert!(sent.iter().all(|m| m.state == DeliveryState::Delivered));
     assert!(sent.iter().all(|m| m.author == alice_key.public()));
     let timestamps: Vec<i64> = sent.iter().map(|m| m.timestamp).collect();
     assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
@@ -2493,15 +2496,18 @@ async fn a_message_to_someone_who_is_not_a_contact_is_refused_and_not_stored() {
     // Carol trusts bob, but bob has not paired with carol.
     trust_in(&carol_dir, &bob_key);
     let (carol, _carol_events) = blob_node_collecting(&carol_dir, carol_key.clone(), None).await;
-    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key, None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
 
     let outcome = carol
         .send_message(bob.addr().await.unwrap(), "hello".into(), None)
         .await
         .unwrap();
-    assert_eq!(outcome.state, DeliveryState::Failed);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(outcome.state, DeliveryState::Sending);
+    // Bob never stores it, and carol never sees it delivered.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(bob.messages(carol_key.public()).await.unwrap().is_empty());
+    let kept = carol.messages(bob_key.public()).await.unwrap();
+    assert!(kept.iter().all(|m| m.state != DeliveryState::Delivered));
 
     // An empty message is refused before anything is sent.
     let refused = carol
@@ -2511,4 +2517,111 @@ async fn a_message_to_someone_who_is_not_a_contact_is_refused_and_not_stored() {
 
     assert!(carol.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_message_sent_while_the_contact_is_offline_arrives_after_both_restart() {
+    use groovy_core::messages::DeliveryState;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+    let bob_addr = bob.addr().await.unwrap();
+    assert!(bob.shutdown(TIMEOUT));
+
+    // Bob is offline, so the message waits in alice's outbox.
+    let queued = alice
+        .send_message(bob_addr, "are you there".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(queued.state, DeliveryState::Sending);
+    // Alice restarts before bob is back.
+    assert!(alice.shutdown(TIMEOUT));
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+
+    // Bob comes back at a new address and connects to alice. Alice then delivers to him.
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+    let alice_addr = alice.addr().await.unwrap();
+    // A device's attempts are spaced out, so the one from the connection waits a moment.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    bob.check_presence(alice_addr)
+        .await
+        .expect("bob reaches alice");
+
+    let received = wait_for_messages(&bob, alice_key.public(), "reached bob", |listed| {
+        listed.len() == 1
+    })
+    .await;
+    assert_eq!(received[0].body, "are you there");
+    let sent = wait_for_messages(&alice, bob_key.public(), "were delivered", |listed| {
+        listed.len() == 1 && listed[0].state == DeliveryState::Delivered
+    })
+    .await;
+    assert_eq!(sent[0].id, queued.id);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_message_reaches_a_contacts_linked_device_when_the_contact_is_offline() {
+    use groovy_core::messages::DeliveryState;
+    use groovy_core::user::DeviceCert;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key, phone_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let user = SecretKey::generate();
+    let (alice_dir, phone_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "phone"));
+    // Bob's laptop and phone belong to one user, which alice trusts through bob.
+    trust_in(&alice_dir, &bob_key);
+    {
+        let db = Database::open(&alice_dir.database_file()).unwrap();
+        db.save_device(&DeviceCert::issue(&user, bob_key.public(), "laptop", 1))
+            .unwrap();
+        db.save_device(&DeviceCert::issue(&user, phone_key.public(), "phone", 1))
+            .unwrap();
+        db.set_contact_user(bob_key.public(), &user.public())
+            .unwrap();
+    }
+    trust_in(&phone_dir, &alice_key);
+
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    // Bob's laptop never starts, so only the phone can take the message.
+    let queued = alice
+        .send_message(
+            iroh::EndpointAddr::from(bob_key.public()),
+            "on your phone too".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, DeliveryState::Sending);
+
+    let (phone, _phone_events) = blob_node_collecting(&phone_dir, phone_key.clone(), None).await;
+    let alice_addr = alice.addr().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    phone
+        .check_presence(alice_addr)
+        .await
+        .expect("the phone reaches alice");
+
+    let on_phone = wait_for_messages(&phone, alice_key.public(), "reached the phone", |listed| {
+        listed.len() == 1
+    })
+    .await;
+    assert_eq!(on_phone[0].body, "on your phone too");
+    wait_for_messages(&alice, bob_key.public(), "were acknowledged", |listed| {
+        listed.len() == 1 && listed[0].state == DeliveryState::Delivered
+    })
+    .await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(phone.shutdown(TIMEOUT));
 }

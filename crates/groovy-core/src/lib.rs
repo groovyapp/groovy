@@ -18,6 +18,7 @@ pub mod link;
 pub mod logging;
 pub mod messages;
 mod node;
+pub mod outbox;
 pub mod pairing;
 mod paths;
 pub mod presence;

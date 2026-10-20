@@ -50,7 +50,8 @@ use crate::folders::{
 };
 use crate::gated::TrustedOnly;
 use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
-use crate::messages::{self, DeliveryState, MESSAGE_VERSION, Message, MessageId, WireMessage};
+use crate::messages::{self, DeliveryState, MESSAGE_VERSION, Message, MessageId};
+use crate::outbox::{Outbox, Trigger};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
@@ -569,7 +570,14 @@ async fn run(
         open_link: Arc::new(Mutex::new(None)),
         profile: profile.clone(),
         gate: gate.clone(),
+        outbox: config
+            .database
+            .clone()
+            .map(|database| Outbox::new(database, gate.clone())),
     };
+    if let Some(outbox) = receiving.outbox.clone() {
+        spawn_outbox(receiving.clone(), outbox, events.subscribe());
+    }
     let mut router = Router::builder(endpoint.clone()).accept(
         protocol::ALPN,
         GroovyProtocol {
@@ -1502,6 +1510,8 @@ struct Receiving {
     open_link: OpenLinks,
     profile: SharedProfile,
     gate: Arc<dyn PeerGate>,
+    /// Messages waiting for their devices to take them. Kept only where there is a database.
+    outbox: Option<Outbox>,
 }
 
 /// What a send's offer carries before its files are imported.
@@ -1515,18 +1525,18 @@ fn unsent_offer(receiving: &Receiving) -> FileOffer {
     }
 }
 
-/// Sends a message to a trusted contact and keeps it here. Returns the message with the state
-/// it ended in: `Delivered` once the contact has stored it, or `Failed`.
+/// Sends a message to a trusted contact and keeps it here. The message is queued for the
+/// contact's devices, and the first attempt starts in the background. Returns the message as
+/// queued, in the state `Sending`. Its state changes as the devices take it.
 async fn send_message(
     receiving: &Receiving,
     addr: EndpointAddr,
     body: String,
     reply_to: Option<MessageId>,
 ) -> Result<Message, NodeError> {
-    let database = receiving
-        .database
-        .clone()
-        .ok_or_else(|| NodeError::Message("messages need a database".to_owned()))?;
+    let Some(database) = receiving.database.clone() else {
+        return Err(NodeError::Message("messages need a database".to_owned()));
+    };
     let body =
         messages::clean_body(&body).map_err(|error| NodeError::Message(error.to_string()))?;
     if !receiving.gate.is_trusted(&addr.id) {
@@ -1535,70 +1545,112 @@ async fn send_message(
         ));
     }
     let own = receiving.endpoint.id();
+    database
+        .remember_address(addr.id, &addr)
+        .map_err(|error| NodeError::Message(error.to_string()))?;
     // Never earlier than this device's previous message to the contact, so its own order holds.
     let timestamp = match database.last_sent_timestamp(&addr.id, &own) {
         Ok(Some(last)) => messages::now_millis().max(last + 1),
         Ok(None) => messages::now_millis(),
         Err(error) => return Err(NodeError::Message(error.to_string())),
     };
-    let mut message = Message {
+    let message = Message {
         id: messages::new_id(),
         conversation: addr.id,
         author: own,
         timestamp,
-        body: body.clone(),
+        body,
         reply_to,
         state: DeliveryState::Sending,
     };
     database
         .insert_message(&message)
         .map_err(|error| NodeError::Message(error.to_string()))?;
-    let wire = WireMessage {
-        version: MESSAGE_VERSION,
-        id: message.id,
-        timestamp,
-        body,
-        reply_to,
-    };
-    message.state = match deliver(receiving, addr, &wire).await {
-        Ok(()) => DeliveryState::Delivered,
-        Err(error) => {
-            warn!(%error, "a message could not be delivered");
-            DeliveryState::Failed
-        }
-    };
-    database
-        .set_message_state(message.id, message.state)
+    let devices = database
+        .contact_devices(&addr.id)
         .map_err(|error| NodeError::Message(error.to_string()))?;
+    database
+        .enqueue(message.id, &devices)
+        .map_err(|error| NodeError::Message(error.to_string()))?;
+    for device in devices {
+        tokio::spawn(flush_by_dial(receiving.clone(), device, Trigger::Send));
+    }
     Ok(message)
 }
 
-/// Sends one message on a connection to the contact, and waits for the contact to store it.
-async fn deliver(
-    receiving: &Receiving,
-    addr: EndpointAddr,
-    wire: &WireMessage,
-) -> Result<(), NodeError> {
-    let (connection, _peer) = open_peer(
-        &receiving.endpoint,
-        addr,
-        &receiving.profile,
-        &receiving.events,
-        &receiving.gate,
-    )
-    .await?;
-    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
-    protocol::write_message(&mut send, &Request::Message(wire.clone()))
-        .await
-        .map_err(NodeError::Connect)?;
-    let reply: Reply = protocol::read_message(&mut recv)
-        .await
-        .map_err(NodeError::Connect)?;
-    connection.close(0u32.into(), b"sent");
-    match reply {
-        Reply::Stored => Ok(()),
-        _ => Err(NodeError::Connect(ProtocolError::Closed)),
+/// Starts the outbox's background work: a flush to each device that connects, and a periodic
+/// check for messages whose retry time has come. The check also runs once at startup.
+fn spawn_outbox(receiving: Receiving, outbox: Outbox, mut events: broadcast::Receiver<NodeEvent>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(OUTBOX_TICK);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let now = messages::now_millis();
+                    if let Err(error) = outbox.database().expire_outbox(now) {
+                        warn!(%error, "could not expire the outbox");
+                    }
+                    match outbox.database().devices_due(now) {
+                        Ok(devices) => {
+                            for device in devices {
+                                tokio::spawn(flush_by_dial(receiving.clone(), device, Trigger::Tick));
+                            }
+                        }
+                        Err(error) => warn!(%error, "could not read the outbox"),
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(NodeEvent::PeerConnected(peer)) => {
+                        tokio::spawn(flush_by_dial(
+                            receiving.clone(),
+                            peer.endpoint_id,
+                            Trigger::Connected,
+                        ));
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    });
+}
+
+/// How often the outbox is checked for messages whose retry time has come.
+const OUTBOX_TICK: Duration = Duration::from_secs(60);
+
+/// Writes the messages waiting for a device, dialing it first. Only one flush runs for a device
+/// at a time, and a flush with nothing due does not dial.
+async fn flush_by_dial(receiving: Receiving, device: EndpointId, trigger: Trigger) {
+    let Some(outbox) = receiving.outbox.clone() else {
+        return;
+    };
+    if !outbox.claim(&device, trigger) {
+        return;
     }
+    if outbox.has_work(&device, trigger) {
+        let addr = outbox
+            .database()
+            .address_of(&device)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| EndpointAddr::from(device));
+        match open_peer(
+            &receiving.endpoint,
+            addr,
+            &receiving.profile,
+            &receiving.events,
+            &receiving.gate,
+        )
+        .await
+        {
+            Ok((connection, _peer)) => {
+                outbox.flush_on(&connection, device, trigger).await;
+                connection.close(0u32.into(), b"flushed");
+            }
+            Err(error) => outbox.unreachable(&device, &error.to_string(), trigger),
+        }
+    }
+    outbox.release(&device);
 }
 
 /// Offers `paths` to a trusted peer, as transfer `id`, and waits for its answer. An accepted
@@ -2789,6 +2841,12 @@ impl ProtocolHandler for GroovyProtocol {
             Ok(peer) => {
                 inbox.gate.handshook(&peer);
                 let endpoint_id = peer.endpoint_id;
+                if let Some(database) = &inbox.database {
+                    let _ = database.remember_address(
+                        endpoint_id,
+                        &crate::outbox::address_of_connection(&connection),
+                    );
+                }
                 let _ = inbox.events.send(NodeEvent::PeerConnected(peer.clone()));
                 loop {
                     tokio::select! {
