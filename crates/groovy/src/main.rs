@@ -4,6 +4,7 @@
 mod backup;
 mod data;
 mod files;
+mod folders;
 mod node;
 mod onboarding;
 mod peers;

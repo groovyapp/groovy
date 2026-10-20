@@ -44,7 +44,9 @@ use crate::contacts;
 use crate::db::Database;
 use crate::files;
 use crate::folder_sync;
-use crate::folders::{self, ExportReport, Folder, FolderAccess, FolderEntry, Protected};
+use crate::folders::{
+    self, ExportReport, Folder, FolderAccess, FolderEntry, FolderStatus, Protected,
+};
 use crate::gated::TrustedOnly;
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
@@ -289,6 +291,12 @@ enum Command {
         oneshot::Sender<Result<ExportReport, NodeError>>,
     ),
     ListFolders(oneshot::Sender<Result<Vec<Folder>, NodeError>>),
+    LeaveFolder(NamespaceId, oneshot::Sender<Result<(), NodeError>>),
+    FolderStatus(
+        NamespaceId,
+        oneshot::Sender<Result<FolderStatus, NodeError>>,
+    ),
+    RenameFolder(NamespaceId, String, oneshot::Sender<Result<(), NodeError>>),
     DeleteTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     ClearCache(oneshot::Sender<Result<(), NodeError>>),
     StorageUsage(oneshot::Sender<Result<StorageUsage, NodeError>>),
@@ -559,6 +567,7 @@ async fn run(
                         store: store.clone(),
                         database: database.clone(),
                         live: folder_live.clone(),
+                        tasks: Arc::new(Mutex::new(HashMap::new())),
                     };
                     if config.garbage_interval.is_some() {
                         let refreshing = state.clone();
@@ -898,6 +907,59 @@ async fn run(
                     };
                     let _ = reply.send(outcome);
                 }
+                Some(Command::LeaveFolder(namespace, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => {
+                                // Stop syncing the directory first, so it does not write to a folder
+                                // that is going away.
+                                if let Some(task) = state
+                                    .tasks
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .remove(&namespace)
+                                {
+                                    task.abort();
+                                }
+                                folders::leave(&state.docs, &state.database, namespace)
+                                    .await
+                                    .map_err(folder_error)
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::FolderStatus(namespace, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => folders::status(&state.docs, namespace)
+                                .await
+                                .map_err(folder_error),
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::RenameFolder(namespace, name, reply)) => {
+                    let outcome = match folder_state(&folders) {
+                        Ok(state) => state
+                            .database
+                            .rename_folder(namespace, &name)
+                            .map_err(|error| NodeError::Folder(error.to_string()))
+                            .and_then(|found| {
+                                if found {
+                                    Ok(())
+                                } else {
+                                    Err(NodeError::Folder("there is no folder with that id".to_owned()))
+                                }
+                            }),
+                        Err(error) => Err(error),
+                    };
+                    let _ = reply.send(outcome);
+                }
                 Some(Command::ListFolders(reply)) => {
                     let outcome = match folder_state(&folders) {
                         Ok(state) => state
@@ -1126,19 +1188,29 @@ struct FolderState {
     store: FsStore,
     database: Arc<Database>,
     live: Protected,
+    /// The sync task of each folder this device saves, so leaving a folder can stop it.
+    tasks: Arc<Mutex<HashMap<NamespaceId, tokio::task::AbortHandle>>>,
 }
 
 impl FolderState {
     /// Starts keeping a folder's directory in step with it, if this device saves it.
     fn sync(&self, folder: &Folder) {
         if let Some(dir) = &folder.path {
-            folder_sync::spawn(
+            let task = folder_sync::spawn(
                 self.docs.clone(),
                 std::ops::Deref::deref(&self.store).clone(),
                 folder.namespace,
                 dir.clone(),
                 self.live.clone(),
             );
+            if let Some(old) = self
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(folder.namespace, task)
+            {
+                old.abort();
+            }
         }
     }
 }
@@ -1621,8 +1693,8 @@ fn spawn_receive(receiving: &Receiving, id: i64, peer: EndpointId, offer: FileOf
         set_transfer(&task, id, Some(TransferState::Active), None);
         match receive(&task, id, &offer).await {
             Ok(()) => {
-                set_transfer(&task, id, Some(TransferState::Completed), Some(offer.bytes));
-                // The transfer's tag keeps the content from here on.
+                // The transfer's tag keeps the content from here on. It was marked completed
+                // before the event that says so was sent.
                 forget_in_flight(&task, offer.root).await;
             }
             Err(error) => {
@@ -1703,6 +1775,13 @@ async fn receive(receiving: &Receiving, id: i64, offer: &FileOffer) -> Result<()
         None => Vec::new(),
     };
     let peer = offer_peer(receiving, id);
+    // Completed before the event, so anyone who sees the event also sees the final state.
+    set_transfer(
+        receiving,
+        id,
+        Some(TransferState::Completed),
+        Some(offer.bytes),
+    );
     let _ = receiving.events.send(NodeEvent::FileReceived {
         transfer: id,
         peer,
@@ -2526,6 +2605,41 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::ExportFolder(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Leaves a shared folder. Syncing stops, and the folder is removed from this device. Files
+    /// already saved to a directory are kept, and other members keep the folder.
+    pub async fn leave_folder(&self, namespace: NamespaceId) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::LeaveFolder(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// How big a folder is, and how many peers it is syncing with.
+    pub async fn folder_status(&self, namespace: NamespaceId) -> Result<FolderStatus, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::FolderStatus(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Sets the name this device shows for a folder.
+    pub async fn rename_folder(
+        &self,
+        namespace: NamespaceId,
+        name: String,
+    ) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::RenameFolder(namespace, name, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

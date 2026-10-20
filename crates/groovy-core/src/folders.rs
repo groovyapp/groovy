@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 use iroh_blobs::{BlobFormat, Hash, api::Store};
+use iroh_docs::DocTicket;
+pub use iroh_docs::NamespaceId;
 use iroh_docs::store::Query;
-use iroh_docs::{DocTicket, NamespaceId};
 use rusqlite::params;
 use thiserror::Error;
 
@@ -39,6 +40,16 @@ pub struct FolderEntry {
     pub key: String,
     pub hash: Hash,
     pub size: u64,
+}
+
+/// How big a folder is, and who it is syncing with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderStatus {
+    pub files: u64,
+    /// The total size of the files, in bytes.
+    pub bytes: u64,
+    /// How many peers the folder is syncing with now.
+    pub sync_peers: usize,
 }
 
 /// What exporting a folder wrote, and what was not yet on this device.
@@ -142,6 +153,28 @@ impl Database {
         Ok(folders)
     }
 
+    /// Forgets a folder this device was in.
+    pub fn delete_folder(&self, namespace: NamespaceId) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM folders WHERE namespace = ?1",
+                [namespace.as_bytes().as_slice()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Sets the name this device shows for a folder.
+    pub fn rename_folder(&self, namespace: NamespaceId, name: &str) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE folders SET name = ?2 WHERE namespace = ?1",
+                rusqlite::params![namespace.as_bytes().as_slice(), name],
+            )
+            .map(|changed| changed > 0)
+        })
+    }
+
     /// The folder with this id, if this device is in it.
     pub fn folder(&self, namespace: NamespaceId) -> Result<Option<Folder>, DbError> {
         Ok(self
@@ -149,6 +182,60 @@ impl Database {
             .into_iter()
             .find(|folder| folder.namespace == namespace))
     }
+}
+
+/// How big the folder is, and how many peers it is syncing with.
+pub async fn status(
+    docs: &iroh_docs::protocol::Docs,
+    namespace: NamespaceId,
+) -> Result<FolderStatus, FolderError> {
+    let entries = entries(docs, namespace).await?;
+    let doc = docs
+        .open(namespace)
+        .await
+        .map_err(replica)?
+        .ok_or(FolderError::UnknownFolder)?;
+    let sync_peers = doc
+        .get_sync_peers()
+        .await
+        .map_err(replica)?
+        .map_or(0, |peers| peers.len());
+    Ok(FolderStatus {
+        files: entries.len() as u64,
+        bytes: entries.iter().map(|entry| entry.size).sum(),
+        sync_peers,
+    })
+}
+
+/// Leaves a folder: syncing stops, and the folder is removed from this device. Its files
+/// stay in any directory it was saved to. Other members keep the folder.
+pub async fn leave(
+    docs: &iroh_docs::protocol::Docs,
+    database: &Database,
+    namespace: NamespaceId,
+) -> Result<(), FolderError> {
+    let doc = docs
+        .open(namespace)
+        .await
+        .map_err(replica)?
+        .ok_or(FolderError::UnknownFolder)?;
+    doc.leave().await.map_err(replica)?;
+    // A replica must be closed before it can be dropped. Handles opened by earlier calls close
+    // as they are dropped, which takes a moment, so the drop is tried again for a few seconds.
+    doc.close().await.map_err(replica)?;
+    let mut attempts = 0;
+    loop {
+        match docs.drop_doc(namespace).await {
+            Ok(()) => break,
+            Err(error) if attempts < 50 && error.to_string().contains("not closed") => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(replica(error)),
+        }
+    }
+    database.delete_folder(namespace)?;
+    Ok(())
 }
 
 /// Creates a folder, and records it. The folder is saved to `path` on this device, if given.

@@ -13,6 +13,7 @@ use crate::{
     APP_NAME,
     data::AppData,
     files::FilesView,
+    folders::FoldersView,
     node::{NodeState, answer_pairing},
     onboarding::{self, Onboarding, OnboardingEvent},
     peers::PeersView,
@@ -40,6 +41,7 @@ pub struct Workspace {
     settings: Entity<SettingsScreen>,
     peers: Entity<PeersView>,
     files: Entity<FilesView>,
+    folders: Entity<FoldersView>,
     _appearance_subscription: Subscription,
 }
 
@@ -86,6 +88,7 @@ impl Workspace {
         let settings = cx.new(|cx| SettingsScreen::new(database.clone(), cx));
         let peers = cx.new(|cx| PeersView::new(database.clone(), cx));
         let files = cx.new(|cx| FilesView::new(database.clone(), cx));
+        let folders = cx.new(FoldersView::new);
 
         Self {
             current,
@@ -95,6 +98,7 @@ impl Workspace {
             settings,
             peers,
             files,
+            folders,
             _appearance_subscription,
         }
     }
@@ -277,10 +281,13 @@ impl Workspace {
                     .when(self.current == Screen::Files, |d| {
                         d.child(self.files.clone())
                     })
+                    .when(self.current == Screen::Storage, |d| {
+                        d.child(self.folders.clone())
+                    })
                     .when(
                         !matches!(
                             self.current,
-                            Screen::Settings | Screen::Peers | Screen::Files
+                            Screen::Settings | Screen::Peers | Screen::Files | Screen::Storage
                         ),
                         |d| {
                             d.child(
