@@ -7,13 +7,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui::{App, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px};
-use groovy_core::{Appearance, DataDir, Database, RelaySetting};
+use groovy_core::{Appearance, DataDir, Database, RelaySetting, storage::StorageUsage};
 use tracing::warn;
 
 use crate::{
     backup::BackupSection,
     data::AppData,
-    node::abbreviate_id,
+    files::format_bytes,
+    node::{NodeState, abbreviate_id},
     settings_profile::ProfileEditor,
     theme::{self, ActiveTheme},
     ui::{
@@ -30,18 +31,131 @@ pub struct SettingsScreen {
     relay_input: Entity<TextInput>,
     /// The last result of saving relays: whether it was an error, and the message.
     relay_status: Option<(bool, SharedString)>,
+    cap_input: Entity<TextInput>,
+    /// What the node holds, as last read from it.
+    storage: Option<StorageUsage>,
+    /// The last result of a storage action: whether it was an error, and the message.
+    storage_status: Option<(bool, SharedString)>,
 }
 
 impl SettingsScreen {
     pub fn new(database: Arc<Database>, cx: &mut Context<Self>) -> Self {
-        Self {
+        let mut screen = Self {
             profile: cx.new(|cx| ProfileEditor::new(database, cx)),
             backup: cx.new(BackupSection::new),
             relay_input: cx.new(|cx| {
                 TextInput::new("https://relay.example.org./ (space or comma separated)", cx)
             }),
             relay_status: None,
-        }
+            cap_input: cx.new(|cx| TextInput::new("Cap in MB, for example 10240", cx)),
+            storage: None,
+            storage_status: None,
+        };
+        screen.refresh_storage(cx);
+        screen
+    }
+
+    /// Reads what the node holds. Does nothing until the node is running.
+    pub fn refresh_storage(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Ok(usage) = handle.storage_usage().await {
+                this.update(cx, |screen, cx| {
+                    screen.storage = Some(usage);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn set_storage_status(
+        &mut self,
+        error: bool,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.storage_status = Some((error, message.into()));
+        cx.notify();
+    }
+
+    /// Sets the cap from the field, in megabytes. An empty field removes the cap.
+    fn apply_cap(&mut self, cx: &mut Context<Self>) {
+        let text = self.cap_input.read(cx).text().trim().to_owned();
+        let cap = if text.is_empty() {
+            None
+        } else {
+            match text.parse::<f64>() {
+                Ok(megabytes) if megabytes > 0.0 => Some((megabytes * 1024.0 * 1024.0) as u64),
+                _ => {
+                    self.set_storage_status(
+                        true,
+                        "Enter a number of megabytes, or leave it empty for no limit.",
+                        cx,
+                    );
+                    return;
+                }
+            }
+        };
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            self.set_storage_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.set_storage_cap(cap).await;
+            this.update(cx, |screen, cx| {
+                match outcome {
+                    Ok(()) => screen.set_storage_status(
+                        false,
+                        match cap {
+                            Some(_) => "The cap is set.",
+                            None => "There is no cap.",
+                        },
+                        cx,
+                    ),
+                    Err(error) => screen.set_storage_status(
+                        true,
+                        format!("The cap could not be saved: {error}"),
+                        cx,
+                    ),
+                }
+                screen.refresh_storage(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Clears the cache: the received files' history and the sent files' tags. The files
+    /// already saved to disk, and the shared folders, are not touched.
+    fn clear_cache(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            self.set_storage_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.clear_cache().await;
+            this.update(cx, |screen, cx| {
+                match outcome {
+                    Ok(()) => screen.set_storage_status(
+                        false,
+                        "The cache is cleared. Files already saved to disk are kept.",
+                        cx,
+                    ),
+                    Err(error) => screen.set_storage_status(
+                        true,
+                        format!("The cache could not be cleared: {error}"),
+                        cx,
+                    ),
+                }
+                screen.refresh_storage(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Uses the relay URLs typed in the field. Any token already set in config.toml is kept.
@@ -293,6 +407,100 @@ fn discovery_row(
         .child(button)
 }
 
+impl SettingsScreen {
+    /// What the node holds, the cap, the cap field, and clearing the cache.
+    fn storage_usage_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let view = cx.entity().clone();
+        let clear_view = view.clone();
+        let cap_view = view.clone();
+        let no_cap_view = view.clone();
+
+        let usage = self.storage.map(|usage| {
+            let cap = match usage.cap_bytes {
+                Some(bytes) => format_bytes(bytes),
+                None => "No limit".to_owned(),
+            };
+            let warning = usage.near_cap().then(|| {
+                div().text_sm().text_color(theme.warning).child(
+                    "This device is near its storage cap. Clear the cache, or raise the cap.",
+                )
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(info_row(
+                    "Received files",
+                    format_bytes(usage.received_bytes),
+                    None::<gpui::Div>,
+                    cx,
+                ))
+                .child(info_row(
+                    "Shared folders",
+                    format_bytes(usage.folder_bytes),
+                    None::<gpui::Div>,
+                    cx,
+                ))
+                .child(info_row("Cap", cap, None::<gpui::Div>, cx))
+                .children(warning)
+        });
+        let status = self.storage_status.as_ref().map(|(error, message)| {
+            let color = if *error { theme.danger } else { theme.success };
+            div().text_sm().text_color(color).child(message.clone())
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(match usage {
+                Some(rows) => rows.into_any_element(),
+                None => div()
+                    .text_sm()
+                    .text_color(theme.text_muted)
+                    .child("Storage is read once the node is running.")
+                    .into_any_element(),
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().child(self.cap_input.clone()))
+                    .child(
+                        Button::new("storage-set-cap", "Set cap")
+                            .variant(Variant::Secondary)
+                            .on_click(move |_, cx| {
+                                cap_view.update(cx, |screen, cx| screen.apply_cap(cx))
+                            }),
+                    )
+                    .child(
+                        Button::new("storage-no-cap", "No limit")
+                            .variant(Variant::Ghost)
+                            .on_click(move |_, cx| {
+                                no_cap_view.update(cx, |screen, cx| {
+                                    screen
+                                        .cap_input
+                                        .update(cx, |input, cx| input.set_text("", cx));
+                                    screen.apply_cap(cx);
+                                })
+                            }),
+                    ),
+            )
+            .child(
+                Button::new("storage-clear-cache", "Clear cache")
+                    .variant(Variant::Secondary)
+                    .icon(Icon::Trash)
+                    .on_click(move |_, cx| {
+                        clear_view.update(cx, |screen, cx| screen.clear_cache(cx))
+                    }),
+            )
+            .children(status)
+    }
+}
+
 fn divider(cx: &App) -> impl IntoElement {
     div().h(px(1.)).w_full().bg(cx.theme().border)
 }
@@ -445,12 +653,7 @@ impl Render for SettingsScreen {
                 Some(reveal_data),
                 cx,
             ))
-            .child(info_row(
-                "Usage",
-                "Shared storage and cleanup arrive with blob storage (#26).".to_owned(),
-                None::<gpui::Div>,
-                cx,
-            ))
+            .child(self.storage_usage_rows(cx))
             .child(divider(cx))
             .child(section_heading("Advanced", "Logs and version.", cx))
             .child(info_row(
