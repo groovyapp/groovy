@@ -117,6 +117,11 @@ impl Workspace {
         if screen != self.current {
             self.current = screen;
             screen.remember(self.database.clone(), cx);
+            if screen == Screen::Settings {
+                // Usage is read each time Settings opens, in case the node has started since.
+                let settings = self.settings.clone();
+                settings.update(cx, |settings, cx| settings.refresh_storage(cx));
+            }
             cx.notify();
         }
     }
