@@ -8,6 +8,7 @@ use gpui::{
     Context, Entity, FontWeight, PathPromptOptions, SharedString, Window, div, prelude::*, px,
 };
 use groovy_core::folders::{Folder, FolderAccess, FolderStatus, NamespaceId};
+use groovy_core::replicas::ReplicaHealth;
 use tracing::warn;
 
 use crate::{
@@ -27,6 +28,7 @@ const REFRESH_EVERY: Duration = Duration::from_secs(2);
 struct Row {
     folder: Folder,
     status: Option<FolderStatus>,
+    health: Option<ReplicaHealth>,
 }
 
 pub struct FoldersView {
@@ -67,7 +69,12 @@ impl FoldersView {
                     let mut rows = Vec::with_capacity(folders.len());
                     for folder in folders {
                         let status = handle.folder_status(folder.namespace).await.ok();
-                        rows.push(Row { folder, status });
+                        let health = handle.folder_health(folder.namespace).await.ok();
+                        rows.push(Row {
+                            folder,
+                            status,
+                            health,
+                        });
                     }
                     let shown = this.update(cx, |view, cx| {
                         view.rows = rows;
@@ -234,6 +241,58 @@ impl FoldersView {
         .detach();
     }
 
+    /// Chooses whether this device keeps a full copy of a folder.
+    fn set_keep_copy(&mut self, namespace: NamespaceId, keep: bool, cx: &mut Context<Self>) {
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.set_keep_copy(namespace, keep).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(()) => view.set_status(
+                    false,
+                    if keep {
+                        "This device keeps a full copy of the folder."
+                    } else {
+                        "This device no longer keeps the folder's files. Files already saved stay."
+                    },
+                    cx,
+                ),
+                Err(error) => {
+                    view.set_status(true, format!("The setting was not saved: {error}"), cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Checks this device's copy of a folder now.
+    fn check_copy(&mut self, namespace: NamespaceId, cx: &mut Context<Self>) {
+        let Some(handle) = cx.try_global::<NodeState>().and_then(|node| node.handle()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.verify_folder(namespace).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(info) if info.complete() => {
+                    view.set_status(false, "Checked: this device has every file in full.", cx)
+                }
+                Ok(info) => view.set_status(
+                    false,
+                    format!(
+                        "Checked: {} of {} files are here in full.",
+                        info.held, info.files
+                    ),
+                    cx,
+                ),
+                Err(error) => view.set_status(true, format!("The check failed: {error}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Leaves a folder, after the second click. Files already saved to disk are kept.
     fn leave(&mut self, namespace: NamespaceId, cx: &mut Context<Self>) {
         if self.leaving != Some(namespace) {
@@ -268,6 +327,50 @@ impl FoldersView {
 
 fn short(namespace: &NamespaceId) -> String {
     namespace.to_string().chars().take(8).collect()
+}
+
+/// What to show about how well a folder is kept: how many complete copies exist, then one
+/// line for each device.
+fn copies_line(health: &ReplicaHealth) -> Vec<String> {
+    let headline = match health.copies {
+        0 => "No device has a complete copy".to_owned(),
+        1 => "1 complete copy".to_owned(),
+        n => format!("{n} complete copies"),
+    };
+    let now = groovy_core::contacts::now();
+    let mut lines = vec![headline];
+    for info in &health.devices {
+        let who = if info.you {
+            "This device".to_owned()
+        } else {
+            let id = info.device.to_string();
+            format!("Device {}", &id[..8.min(id.len())])
+        };
+        let state = if !info.keeps_copy {
+            "follows the file list only".to_owned()
+        } else if info.complete() {
+            format!("complete, checked {}", ago(now - info.verified))
+        } else {
+            format!(
+                "{} of {} files, checked {}",
+                info.held,
+                info.files,
+                ago(now - info.verified)
+            )
+        };
+        lines.push(format!("{who}: {state}"));
+    }
+    lines
+}
+
+/// How long ago, in the largest whole unit.
+fn ago(seconds: i64) -> String {
+    match seconds.max(0) {
+        s if s < 60 => "just now".to_owned(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
+    }
 }
 
 impl Render for FoldersView {
@@ -306,6 +409,10 @@ impl Render for FoldersView {
                     None => "Reading the folder...".to_owned(),
                 };
 
+                let copies = row.health.as_ref().map(copies_line);
+                let keeps = row.folder.keep_copy;
+                let keep_toggle_view = view.clone();
+                let check_view = view.clone();
                 let edit_view = view.clone();
                 let read_view = view.clone();
                 let leave_view = view.clone();
@@ -335,6 +442,29 @@ impl Render for FoldersView {
                                 read_view.update(cx, |view, cx| {
                                     view.invite_to(namespace, FolderAccess::Read, cx)
                                 });
+                            }),
+                    );
+                actions = actions
+                    .child(
+                        Button::new(
+                            format!("folder-keep-{id}"),
+                            if keeps {
+                                "Don't keep a copy here"
+                            } else {
+                                "Keep a full copy here"
+                            },
+                        )
+                        .variant(Variant::Secondary)
+                        .on_click(move |_, cx| {
+                            keep_toggle_view
+                                .update(cx, |view, cx| view.set_keep_copy(namespace, !keeps, cx));
+                        }),
+                    )
+                    .child(
+                        Button::new(format!("folder-check-{id}"), "Check copy")
+                            .variant(Variant::Secondary)
+                            .on_click(move |_, cx| {
+                                check_view.update(cx, |view, cx| view.check_copy(namespace, cx));
                             }),
                     );
                 if let Some(path) = row.folder.path.clone() {
@@ -389,6 +519,11 @@ impl Render for FoldersView {
                     )
                     .child(div().text_xs().text_color(theme.text_muted).child(location))
                     .child(div().text_xs().text_color(theme.text_muted).child(detail))
+                    .when_some(copies, |column, lines| {
+                        lines.into_iter().fold(column, |column, line| {
+                            column.child(div().text_xs().text_color(theme.text_muted).child(line))
+                        })
+                    })
                     .child(actions)
                     .when_some(invite_ticket, |column, (_, access, ticket)| {
                         let copy = ticket.clone();

@@ -31,6 +31,9 @@ pub struct Folder {
     pub path: Option<PathBuf>,
     /// Unix seconds.
     pub created: i64,
+    /// Whether this device keeps a full copy of the folder's files. A device that does not
+    /// follows the list of files, and fetches nothing until it is asked to.
+    pub keep_copy: bool,
 }
 
 /// One file in a folder, as the folder currently has it.
@@ -124,7 +127,7 @@ impl Database {
     pub fn folders(&self) -> Result<Vec<Folder>, DbError> {
         let rows = self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT namespace, name, path, created FROM folders ORDER BY created, rowid",
+                "SELECT namespace, name, path, created, keep_copy FROM folders ORDER BY created, rowid",
             )?;
             let rows = statement
                 .query_map([], |row| {
@@ -133,13 +136,14 @@ impl Database {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })?;
         let mut folders = Vec::with_capacity(rows.len());
-        for (namespace, name, path, created) in rows {
+        for (namespace, name, path, created, keep_copy) in rows {
             let Ok(bytes) = <[u8; 32]>::try_from(namespace.as_slice()) else {
                 continue;
             };
@@ -148,6 +152,7 @@ impl Database {
                 name,
                 path: path.map(PathBuf::from),
                 created,
+                keep_copy: keep_copy != 0,
             });
         }
         Ok(folders)
@@ -170,6 +175,17 @@ impl Database {
             conn.execute(
                 "UPDATE folders SET name = ?2 WHERE namespace = ?1",
                 rusqlite::params![namespace.as_bytes().as_slice(), name],
+            )
+            .map(|changed| changed > 0)
+        })
+    }
+
+    /// Sets whether this device keeps a full copy of a folder.
+    pub fn set_keep_copy(&self, namespace: NamespaceId, keep: bool) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE folders SET keep_copy = ?2 WHERE namespace = ?1",
+                rusqlite::params![namespace.as_bytes().as_slice(), keep],
             )
             .map(|changed| changed > 0)
         })
@@ -252,6 +268,7 @@ pub async fn create(
         name,
         path,
         created: now,
+        keep_copy: true,
     };
     database.insert_folder(&folder)?;
     Ok(folder)
@@ -276,6 +293,7 @@ pub async fn join(
         name: String::new(),
         path,
         created: now,
+        keep_copy: true,
     };
     database.insert_folder(&folder)?;
     Ok(folder)
@@ -323,9 +341,14 @@ const TOMBSTONE: &[u8] = b"groovy:deleted";
 /// The key prefix of the records of which versions a write had seen. A record
 /// `history:<version>:<seen>:<key>` says that `version` was written after `seen`, so `seen`
 /// is superseded. Keys cannot contain `:`, so the prefix cannot clash with a file.
-const HISTORY: &str = "history:";
+pub(crate) const HISTORY: &str = "history:";
 
-fn tombstone() -> Hash {
+/// Whether a key is a record the folder keeps about itself, not a file.
+fn is_meta(key: &str) -> bool {
+    key.starts_with(HISTORY) || key.starts_with(crate::replicas::REPLICA)
+}
+
+pub(crate) fn tombstone() -> Hash {
     Hash::new(TOMBSTONE)
 }
 
@@ -337,7 +360,7 @@ fn is_deleted(hash: Hash) -> bool {
 /// The key a file is stored under. iroh-docs removes a key's entries when a key that
 /// starts with it is written, so every stored key ends in a NUL byte: no stored key is then
 /// a prefix of another, and `x.txt` cannot remove `x.txt2`. Paths cannot contain NUL.
-fn stored_key(key: &str) -> Vec<u8> {
+pub(crate) fn stored_key(key: &str) -> Vec<u8> {
     let mut bytes = key.as_bytes().to_vec();
     bytes.push(0);
     bytes
@@ -356,16 +379,16 @@ fn unstored(bytes: &[u8]) -> String {
 
 /// One entry in the folder, as written by one author.
 #[derive(Debug, Clone)]
-struct Version {
-    key: String,
-    hash: Hash,
-    size: u64,
-    author: String,
-    timestamp: u64,
+pub(crate) struct Version {
+    pub(crate) key: String,
+    pub(crate) hash: Hash,
+    pub(crate) size: u64,
+    pub(crate) author: String,
+    pub(crate) timestamp: u64,
 }
 
 /// Every entry in the replica, including old versions and history records.
-async fn all_entries(
+pub(crate) async fn all_entries(
     docs: &iroh_docs::protocol::Docs,
     namespace: NamespaceId,
 ) -> Result<Vec<Version>, FolderError> {
@@ -543,7 +566,7 @@ pub async fn entries(
     let all = all_entries(docs, namespace).await?;
     let keys: BTreeSet<&str> = all
         .iter()
-        .filter(|version| !version.key.starts_with(HISTORY))
+        .filter(|version| !is_meta(&version.key))
         .map(|version| version.key.as_str())
         .collect();
     let mut entries = Vec::new();

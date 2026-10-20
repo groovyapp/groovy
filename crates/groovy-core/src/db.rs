@@ -93,6 +93,9 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user, device)
     );
     ALTER TABLE contacts ADD COLUMN user BLOB CHECK (user IS NULL OR length(user) = 32);",
+    // Whether this device keeps a full copy of a shared folder. Folders recorded before this
+    // were kept in full.
+    "ALTER TABLE folders ADD COLUMN keep_copy INTEGER NOT NULL DEFAULT 1;",
 ];
 
 /// The schema version this build writes.
