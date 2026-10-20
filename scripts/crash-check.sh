@@ -1,9 +1,11 @@
 #!/bin/bash
 # Crash check for interrupted receives. Shares a file (1 GiB, or SIZE_MIB) from one data directory to
 # another, kills the receiver with SIGKILL partway through, resumes it in a new process,
-# and checks that the saved file matches the source. Run it after `cargo build -p groovy-cli`.
+# and checks that the saved file matches the source. Run it after `cargo build --release -p groovy-cli`.
 set -u
-CLI="$(cd "$(dirname "$0")/.." && pwd)/target/debug/groovy-cli"
+# Use the release build for large sizes (cargo build --release -p groovy-cli): a debug build
+# is many times slower.
+CLI="${CLI:-$(cd "$(dirname "$0")/.." && pwd)/target/release/groovy-cli}"
 # Work in target/, which has room for the 1 GiB file, and is removed at the end.
 mkdir -p "$(dirname "$0")/../target"
 T=$(mktemp -d "$(cd "$(dirname "$0")/.." && pwd)/target/crash-check.XXXX")

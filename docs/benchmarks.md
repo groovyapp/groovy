@@ -62,11 +62,10 @@ Result with a restart on the same machine: stopped with 1,283 MiB of 5,120 MiB r
 
 ### A crash (SIGKILL)
 
-`scripts/crash-check.sh` shares a file between two data directories, kills the receiver with SIGKILL six seconds in, resumes it in a new process with `groovy-cli resume`, and checks the saved file against the source.
+`scripts/crash-check.sh` shares a file between two data directories, kills the receiver with SIGKILL six seconds in, resumes it in a new process with `groovy-cli resume`, and checks the saved file against the source. Use the release build of the CLI for large sizes: a debug build is many times slower.
 
-- **1 GiB:** passes. The resume started from 215,466,070 bytes and fetched 855,605,248 of the 858,275,754 missing, and the file matches.
-- **5 GiB:** fails, twice. The receive is recorded as failed with `the blob store failed: encode error`, and no file is saved. The partial download cannot be exported after the kill. A graceful stop at 5 GiB does not cause this, so it appears specific to an unclean stop. Retrying does not help, because the damaged partial stays in the store, and this code has no public way to remove it.
+Result at 5 GiB, with the release CLI: the receive had 470,941,782 bytes when it was killed. The resume fetched 4,897,439,744 bytes, which is what was missing, and the file matches the source.
 
-So the crash case at full size is **not** met. The file is never saved damaged. The fault lies in the blob store's recovery after an unclean stop, or in how this code relies on it, and it needs investigating before alpha.
+An earlier version of this section said the 5 GiB case failed with `encode error` because of the unclean stop. That was wrong. The cause was garbage collection: a transfer that took longer than the collection interval (60 s) had its partly downloaded files removed, and failed when it was saved. A plain 2 GiB transfer with no kill hit it too. A debug build is slow enough to be affected, and a release build usually finishes first. A transfer now takes out its tag when it starts, and protects every file in it before any data arrives.
 
 The check does not cover a dropped network connection.

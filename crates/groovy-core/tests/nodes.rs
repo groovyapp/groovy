@@ -1400,15 +1400,19 @@ async fn share_to(
     let shared = alice.create_share(paths).await.expect("the share is made");
     let transfer = bob.receive_share(shared.ticket).await.expect("bob starts");
     loop {
-        if let NodeEvent::FileReceived {
-            transfer: id, root, ..
-        } = tokio::time::timeout(TIMEOUT * 4, bob_events.next())
+        match tokio::time::timeout(TIMEOUT * 4, bob_events.next())
             .await
             .expect("bob receives the share")
             .unwrap()
         {
-            assert_eq!(id, transfer);
-            return (id, root);
+            NodeEvent::FileReceived {
+                transfer: id, root, ..
+            } => {
+                assert_eq!(id, transfer);
+                return (id, root);
+            }
+            NodeEvent::ReceiveFailed { error, .. } => panic!("the receive failed: {error}"),
+            _ => {}
         }
     }
 }
@@ -1964,6 +1968,38 @@ async fn a_send_still_waiting_for_an_answer_cannot_be_paused() {
     ));
     alice.cancel_transfer(transfer).await.unwrap();
     send.abort();
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_download_that_outlasts_the_collection_interval_is_not_collected() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    let (alice, _alice_events) =
+        blob_node_collecting(&alice_dir, alice_key, Some(Duration::from_millis(5))).await;
+    let (bob, mut bob_events) =
+        blob_node_collecting(&bob_dir, bob_key, Some(Duration::from_millis(5))).await;
+
+    // A file big enough that receiving it takes many collection intervals, which are 5 ms here.
+    let source = tmp.path().join("big.bin");
+    {
+        let mut file = std::fs::File::create(&source).unwrap();
+        let chunk: Vec<u8> = (0..1 << 20).map(|i| (i * 7 % 251) as u8).collect();
+        for _ in 0..96 {
+            file.write_all(&chunk).unwrap();
+        }
+    }
+    let (transfer, _root) = share_to(&alice, &bob, &mut bob_events, vec![source.clone()]).await;
+    let received = tmp.path().join("bob/Downloads/big.bin");
+    assert_eq!(
+        std::fs::metadata(received).map(|m| m.len()).ok(),
+        std::fs::metadata(&source).map(|m| m.len()).ok(),
+        "transfer {transfer} was cut off by collection"
+    );
+
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
