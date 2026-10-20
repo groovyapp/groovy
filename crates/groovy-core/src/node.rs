@@ -903,10 +903,16 @@ async fn run(
                     let _ = reply.send(outcome);
                 }
                 Some(Command::PauseTransfer(id, reply)) => {
-                    let _ = reply.send(stop_transfer(&receiving, id, TransferState::Paused));
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(pause_transfer(&receiving, id).await);
+                    });
                 }
                 Some(Command::ResumeTransfer(id, reply)) => {
-                    let _ = reply.send(resume_transfer(&receiving, id));
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(resume_transfer_any(&receiving, id).await);
+                    });
                 }
                 Some(Command::CancelTransfer(id, reply)) => {
                     let receiving = receiving.clone();
@@ -1400,7 +1406,7 @@ async fn cancel_send(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
             set_transfer(receiving, id, Some(TransferState::Cancelled), None);
             Ok(())
         }
-        TransferState::Completed => {
+        TransferState::Completed | TransferState::Paused => {
             if let Some(store) = &receiving.store {
                 let hashes = hashes_of_collection(store, root).await?;
                 lock_withdrawn(&receiving.withdrawn).extend(hashes);
@@ -1435,6 +1441,63 @@ async fn answer_offer(
     let id = new_transfer(receiving, peer, offer.clone());
     spawn_receive(receiving, id, peer, offer);
     Ok(())
+}
+
+/// Pauses a transfer. A receive stops fetching. An accepted send stops being served, to
+/// everyone, until it is resumed. A send still waiting for its answer cannot be paused.
+async fn pause_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    let (direction, state, root) = {
+        let book = lock_book(&receiving.book);
+        let slot = book.get(&id).ok_or(NodeError::UnknownTransfer)?;
+        (
+            slot.transfer.direction,
+            slot.transfer.state.clone(),
+            slot.transfer.offer.root,
+        )
+    };
+    match direction {
+        Direction::Receive => stop_transfer(receiving, id, TransferState::Paused),
+        Direction::Send => {
+            if state != TransferState::Completed {
+                return Err(NodeError::WrongTransferState("paused"));
+            }
+            if let Some(store) = &receiving.store {
+                let hashes = hashes_of_collection(store, root).await?;
+                lock_withdrawn(&receiving.withdrawn).extend(hashes);
+            }
+            set_transfer(receiving, id, Some(TransferState::Paused), None);
+            Ok(())
+        }
+    }
+}
+
+/// Resumes a transfer, whichever way it goes.
+async fn resume_transfer_any(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    let (direction, state, root) = {
+        let book = lock_book(&receiving.book);
+        let slot = book.get(&id).ok_or(NodeError::UnknownTransfer)?;
+        (
+            slot.transfer.direction,
+            slot.transfer.state.clone(),
+            slot.transfer.offer.root,
+        )
+    };
+    match direction {
+        Direction::Receive => resume_transfer(receiving, id),
+        Direction::Send => {
+            if state != TransferState::Paused {
+                return Err(NodeError::WrongTransferState("resumed"));
+            }
+            if let Some(store) = &receiving.store {
+                let hashes = hashes_of_collection(store, root).await?;
+                for hash in &hashes {
+                    lock_withdrawn(&receiving.withdrawn).remove(hash);
+                }
+            }
+            set_transfer(receiving, id, Some(TransferState::Completed), None);
+            Ok(())
+        }
+    }
 }
 
 /// Cancels a transfer, whichever way it goes.
