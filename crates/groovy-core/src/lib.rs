@@ -16,6 +16,7 @@ pub mod gated;
 pub mod identity;
 pub mod link;
 pub mod logging;
+pub mod messages;
 mod node;
 pub mod pairing;
 mod paths;

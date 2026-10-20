@@ -397,6 +397,8 @@ pub fn start(cx: &mut App) {
                     // A failed receive shows as a failed transfer, which the transfer list
                     // already reports.
                     NodeEvent::ReceiveFailed { .. } | NodeEvent::ImportProgress { .. } => {}
+                    // Shown once the conversations screen exists (#47).
+                    NodeEvent::MessageReceived(_) => {}
                     // Peers are shown once the Peers screen exists (#25).
                     NodeEvent::PeerConnected(_) | NodeEvent::PeerDisconnected(_) => {}
                 }

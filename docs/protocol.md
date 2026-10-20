@@ -113,6 +113,14 @@ A shared folder syncs over two protocols this node serves: the iroh-docs sync pr
 
 A folder's ticket names one of its members and the folder's capability, with read or write access. Joining a folder imports it and syncs with the members named in the ticket. Each entry is a relative path and the hash of its file. A delete is an entry with the empty hash. See `docs/storage.md` for the model, and for what is not built yet (conflict copies).
 
+## Direct messages
+
+A message to a trusted contact is sent as `Request::Message(WireMessage)` on a new stream. The `WireMessage` carries a version (`1`), a random 16-byte id, the sender's timestamp in milliseconds, the body (at most 4 KiB, trimmed), and an optional `reply_to` id. The author is the connection's peer, so a message cannot name another author.
+
+The receiver stores the message, unless a message with that id is already stored, and answers `Reply::Stored`. A resent message is acknowledged again without a second event. A receiver that does not trust the sender, or that does not read the version, gives no answer, and the sender sees the message as failed.
+
+Each side keeps its copy with a delivery state: `sending`, `delivered` (acknowledged) or `failed`. Conversations are ordered by `(timestamp, id)`. A sender never stamps a message earlier than its previous message to the same contact. Clock skew moves a message's place but never loses or duplicates it.
+
 ## Not yet specified
 
-Messages after the handshake: transfer management (#29), chat (#41), and groups (#43). Each will get a section here when it is built.
+Offline delivery (#42), groups (#43 to #44), attachments (#45), and search (#46) are not built. Each will get a section here when it is.
