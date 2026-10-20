@@ -31,13 +31,21 @@ const PULL_INTERVAL: Duration = Duration::from_secs(1);
 /// How long to wait after a change, so a save that writes several times is sent once.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Starts syncing a folder's directory. The task runs until the node stops.
-pub fn spawn(docs: Docs, store: Store, namespace: NamespaceId, dir: PathBuf, protected: Protected) {
+/// Starts syncing a folder's directory. The task runs until the node stops, or until it is
+/// aborted through the returned handle, as when the folder is left.
+pub fn spawn(
+    docs: Docs,
+    store: Store,
+    namespace: NamespaceId,
+    dir: PathBuf,
+    protected: Protected,
+) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         if let Err(error) = run(docs, store, namespace, dir, protected).await {
             warn!(%error, "a shared folder stopped syncing");
         }
-    });
+    })
+    .abort_handle()
 }
 
 async fn run(

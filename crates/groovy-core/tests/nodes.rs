@@ -2003,3 +2003,77 @@ async fn a_download_that_outlasts_the_collection_interval_is_not_collected() {
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_folder_reports_its_size_and_peers_can_be_renamed_and_left() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key, None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key, None).await;
+
+    let alice_folder = tmp.path().join("alice-docs");
+    std::fs::create_dir_all(&alice_folder).unwrap();
+    std::fs::write(alice_folder.join("a.txt"), b"hello").unwrap();
+    std::fs::write(alice_folder.join("b.txt"), b"world!").unwrap();
+    let folder = alice
+        .create_folder("docs".into(), Some(alice_folder.clone()))
+        .await
+        .unwrap();
+
+    // Size: the files the directory had are shared at once.
+    let status = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = alice.folder_status(folder.namespace).await.unwrap();
+            if status.files == 2 {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("both files are counted");
+    assert_eq!(status.bytes, 11);
+
+    // Peers: once a member joins, the folder is syncing with someone.
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+    let joined = bob.join_folder(ticket, None).await.unwrap();
+    bob.rename_folder(joined.namespace, "alice's docs".into())
+        .await
+        .unwrap();
+    assert_eq!(bob.folders().await.unwrap()[0].name, "alice's docs");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while bob
+            .folder_status(joined.namespace)
+            .await
+            .unwrap()
+            .sync_peers
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the folder syncs with its member");
+
+    // Leaving removes the folder, and keeps the files on disk.
+    alice
+        .leave_folder(folder.namespace)
+        .await
+        .expect("alice leaves");
+    assert!(alice.folders().await.unwrap().is_empty());
+    assert!(alice.folder_status(folder.namespace).await.is_err());
+    assert!(
+        alice_folder.join("a.txt").is_file(),
+        "leaving deleted a file"
+    );
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
