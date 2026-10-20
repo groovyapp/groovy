@@ -79,6 +79,20 @@ const MIGRATIONS: &[&str] = &[
     // Whether a transfer is a receive or a send. Transfers recorded before this were receives.
     "ALTER TABLE transfers ADD COLUMN direction TEXT NOT NULL DEFAULT 'receive'
         CHECK (direction IN ('receive', 'send'));",
+    // Devices linked to a user, as seen from here: each is a certificate the user's key signed.
+    // `revoked` is when the user revoked the device, and `revocation` is the signed record, which
+    // is passed on to peers. Contacts also remember which user a device belongs to.
+    "CREATE TABLE user_devices (
+        user       BLOB NOT NULL CHECK (length(user) = 32),
+        device     BLOB NOT NULL CHECK (length(device) = 32),
+        name       TEXT NOT NULL,
+        created    INTEGER NOT NULL,
+        cert       BLOB NOT NULL,
+        revoked    INTEGER,
+        revocation BLOB,
+        PRIMARY KEY (user, device)
+    );
+    ALTER TABLE contacts ADD COLUMN user BLOB CHECK (user IS NULL OR length(user) = 32);",
 ];
 
 /// The schema version this build writes.

@@ -262,6 +262,10 @@ impl Setup {
             downloads,
             database: Some(self.database.clone()),
             garbage_interval: Some(GARBAGE_INTERVAL),
+            user_keys: Some(Arc::new(groovy_core::user::StoredUserKey::new(
+                self.dir.clone(),
+                APP_NAME,
+            ))),
         })
         .context("the node could not start")?;
         let started = tokio::time::timeout(START_TIMEOUT, async {

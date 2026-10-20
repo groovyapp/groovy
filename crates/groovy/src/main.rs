@@ -3,6 +3,7 @@
 
 mod backup;
 mod data;
+mod devices;
 mod files;
 mod folders;
 mod node;

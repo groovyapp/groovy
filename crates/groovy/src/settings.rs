@@ -13,6 +13,7 @@ use tracing::warn;
 use crate::{
     backup::BackupSection,
     data::AppData,
+    devices::DevicesSection,
     files::format_bytes,
     node::{NodeState, abbreviate_id},
     settings_profile::ProfileEditor,
@@ -28,6 +29,7 @@ use crate::{
 pub struct SettingsScreen {
     profile: Entity<ProfileEditor>,
     backup: Entity<BackupSection>,
+    devices: Entity<DevicesSection>,
     relay_input: Entity<TextInput>,
     /// The last result of saving relays: whether it was an error, and the message.
     relay_status: Option<(bool, SharedString)>,
@@ -43,6 +45,7 @@ impl SettingsScreen {
         let mut screen = Self {
             profile: cx.new(|cx| ProfileEditor::new(database, cx)),
             backup: cx.new(BackupSection::new),
+            devices: cx.new(DevicesSection::new),
             relay_input: cx.new(|cx| {
                 TextInput::new("https://relay.example.org./ (space or comma separated)", cx)
             }),
@@ -641,6 +644,8 @@ impl Render for SettingsScreen {
                 cx,
             ))
             .child(self.backup.clone())
+            .child(divider(cx))
+            .child(self.devices.clone())
             .child(divider(cx))
             .child(section_heading(
                 "Storage",

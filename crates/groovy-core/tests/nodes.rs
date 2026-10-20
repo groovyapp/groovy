@@ -27,6 +27,7 @@ fn config(secret_key: SecretKey) -> NodeConfig {
         downloads: None,
         database: None,
         garbage_interval: None,
+        user_keys: None,
     }
 }
 
@@ -2076,4 +2077,198 @@ async fn a_folder_reports_its_size_and_peers_can_be_renamed_and_left() {
 
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
+}
+
+/// A node that can belong to a user: it has blob storage, a database, and a key store of its own.
+async fn user_node(dir: &DataDir, key: SecretKey) -> (NodeHandle, EventStream, Arc<Database>) {
+    let db = Arc::new(Database::open(&dir.database_file()).unwrap());
+    let config = NodeConfig {
+        gate: Arc::new(ContactGate::new(db.clone())),
+        blobs: Some(dir.blobs_dir()),
+        downloads: Some(dir.root().join("Downloads")),
+        database: Some(db.clone()),
+        user_keys: Some(Arc::new(groovy_core::user::MemoryUserKey::default())),
+        ..config(key)
+    };
+    let (handle, mut events) = Node::start(config).expect("node starts");
+    assert_eq!(events.next().await, Some(NodeEvent::Started));
+    (handle, events, db)
+}
+
+#[tokio::test]
+async fn a_device_linked_to_a_user_is_trusted_by_their_contacts_without_pairing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, laptop_key, phone_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let (alice_dir, laptop_dir, phone_dir) = (
+        fresh_dir(&tmp, "alice"),
+        fresh_dir(&tmp, "laptop"),
+        fresh_dir(&tmp, "phone"),
+    );
+    // Alice and the laptop have paired. The phone has never met Alice.
+    trust_in(&alice_dir, &laptop_key);
+    trust_in(&laptop_dir, &alice_key);
+    let (alice, mut alice_events, alice_db) = user_node(&alice_dir, alice_key).await;
+    let (laptop, _laptop_events, _laptop_db) = user_node(&laptop_dir, laptop_key.clone()).await;
+    let (phone, _phone_events, _phone_db) = user_node(&phone_dir, phone_key.clone()).await;
+    let alice_addr = alice.addr().await.unwrap();
+
+    // The laptop becomes a user, and links the phone with a ticket.
+    let ticket = laptop
+        .link_device("laptop".into())
+        .await
+        .expect("a link opens");
+    let user = phone
+        .accept_link(ticket, "phone".into())
+        .await
+        .expect("the phone links");
+    let devices = laptop.user_devices().await.unwrap();
+    let names: Vec<&str> = devices.iter().map(|d| d.cert.name.as_str()).collect();
+    assert_eq!(names, ["laptop", "phone"]);
+    assert!(
+        devices
+            .iter()
+            .all(|d| d.cert.user == user && d.cert.verify())
+    );
+
+    // The laptop meets Alice as the user, so she learns which user it belongs to.
+    laptop
+        .connect(alice_addr.clone())
+        .await
+        .expect("the laptop connects");
+    assert!(
+        !alice_db.is_trusted_device(phone_key.public()).unwrap(),
+        "trusted before it was seen"
+    );
+
+    // The phone connects, and is trusted without ever pairing: she sees its certificate.
+    phone.connect(alice_addr).await.expect("the phone connects");
+    // She records the certificate a moment after the phone finishes the handshake.
+    wait_until(|| alice_db.is_trusted_device(phone_key.public()).unwrap()).await;
+
+    // And she acts on it: an offer from the phone is shown to her.
+    let paths = write_sample_files(&tmp.path().join("source"));
+    let phone_addr = alice.addr().await.unwrap();
+    let send = tokio::spawn({
+        let phone = phone.clone();
+        async move { phone.send_files(phone_addr, paths).await }
+    });
+    let offer = tokio::time::timeout(TIMEOUT, next_file_offer(&mut alice_events))
+        .await
+        .expect("alice is offered the files by the phone");
+    assert_eq!(offer.files, 3);
+    send.abort();
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(laptop.shutdown(TIMEOUT));
+    assert!(phone.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_refused_once_contacts_have_the_revocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, laptop_key, phone_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let (alice_dir, laptop_dir, phone_dir) = (
+        fresh_dir(&tmp, "alice"),
+        fresh_dir(&tmp, "laptop"),
+        fresh_dir(&tmp, "phone"),
+    );
+    trust_in(&alice_dir, &laptop_key);
+    trust_in(&laptop_dir, &alice_key);
+    let (alice, _alice_events, alice_db) = user_node(&alice_dir, alice_key).await;
+    let (laptop, _laptop_events, laptop_db) = user_node(&laptop_dir, laptop_key.clone()).await;
+    let (phone, _phone_events, _phone_db) = user_node(&phone_dir, phone_key.clone()).await;
+    let alice_addr = alice.addr().await.unwrap();
+
+    let ticket = laptop.link_device("laptop".into()).await.unwrap();
+    phone.accept_link(ticket, "phone".into()).await.unwrap();
+    laptop.connect(alice_addr.clone()).await.unwrap();
+    phone.connect(alice_addr.clone()).await.unwrap();
+    wait_until(|| alice_db.is_trusted_device(phone_key.public()).unwrap()).await;
+
+    // A device cannot revoke itself, and only the user's own devices can be revoked.
+    assert!(matches!(
+        phone.revoke_device(phone_key.public()).await,
+        Err(groovy_core::NodeError::User(_))
+    ));
+    assert!(matches!(
+        laptop.revoke_device(SecretKey::generate().public()).await,
+        Err(groovy_core::NodeError::User(_))
+    ));
+
+    // The laptop revokes the phone. It is refused by the laptop at once, and by Alice once the
+    // laptop has told her.
+    laptop
+        .revoke_device(phone_key.public())
+        .await
+        .expect("the phone is revoked");
+    assert!(!laptop_db.is_trusted_device(phone_key.public()).unwrap());
+    assert!(
+        alice_db.is_trusted_device(phone_key.public()).unwrap(),
+        "alice cannot know yet"
+    );
+    laptop
+        .connect(alice_addr)
+        .await
+        .expect("the laptop tells alice");
+    wait_until(|| !alice_db.is_trusted_device(phone_key.public()).unwrap()).await;
+    // Alice still trusts the laptop.
+    assert!(alice_db.is_trusted_device(laptop_key.public()).unwrap());
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(laptop.shutdown(TIMEOUT));
+    assert!(phone.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_link_ticket_works_once_and_only_with_its_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (laptop_dir, phone_dir, tablet_dir) = (
+        fresh_dir(&tmp, "laptop"),
+        fresh_dir(&tmp, "phone"),
+        fresh_dir(&tmp, "tablet"),
+    );
+    let (laptop, _laptop_events, _laptop_db) = user_node(&laptop_dir, SecretKey::generate()).await;
+    let (phone, _phone_events, _phone_db) = user_node(&phone_dir, SecretKey::generate()).await;
+    let (tablet, _tablet_events, _tablet_db) = user_node(&tablet_dir, SecretKey::generate()).await;
+
+    let ticket = laptop.link_device("laptop".into()).await.unwrap();
+
+    // A ticket with the wrong secret is refused, and does not spend the link.
+    let mut forged = groovy_core::link::LinkTicket::parse(&ticket).unwrap();
+    forged.secret = [9; 32];
+    assert!(
+        tablet
+            .accept_link(forged.encode(), "tablet".into())
+            .await
+            .is_err()
+    );
+
+    phone
+        .accept_link(ticket.clone(), "phone".into())
+        .await
+        .expect("the real ticket works");
+    // The link is spent, so a second device cannot use the same ticket.
+    assert!(tablet.accept_link(ticket, "tablet".into()).await.is_err());
+    assert_eq!(laptop.user_devices().await.unwrap().len(), 2);
+
+    // A device that already belongs to a user will not link to another.
+    let other_ticket = laptop.link_device("laptop".into()).await.unwrap();
+    assert!(
+        phone
+            .accept_link(other_ticket, "phone again".into())
+            .await
+            .is_err()
+    );
+
+    assert!(laptop.shutdown(TIMEOUT));
+    assert!(phone.shutdown(TIMEOUT));
+    assert!(tablet.shutdown(TIMEOUT));
 }

@@ -306,6 +306,10 @@ pub fn start(cx: &mut App) {
         downloads: groovy_core::files::default_downloads(),
         database: Some(cx.global::<AppData>().database.clone()),
         garbage_interval: Some(GARBAGE_INTERVAL),
+        user_keys: Some(Arc::new(groovy_core::user::StoredUserKey::new(
+            cx.global::<AppData>().dir.clone(),
+            crate::APP_NAME,
+        ))),
     }) {
         Ok(started) => started,
         Err(error) => {
