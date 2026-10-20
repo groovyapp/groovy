@@ -33,8 +33,10 @@ pub type MessageId = [u8; 16];
 /// Where a message is in its delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
-    /// Being sent. The contact has not acknowledged it yet.
+    /// Waiting to be sent, or being sent. Not yet written to any of the contact's devices.
     Sending,
+    /// Written to one of the contact's devices, which has not acknowledged it yet.
+    Sent,
     /// The contact stored it and acknowledged it. Also the state of every message received.
     Delivered,
     /// Could not be delivered. Retrying is handled by the outbox.
@@ -45,6 +47,7 @@ impl DeliveryState {
     fn as_str(self) -> &'static str {
         match self {
             DeliveryState::Sending => "sending",
+            DeliveryState::Sent => "sent",
             DeliveryState::Delivered => "delivered",
             DeliveryState::Failed => "failed",
         }
@@ -53,6 +56,7 @@ impl DeliveryState {
     fn from_str(value: &str) -> Option<Self> {
         match value {
             "sending" => Some(DeliveryState::Sending),
+            "sent" => Some(DeliveryState::Sent),
             "delivered" => Some(DeliveryState::Delivered),
             "failed" => Some(DeliveryState::Failed),
             _ => None,
@@ -140,6 +144,44 @@ fn id_bytes(id: &MessageId) -> &[u8] {
     id.as_slice()
 }
 
+/// The columns of a message, as read from the table, before they are checked.
+type Row = (Vec<u8>, Vec<u8>, i64, String, Option<Vec<u8>>, String);
+
+const SELECT: &str = "SELECT id, author, timestamp, body, reply_to, state FROM messages";
+
+/// Turns a stored row into a message. A row that does not decode is left out, rather than
+/// failing the whole conversation.
+fn decode(conversation: EndpointId, row: Row) -> Option<Message> {
+    let (id, author, timestamp, body, reply_to, state) = row;
+    let id = <MessageId>::try_from(id.as_slice()).ok()?;
+    let author = EndpointId::from_bytes(&<[u8; 32]>::try_from(author.as_slice()).ok()?).ok()?;
+    let state = DeliveryState::from_str(&state)?;
+    let reply_to = match reply_to {
+        Some(bytes) => Some(<MessageId>::try_from(bytes.as_slice()).ok()?),
+        None => None,
+    };
+    Some(Message {
+        id,
+        conversation,
+        author,
+        timestamp,
+        body,
+        reply_to,
+        state,
+    })
+}
+
+fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
 impl Database {
     /// Stores a message. Returns `false` if a message with the same id is already stored, as
     /// when a sender resends one.
@@ -174,6 +216,35 @@ impl Database {
         })
     }
 
+    /// Marks a message as written to a device, unless it has already been acknowledged.
+    pub fn mark_sent(&self, id: MessageId) -> Result<bool, DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE messages SET state = 'sent' WHERE id = ?1 AND state = 'sending'",
+                params![id_bytes(&id)],
+            )
+            .map(|changed| changed > 0)
+        })
+    }
+
+    /// One message by id, if it is stored.
+    pub fn message(&self, id: MessageId) -> Result<Option<Message>, DbError> {
+        let found = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, author, timestamp, body, reply_to, state, conversation
+                 FROM messages WHERE id = ?1",
+                [id_bytes(&id)],
+                |r| Ok((row(r)?, r.get::<_, Vec<u8>>(6)?)),
+            )
+            .optional()
+        })?;
+        Ok(found.and_then(|(row, conversation)| {
+            let conversation =
+                EndpointId::from_bytes(&<[u8; 32]>::try_from(conversation).ok()?).ok()?;
+            decode(conversation, row)
+        }))
+    }
+
     /// The timestamp of this device's latest message in a conversation, if it has one.
     pub fn last_sent_timestamp(
         &self,
@@ -197,55 +268,16 @@ impl Database {
     /// Every message in a conversation, in conversation order.
     pub fn messages(&self, conversation: &EndpointId) -> Result<Vec<Message>, DbError> {
         let rows = self.with_conn(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT id, author, timestamp, body, reply_to, state FROM messages
-                 WHERE conversation = ?1",
-            )?;
+            let mut statement = conn.prepare(&format!("{SELECT} WHERE conversation = ?1"))?;
             let rows = statement
-                .query_map([conversation.as_bytes().as_slice()], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<Vec<u8>>>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
+                .query_map([conversation.as_bytes().as_slice()], row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })?;
-
-        let mut messages = Vec::with_capacity(rows.len());
-        for (id, author, timestamp, body, reply_to, state) in rows {
-            // A row that does not decode is skipped rather than failing the whole conversation.
-            let (Ok(id), Ok(author), Some(state)) = (
-                <MessageId>::try_from(id.as_slice()),
-                <[u8; 32]>::try_from(author.as_slice()),
-                DeliveryState::from_str(&state),
-            ) else {
-                continue;
-            };
-            let Ok(author) = EndpointId::from_bytes(&author) else {
-                continue;
-            };
-            let reply_to = match reply_to {
-                Some(bytes) => match <MessageId>::try_from(bytes.as_slice()) {
-                    Ok(bytes) => Some(bytes),
-                    Err(_) => continue,
-                },
-                None => None,
-            };
-            messages.push(Message {
-                id,
-                conversation: *conversation,
-                author,
-                timestamp,
-                body,
-                reply_to,
-                state,
-            });
-        }
+        let mut messages: Vec<Message> = rows
+            .into_iter()
+            .filter_map(|row| decode(*conversation, row))
+            .collect();
         order(&mut messages);
         Ok(messages)
     }

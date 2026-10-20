@@ -108,6 +108,36 @@ const MIGRATIONS: &[&str] = &[
         state        TEXT NOT NULL CHECK (state IN ('sending', 'delivered', 'failed'))
     );
     CREATE INDEX messages_by_conversation ON messages (conversation, timestamp, id);",
+    // Messages wait in the outbox until each device that must have them has stored them, and
+    // a message can be `sent`, which is written but not yet acknowledged. The table is rebuilt
+    // to allow the new state.
+    "CREATE TABLE outbox (
+        message      BLOB NOT NULL CHECK (length(message) = 16),
+        device       BLOB NOT NULL CHECK (length(device) = 32),
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_attempt INTEGER NOT NULL DEFAULT 0,
+        last_error   TEXT,
+        PRIMARY KEY (message, device)
+    );
+    CREATE INDEX outbox_by_device ON outbox (device, next_attempt);
+    CREATE TABLE device_addrs (
+        device BLOB PRIMARY KEY NOT NULL CHECK (length(device) = 32),
+        addr   BLOB NOT NULL
+    );
+    CREATE TABLE messages_rebuilt (
+        id           BLOB PRIMARY KEY NOT NULL CHECK (length(id) = 16),
+        conversation BLOB NOT NULL CHECK (length(conversation) = 32),
+        author       BLOB NOT NULL CHECK (length(author) = 32),
+        timestamp    INTEGER NOT NULL,
+        body         TEXT NOT NULL,
+        reply_to     BLOB CHECK (reply_to IS NULL OR length(reply_to) = 16),
+        state        TEXT NOT NULL CHECK (state IN ('sending', 'sent', 'delivered', 'failed'))
+    );
+    INSERT INTO messages_rebuilt SELECT id, conversation, author, timestamp, body, reply_to, state
+        FROM messages;
+    DROP TABLE messages;
+    ALTER TABLE messages_rebuilt RENAME TO messages;
+    CREATE INDEX messages_by_conversation ON messages (conversation, timestamp, id);",
 ];
 
 /// The schema version this build writes.

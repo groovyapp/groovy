@@ -119,8 +119,10 @@ A message to a trusted contact is sent as `Request::Message(WireMessage)` on a n
 
 The receiver stores the message, unless a message with that id is already stored, and answers `Reply::Stored`. A resent message is acknowledged again without a second event. A receiver that does not trust the sender, or that does not read the version, gives no answer, and the sender sees the message as failed.
 
-Each side keeps its copy with a delivery state: `sending`, `delivered` (acknowledged) or `failed`. Conversations are ordered by `(timestamp, id)`. A sender never stamps a message earlier than its previous message to the same contact. Clock skew moves a message's place but never loses or duplicates it.
+Each side keeps its copy with a delivery state: `sending` (queued, not yet written to a device), `sent` (written, not yet acknowledged), `delivered` (acknowledged by a device), or `failed` (no device took it within seven days). Conversations are ordered by `(timestamp, id)`. A sender never stamps a message earlier than its previous message to the same contact. Clock skew moves a message's place but never loses or duplicates it.
+
+A message is queued for each device that must have it: the contact's own endpoint, and each of the contact's linked devices that has not been revoked. A queued message is retried when the device connects to this node, at startup, and every minute as its retry time comes. Retries back off from 30 seconds to 15 minutes. A device is dialed at the address it last connected from, and by its id when none is known. The state becomes `delivered` as soon as any one device acknowledges it.
 
 ## Not yet specified
 
-Offline delivery (#42), groups (#43 to #44), attachments (#45), and search (#46) are not built. Each will get a section here when it is.
+Groups (#43 to #44), attachments (#45), and search (#46) are not built. Each will get a section here when it is.
