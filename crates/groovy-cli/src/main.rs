@@ -54,6 +54,13 @@ enum Command {
     },
     /// List contacts and how far they are trusted.
     Peers,
+    /// Finish the receives that were interrupted, such as by a crash or a closed app, and
+    /// wait until they have saved their files.
+    Resume {
+        /// The folder to save into. Defaults to the current folder.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -104,6 +111,51 @@ fn run(command: Command) -> Result<()> {
             node.revoke_share(shared.share.id).await?;
             println!("share stopped");
             stop(node);
+            Ok(())
+        }),
+        Command::Resume { out } => runtime.block_on(async {
+            let folder = match out {
+                Some(folder) => folder,
+                None => std::env::current_dir().context("failed to read the current folder")?,
+            };
+            let (node, mut events) = setup.start_node(Some(folder)).await?;
+            // Receives picked up at startup finish on their own. Report where each one starts
+            // from, then wait until none is unfinished.
+            for t in node.transfers() {
+                if t.direction == groovy_core::transfers::Direction::Receive
+                    && t.state.is_unfinished()
+                {
+                    println!("transfer {} starts with {} of {} bytes", t.id, t.done, t.offer.bytes);
+                }
+            }
+            loop {
+                let unfinished = node.transfers().iter().any(|t| {
+                    t.direction == groovy_core::transfers::Direction::Receive
+                        && matches!(
+                            t.state,
+                            groovy_core::transfers::TransferState::Queued
+                                | groovy_core::transfers::TransferState::Active
+                        )
+                });
+                if !unfinished {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
+                    Ok(Some(NodeEvent::FileReceived { saved, fetched, .. })) => {
+                        println!("fetched {fetched} bytes this time");
+                        for path in saved {
+                            println!("saved {}", path.display());
+                        }
+                    }
+                    Ok(Some(NodeEvent::ReceiveFailed { error, .. })) => {
+                        bail!("a receive failed: {error}");
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => bail!("the node stopped"),
+                }
+            }
+            stop(node);
+            println!("no receives are left to finish");
             Ok(())
         }),
         Command::Receive { ticket, out } => runtime.block_on(async {

@@ -60,4 +60,13 @@ The same check can interrupt by stopping the node and starting it again, which i
 
 Result with a restart on the same machine: stopped with 1,283 MiB of 5,120 MiB received. After the restart the receive fetched 3,837 MiB, which is what was missing. The file arrived intact.
 
-Neither covers a crash of the process or a dropped network connection. Those are not covered by this check yet.
+### A crash (SIGKILL)
+
+`scripts/crash-check.sh` shares a file between two data directories, kills the receiver with SIGKILL six seconds in, resumes it in a new process with `groovy-cli resume`, and checks the saved file against the source.
+
+- **1 GiB:** passes. The resume started from 215,466,070 bytes and fetched 855,605,248 of the 858,275,754 missing, and the file matches.
+- **5 GiB:** fails, twice. The receive is recorded as failed with `the blob store failed: encode error`, and no file is saved. The partial download cannot be exported after the kill. A graceful stop at 5 GiB does not cause this, so it appears specific to an unclean stop. Retrying does not help, because the damaged partial stays in the store, and this code has no public way to remove it.
+
+So the crash case at full size is **not** met. The file is never saved damaged. The fault lies in the blob store's recovery after an unclean stop, or in how this code relies on it, and it needs investigating before alpha.
+
+The check does not cover a dropped network connection.
