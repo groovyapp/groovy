@@ -62,3 +62,19 @@ These are the owner's to answer. The recommendations above assume the answers sh
 - #35 builds the replica and the folder entries, following the rules above.
 - #38 turns on garbage collection and quotas, once folders hold tags.
 - #39 evaluates encryption at rest, which this document defers.
+
+## Replica health
+
+Each device in a shared folder writes a small `replica:<device id>` record into the folder:
+how many files it had, how many were complete in its blob store, whether it keeps a full copy,
+and when it last checked. The records sync like any entry, so every member sees how many
+complete copies exist. A device checks its copy every minute, and writes a new record only
+when the result changed or the last one is ten minutes old.
+
+The check compares each file with the blob store: complete, at the size the folder lists. It
+does not re-read the bytes.
+
+"Keep a full copy here" is a per-device setting. A device that does not keep a folder follows
+the file list and the records, fetches no file, and lets collection free the ones it has. It
+is not counted as a copy. A device that is offline is counted by its last report, which the
+folder shows with its age.

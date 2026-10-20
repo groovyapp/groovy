@@ -2272,3 +2272,131 @@ async fn a_link_ticket_works_once_and_only_with_its_secret() {
     assert!(phone.shutdown(TIMEOUT));
     assert!(tablet.shutdown(TIMEOUT));
 }
+
+/// Waits until a node's health report for a folder satisfies `check`.
+async fn wait_for_health(
+    node: &NodeHandle,
+    namespace: iroh_docs::NamespaceId,
+    what: &str,
+    check: impl Fn(&groovy_core::replicas::ReplicaHealth) -> bool,
+) -> groovy_core::replicas::ReplicaHealth {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let health = node
+                .folder_health(namespace)
+                .await
+                .expect("the health can be read");
+            if check(&health) {
+                return health;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the folder health never {what}"))
+}
+
+#[tokio::test]
+async fn a_folder_shows_how_many_devices_hold_a_complete_copy() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+
+    let folder = alice.create_folder("photos".into(), None).await.unwrap();
+    let source = tmp.path().join("a.txt");
+    std::fs::write(&source, b"alpha").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "a.txt".into(), source)
+        .await
+        .unwrap();
+    let health = alice.folder_health(folder.namespace).await.unwrap();
+    assert_eq!(health.copies, 1, "only alice has it yet");
+    assert!(health.devices[0].you && health.devices[0].complete());
+
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+    bob.join_folder(ticket, None).await.unwrap();
+
+    // Once bob has the file, he reports a complete copy, and both devices see two.
+    wait_for_health(&bob, folder.namespace, "showed bob's copy complete", |h| {
+        h.devices[0].complete()
+    })
+    .await;
+    bob.verify_folder(folder.namespace).await.unwrap();
+    alice.verify_folder(folder.namespace).await.unwrap();
+    let seen_by_alice = wait_for_health(&alice, folder.namespace, "showed two copies", |h| {
+        h.copies == 2
+    })
+    .await;
+    assert_eq!(seen_by_alice.devices.len(), 2);
+    let bobs = seen_by_alice
+        .devices
+        .iter()
+        .find(|info| info.device == bob_key.public())
+        .expect("alice knows bob's copy");
+    assert!(bobs.complete() && bobs.verified > 0 && !bobs.you);
+    wait_for_health(&bob, folder.namespace, "showed two copies to bob", |h| {
+        h.copies == 2
+    })
+    .await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_device_that_does_not_keep_a_folder_fetches_no_files_and_is_not_counted() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+
+    let folder = alice.create_folder("photos".into(), None).await.unwrap();
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+    bob.join_folder(ticket, None).await.unwrap();
+    bob.set_keep_copy(folder.namespace, false).await.unwrap();
+
+    let source = tmp.path().join("a.txt");
+    std::fs::write(&source, b"alpha").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "a.txt".into(), source)
+        .await
+        .unwrap();
+    // Bob learns of the file, and does not fetch it.
+    wait_for_folder(&bob, folder.namespace, "listed the file", |e| e.len() == 1).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let health = bob.folder_health(folder.namespace).await.unwrap();
+    let own = &health.devices[0];
+    assert!(!own.keeps_copy && own.files == 1 && own.held == 0);
+    assert_eq!(
+        health.copies, 0,
+        "bob has nothing, and alice has not reported to him"
+    );
+
+    // Alice's copy is the one copy, and bob's choice shows to her.
+    bob.verify_folder(folder.namespace).await.unwrap();
+    alice.verify_folder(folder.namespace).await.unwrap();
+    let health = wait_for_health(&alice, folder.namespace, "showed bob's report", |h| {
+        h.devices.len() == 2
+    })
+    .await;
+    assert_eq!(health.copies, 1);
+    assert!(!health.devices[1].keeps_copy);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

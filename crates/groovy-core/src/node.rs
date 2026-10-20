@@ -53,6 +53,7 @@ use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
+use crate::replicas::{self, ReplicaHealth, ReplicaInfo};
 use crate::shares::Share;
 use crate::storage::StorageUsage;
 use crate::transfers::{Direction, Transfer, TransferState};
@@ -313,6 +314,12 @@ enum Command {
         oneshot::Sender<Result<FolderStatus, NodeError>>,
     ),
     RenameFolder(NamespaceId, String, oneshot::Sender<Result<(), NodeError>>),
+    FolderHealth(
+        NamespaceId,
+        oneshot::Sender<Result<ReplicaHealth, NodeError>>,
+    ),
+    VerifyFolder(NamespaceId, oneshot::Sender<Result<ReplicaInfo, NodeError>>),
+    SetKeepCopy(NamespaceId, bool, oneshot::Sender<Result<(), NodeError>>),
     DeleteTransfer(i64, oneshot::Sender<Result<(), NodeError>>),
     ClearCache(oneshot::Sender<Result<(), NodeError>>),
     StorageUsage(oneshot::Sender<Result<StorageUsage, NodeError>>),
@@ -585,8 +592,17 @@ async fn run(
                         store: store.clone(),
                         database: database.clone(),
                         live: folder_live.clone(),
+                        me: endpoint.id(),
                         tasks: Arc::new(Mutex::new(HashMap::new())),
                     };
+                    let verifying = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(VERIFY_DELAY).await;
+                        loop {
+                            verifying.verify_all().await;
+                            tokio::time::sleep(VERIFY_INTERVAL).await;
+                        }
+                    });
                     if config.garbage_interval.is_some() {
                         let refreshing = state.clone();
                         let live = folder_live.clone();
@@ -975,6 +991,36 @@ async fn run(
                         let _ = reply.send(outcome);
                     });
                 }
+                Some(Command::FolderHealth(namespace, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => state.health(namespace).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::VerifyFolder(namespace, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => state.verify(namespace, true).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::SetKeepCopy(namespace, keep, reply)) => {
+                    let folders = folders.clone();
+                    tokio::spawn(async move {
+                        let outcome = match folder_state(&folders) {
+                            Ok(state) => state.set_keep_copy(namespace, keep).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(outcome);
+                    });
+                }
                 Some(Command::RenameFolder(namespace, name, reply)) => {
                     let outcome = match folder_state(&folders) {
                         Ok(state) => state
@@ -1236,6 +1282,8 @@ struct FolderState {
     store: FsStore,
     database: Arc<Database>,
     live: Protected,
+    /// This device, which names its copy in the folder's replica reports.
+    me: EndpointId,
     /// The sync task of each folder this device saves, so leaving a folder can stop it.
     tasks: Arc<Mutex<HashMap<NamespaceId, tokio::task::AbortHandle>>>,
 }
@@ -1243,7 +1291,7 @@ struct FolderState {
 impl FolderState {
     /// Starts keeping a folder's directory in step with it, if this device saves it.
     fn sync(&self, folder: &Folder) {
-        if let Some(dir) = &folder.path {
+        if let Some(dir) = folder.path.as_ref().filter(|_| folder.keep_copy) {
             let task = folder_sync::spawn(
                 self.docs.clone(),
                 std::ops::Deref::deref(&self.store).clone(),
@@ -1262,6 +1310,85 @@ impl FolderState {
         }
     }
 }
+
+impl FolderState {
+    fn keeps(&self, namespace: NamespaceId) -> Result<bool, NodeError> {
+        match self.database.folder(namespace) {
+            Ok(Some(folder)) => Ok(folder.keep_copy),
+            Ok(None) => Err(NodeError::Folder(
+                "there is no folder with that id".to_owned(),
+            )),
+            Err(error) => Err(NodeError::Folder(error.to_string())),
+        }
+    }
+
+    async fn health(&self, namespace: NamespaceId) -> Result<ReplicaHealth, NodeError> {
+        let keeps = self.keeps(namespace)?;
+        replicas::health(
+            &self.docs,
+            std::ops::Deref::deref(&self.store),
+            namespace,
+            self.me,
+            keeps,
+            contacts::now(),
+        )
+        .await
+        .map_err(folder_error)
+    }
+
+    /// Checks this device's copy of a folder and records the result for the other members.
+    async fn verify(&self, namespace: NamespaceId, force: bool) -> Result<ReplicaInfo, NodeError> {
+        let keeps = self.keeps(namespace)?;
+        replicas::verify(
+            &self.docs,
+            std::ops::Deref::deref(&self.store),
+            namespace,
+            self.me,
+            keeps,
+            contacts::now(),
+            force,
+        )
+        .await
+        .map_err(folder_error)
+    }
+
+    async fn verify_all(&self) {
+        let Ok(folders) = self.database.folders() else {
+            return;
+        };
+        for folder in folders {
+            if let Err(error) = self.verify(folder.namespace, false).await {
+                warn!(%error, "could not check a shared folder's copy");
+            }
+        }
+    }
+
+    /// Changes whether this device keeps a full copy of a folder, and starts or stops saving
+    /// its files to the directory accordingly.
+    async fn set_keep_copy(&self, namespace: NamespaceId, keep: bool) -> Result<(), NodeError> {
+        replicas::set_keep_copy(&self.docs, &self.database, namespace, keep)
+            .await
+            .map_err(folder_error)?;
+        if keep {
+            if let Ok(Some(folder)) = self.database.folder(namespace) {
+                self.sync(&folder);
+            }
+        } else if let Some(task) = self
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&namespace)
+        {
+            task.abort();
+        }
+        Ok(())
+    }
+}
+
+/// How long after start the first check of the shared folders waits, and how often they are
+/// checked after that.
+const VERIFY_DELAY: Duration = Duration::from_secs(5);
+const VERIFY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The folder state, or the error to report when shared folders are not available.
 fn folder_state(folders: &Option<FolderState>) -> Result<FolderState, NodeError> {
@@ -1301,8 +1428,15 @@ async fn refresh_folder_live(state: &FolderState, live: &Protected) {
     };
     let mut hashes = HashSet::new();
     for folder in folders {
-        if let Ok(entries) = folders::entries(&state.docs, folder.namespace).await {
+        // A device that does not keep a folder lets its files go. The folder's own records
+        // are small, and always kept.
+        if folder.keep_copy
+            && let Ok(entries) = folders::entries(&state.docs, folder.namespace).await
+        {
             hashes.extend(entries.iter().map(|entry| entry.hash));
+        }
+        if let Ok(records) = replicas::record_hashes(&state.docs, folder.namespace).await {
+            hashes.extend(records);
         }
     }
     *lock_live(live) = hashes;
@@ -2811,6 +2945,38 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::FolderStatus(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// How many devices hold a complete copy of a folder, and what each has. This device is
+    /// read now; the others are as they last reported.
+    pub async fn folder_health(&self, namespace: NamespaceId) -> Result<ReplicaHealth, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::FolderHealth(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Checks this device's copy of a folder now, and tells the other members the result.
+    pub async fn verify_folder(&self, namespace: NamespaceId) -> Result<ReplicaInfo, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::VerifyFolder(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Sets whether this device keeps a full copy of a folder. A device that does not keep it
+    /// follows the list of files and fetches none of them.
+    pub async fn set_keep_copy(&self, namespace: NamespaceId, keep: bool) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SetKeepCopy(namespace, keep, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?
