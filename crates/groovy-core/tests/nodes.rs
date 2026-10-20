@@ -1879,3 +1879,91 @@ async fn a_send_cannot_be_paused() {
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn an_accepted_send_can_be_paused_and_resumed_by_its_sender() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key.clone()).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    let offer = next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+    next_file_received(&mut bob_events).await;
+
+    let transfer = sends_of(&alice)[0].id;
+    let dialer = dialer_with(bob_key).await;
+    let fetch = |dialer: Endpoint, addr: EndpointAddr, root| async move {
+        let connection = dialer.connect(addr, iroh_blobs::ALPN).await.unwrap();
+        iroh_blobs::get::request::get_blob(connection, root)
+            .await
+            .is_ok()
+    };
+
+    alice
+        .pause_transfer(transfer)
+        .await
+        .expect("the accepted send pauses");
+    assert_eq!(
+        sends_of(&alice)[0].state,
+        groovy_core::transfers::TransferState::Paused
+    );
+    assert!(
+        !fetch(dialer.clone(), alice.addr().await.unwrap(), offer.root).await,
+        "a paused send was served"
+    );
+
+    alice
+        .resume_transfer(transfer)
+        .await
+        .expect("the send resumes");
+    assert_eq!(
+        sends_of(&alice)[0].state,
+        groovy_core::transfers::TransferState::Completed
+    );
+    assert!(
+        fetch(dialer.clone(), alice.addr().await.unwrap(), offer.root).await,
+        "a resumed send was not served"
+    );
+
+    dialer.close().await;
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_send_still_waiting_for_an_answer_cannot_be_paused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+    let transfer = sends_of(&alice)[0].id;
+    assert!(matches!(
+        alice.pause_transfer(transfer).await,
+        Err(groovy_core::NodeError::WrongTransferState(_))
+    ));
+    alice.cancel_transfer(transfer).await.unwrap();
+    send.abort();
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

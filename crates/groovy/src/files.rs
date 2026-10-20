@@ -428,14 +428,15 @@ impl Render for FilesView {
                 };
 
                 let mut controls = div().flex().flex_row().gap_2();
-                // A send cannot be paused or resumed. It can be cancelled while it waits, or after
-                // it is accepted, which stops the peer getting the files.
+                // A send can be paused once accepted, which holds its files back from the peer. It
+                // cannot be paused while it waits for the answer.
                 let receiving = transfer.direction == Direction::Receive;
-                if receiving
+                if (receiving
                     && matches!(
                         transfer.state,
                         TransferState::Queued | TransferState::Active
-                    )
+                    ))
+                    || (!receiving && transfer.state == TransferState::Completed)
                 {
                     controls = controls.child(
                         Button::new(format!("transfer-pause-{id}"), "Pause")
@@ -443,11 +444,12 @@ impl Render for FilesView {
                             .on_click(move |_, cx| control(cx, id, Control::Pause)),
                     );
                 }
-                if receiving
+                if (receiving
                     && matches!(
                         transfer.state,
                         TransferState::Paused | TransferState::Failed(_)
-                    )
+                    ))
+                    || (!receiving && transfer.state == TransferState::Paused)
                 {
                     controls = controls.child(
                         Button::new(format!("transfer-resume-{id}"), "Resume")
