@@ -6,6 +6,7 @@ mod data;
 mod devices;
 mod files;
 mod folders;
+mod messages;
 mod node;
 mod onboarding;
 mod peers;
