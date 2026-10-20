@@ -49,8 +49,11 @@ use crate::folders::{
     self, ExportReport, Folder, FolderAccess, FolderEntry, FolderStatus, Protected,
 };
 use crate::gated::TrustedOnly;
-use crate::groups::{self, GroupEnvelope, GroupId, GroupMessage, GroupPage, GroupTicket};
+use crate::groups::{
+    self, GroupDetails, GroupEnvelope, GroupId, GroupMessage, GroupPage, GroupRow, GroupTicket,
+};
 use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
+use crate::membership::{self, Change, KeyRecord, Members, Record, Role, record_key};
 use crate::messages::{self, DeliveryState, MESSAGE_VERSION, Message, MessageId};
 use crate::outbox::{Outbox, Trigger};
 use crate::pairing::{RateLimiter, verification_code};
@@ -62,6 +65,8 @@ use crate::storage::StorageUsage;
 use crate::transfers::{Direction, Transfer, TransferState};
 use crate::user::{DeviceCert, Revocation, UserClaim, UserDevice, UserKeyStore};
 use iroh::address_lookup::MemoryLookup;
+use iroh_docs::DocTicket;
+use iroh_docs::store::Query;
 use iroh_gossip::api::{Event as GossipEvent, GossipSender};
 use iroh_gossip::proto::TopicId;
 
@@ -344,6 +349,16 @@ enum Command {
         oneshot::Sender<Result<Vec<GroupMessage>, NodeError>>,
     ),
     Groups(oneshot::Sender<Result<Vec<groups::GroupInfo>, NodeError>>),
+    GroupDetailsFor(GroupId, oneshot::Sender<Result<GroupDetails, NodeError>>),
+    RemoveGroupMember(GroupId, EndpointId, oneshot::Sender<Result<(), NodeError>>),
+    SetGroupRole(
+        GroupId,
+        EndpointId,
+        Option<Role>,
+        oneshot::Sender<Result<(), NodeError>>,
+    ),
+    RenameGroup(GroupId, String, oneshot::Sender<Result<(), NodeError>>),
+    GroupRequest(EndpointId, Request, oneshot::Sender<GroupAnswer>),
     FolderStatus(
         NamespaceId,
         oneshot::Sender<Result<FolderStatus, NodeError>>,
@@ -593,7 +608,30 @@ async fn run(
             directory.add_endpoint_info(addr);
         }
     }
+    // The replicas that shared folders and group membership keep, beside the blobs.
+    let docs = match (&blobs, &config.blobs, &gossip) {
+        (Some(store), Some(blobs_dir), Some(gossip)) => {
+            let docs_dir = blobs_dir.parent().unwrap_or(blobs_dir).join("docs");
+            if let Err(error) = std::fs::create_dir_all(&docs_dir) {
+                warn!(%error, "shared folders are not available");
+            }
+            let blob_api: iroh_blobs::api::Store = std::ops::Deref::deref(store).clone();
+            match Docs::persistent(docs_dir)
+                .spawn(endpoint.clone(), blob_api, gossip.clone())
+                .await
+            {
+                Ok(docs) => Some(docs),
+                Err(error) => {
+                    warn!(%error, "shared folders are not available");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let receiving = Receiving {
+        docs: docs.clone(),
+        topics: Arc::new(Mutex::new(HashMap::new())),
         gossip: gossip.clone(),
         groups: Arc::new(Mutex::new(HashMap::new())),
         secret: config.secret_key.clone(),
@@ -642,60 +680,46 @@ async fn run(
     if let Some(gossip) = &gossip {
         router = router.accept(GOSSIP_ALPN, TrustedOnly::new(gossip.clone(), gate.clone()));
     }
-    // Shared folders keep their replicas beside the blobs, and need both to work.
-    let folders = match (&blobs, &config.blobs, &config.database, &gossip) {
-        (Some(store), Some(blobs_dir), Some(database), Some(gossip)) => {
-            let docs_dir = blobs_dir.parent().unwrap_or(blobs_dir).join("docs");
-            if let Err(error) = std::fs::create_dir_all(&docs_dir) {
-                warn!(%error, "shared folders are not available");
-            }
-            let blob_api: iroh_blobs::api::Store = std::ops::Deref::deref(store).clone();
-            match Docs::persistent(docs_dir)
-                .spawn(endpoint.clone(), blob_api, gossip.clone())
-                .await
-            {
-                Ok(docs) => {
-                    let state = FolderState {
-                        docs: docs.clone(),
-                        store: store.clone(),
-                        database: database.clone(),
-                        live: folder_live.clone(),
-                        me: endpoint.id(),
-                        tasks: Arc::new(Mutex::new(HashMap::new())),
-                    };
-                    let verifying = state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(VERIFY_DELAY).await;
-                        loop {
-                            verifying.verify_all().await;
-                            tokio::time::sleep(VERIFY_INTERVAL).await;
-                        }
-                    });
-                    if config.garbage_interval.is_some() {
-                        let refreshing = state.clone();
-                        let live = folder_live.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                refresh_folder_live(&refreshing, &live).await;
-                                tokio::time::sleep(FOLDER_REFRESH).await;
-                            }
-                        });
-                    }
-                    match database.folders() {
-                        Ok(saved) => saved.iter().for_each(|folder| state.sync(folder)),
-                        Err(error) => warn!(%error, "could not read the shared folders"),
-                    }
-                    router = router.accept(
-                        iroh_docs::ALPN,
-                        TrustedOnly::new(docs.clone(), gate.clone()),
-                    );
-                    Some(state)
+    if let Some(docs) = &docs {
+        router = router.accept(
+            iroh_docs::ALPN,
+            TrustedOnly::new(docs.clone(), gate.clone()),
+        );
+    }
+    // Shared folders keep their membership documents here, beside the blobs.
+    let folders = match (&blobs, &docs, &config.database) {
+        (Some(store), Some(docs), Some(database)) => {
+            let state = FolderState {
+                docs: docs.clone(),
+                store: store.clone(),
+                database: database.clone(),
+                live: folder_live.clone(),
+                me: endpoint.id(),
+                tasks: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let verifying = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(VERIFY_DELAY).await;
+                loop {
+                    verifying.verify_all().await;
+                    tokio::time::sleep(VERIFY_INTERVAL).await;
                 }
-                Err(error) => {
-                    warn!(%error, "shared folders are not available");
-                    None
-                }
+            });
+            if config.garbage_interval.is_some() {
+                let refreshing = state.clone();
+                let live = folder_live.clone();
+                tokio::spawn(async move {
+                    loop {
+                        refresh_folder_live(&refreshing, &live).await;
+                        tokio::time::sleep(FOLDER_REFRESH).await;
+                    }
+                });
             }
+            match database.folders() {
+                Ok(saved) => saved.iter().for_each(|folder| state.sync(folder)),
+                Err(error) => warn!(%error, "could not read the shared folders"),
+            }
+            Some(state)
         }
         _ => None,
     };
@@ -1053,8 +1077,46 @@ async fn run(
                     });
                 }
                 Some(Command::CreateGroup(name, reply)) => {
-                    let outcome = create_group(&receiving, &name);
-                    let _ = reply.send(outcome);
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = create_group(&receiving, &name).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::GroupDetailsFor(group, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = group_details(&receiving, group).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::RemoveGroupMember(group, member, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = remove_member(&receiving, group, member).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::SetGroupRole(group, member, role, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = set_role(&receiving, group, member, role).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::RenameGroup(group, name, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = rename_group(&receiving, group, &name).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::GroupRequest(peer, request, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let answer = answer_group(&receiving, peer, request).await;
+                        let _ = reply.send(answer);
+                    });
                 }
                 Some(Command::JoinGroup(ticket, reply)) => {
                     let receiving = receiving.clone();
@@ -1064,7 +1126,11 @@ async fn run(
                     });
                 }
                 Some(Command::GroupTicketFor(group, reply)) => {
-                    let _ = reply.send(group_ticket(&receiving, group));
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = group_ticket(&receiving, group).await;
+                        let _ = reply.send(outcome);
+                    });
                 }
                 Some(Command::SendGroupMessage(group, body, reply_to, reply)) => {
                     let _ = reply.send(send_group_message(&receiving, group, body, reply_to));
@@ -1591,6 +1657,10 @@ struct Receiving {
     secret: SecretKey,
     /// Addresses of other devices, so they can be dialed by id.
     directory: MemoryLookup,
+    /// The document service, which holds each group's membership.
+    docs: Option<Docs>,
+    /// The task running each group's current topic.
+    topics: GroupTasks,
 }
 
 /// What a send's offer carries before its files are imported.
@@ -1658,11 +1728,7 @@ async fn send_message(
     Ok(message)
 }
 
-/// The senders of the groups this node is running, so a message can be sent to a group's topic.
-type GroupSenders = Arc<Mutex<HashMap<GroupId, GossipSender>>>;
-
-/// Starts the gossip topic of each group this device is in. Each one joins with the members it
-/// knows, and fetches what it missed from them once they are connected.
+/// Starts the topic of each group this device is in, with the key each is at.
 fn spawn_groups(receiving: &Receiving) {
     let Some(database) = receiving.database.clone() else {
         return;
@@ -1674,92 +1740,305 @@ fn spawn_groups(receiving: &Receiving) {
             return;
         }
     };
-    let own = receiving.endpoint.id();
     for group in groups {
-        let members: Vec<EndpointId> = database
-            .group_members(&group.id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|member| *member != own)
-            .collect();
-        tokio::spawn(run_group(receiving.clone(), group.id, members));
+        if let Err(error) = start_topic(receiving, group.id) {
+            warn!(%error, "a group could not be started");
+        }
     }
 }
 
-/// Makes a new group, and returns its id. Its ticket is what others join with.
-fn create_group(receiving: &Receiving, name: &str) -> Result<GroupId, NodeError> {
-    let database = group_database(receiving)?;
+/// Renames a group, as an admin.
+async fn rename_group(receiving: &Receiving, group: GroupId, name: &str) -> Result<(), NodeError> {
+    let row = row_of(receiving, &group)?;
+    let own = receiving.endpoint.id();
     let name = name.trim();
     if name.is_empty() {
         return Err(NodeError::Group("a group needs a name".to_owned()));
     }
+    if !members_of(receiving, &row).await?.is_admin(&own) {
+        return Err(NodeError::Group(
+            "only an admin can rename the group".to_owned(),
+        ));
+    }
+    write_record(
+        receiving,
+        row.doc,
+        &membership::sign_record(
+            &receiving.secret,
+            group,
+            Change::Name(name.to_owned()),
+            messages::now_millis(),
+        ),
+    )
+    .await?;
+    group_database(receiving)?
+        .set_group_name(&group, name)
+        .map_err(group_error)
+}
+
+/// The senders of the groups' current topics, so a message can be sent to a group.
+type GroupSenders = Arc<Mutex<HashMap<GroupId, GossipSender>>>;
+
+/// The task running each group's current topic, so it can be replaced when the key changes.
+type GroupTasks = Arc<Mutex<HashMap<GroupId, tokio::task::AbortHandle>>>;
+
+/// How long a joiner waits for the admin who admitted it to show up as an admin in its own copy
+/// of the membership document, before it gives up on that admin's key.
+const ADMIN_WAIT: Duration = Duration::from_secs(15);
+
+/// What a member answers a group request with.
+enum GroupAnswer {
+    Page(GroupPage),
+    Key(Option<KeyRecord>),
+    Stored,
+    Refused,
+}
+
+/// The membership document of a group this device is in.
+fn docs_of(receiving: &Receiving) -> Result<Docs, NodeError> {
+    receiving
+        .docs
+        .clone()
+        .ok_or_else(|| NodeError::Group("group chat needs the document service".to_owned()))
+}
+
+/// Reads every membership record in a group's document. Records whose content has not arrived
+/// yet are left out until it does.
+async fn read_records(
+    receiving: &Receiving,
+    namespace: NamespaceId,
+) -> Result<Vec<Record>, NodeError> {
+    let docs = docs_of(receiving)?;
+    let store = receiving
+        .store
+        .clone()
+        .ok_or_else(|| NodeError::Group("group chat needs blob storage".to_owned()))?;
+    let blobs: &iroh_blobs::api::Store = std::ops::Deref::deref(&store);
+    let doc = docs
+        .open(namespace)
+        .await
+        .map_err(group_error)?
+        .ok_or_else(|| NodeError::Group("the group's document is missing".to_owned()))?;
+    let mut stream = Box::pin(doc.get_many(Query::all()).await.map_err(group_error)?);
+    let mut records = Vec::new();
+    while let Some(entry) = stream.next().await {
+        let entry = entry.map_err(group_error)?;
+        if !entry.key().starts_with(b"record/") {
+            continue;
+        }
+        let Ok(bytes) = blobs.blobs().get_bytes(entry.content_hash()).await else {
+            continue;
+        };
+        if let Ok(record) = postcard::from_bytes::<Record>(&bytes) {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+/// Writes a membership record into a group's document.
+async fn write_record(
+    receiving: &Receiving,
+    namespace: NamespaceId,
+    record: &Record,
+) -> Result<(), NodeError> {
+    let docs = docs_of(receiving)?;
+    let doc = docs
+        .open(namespace)
+        .await
+        .map_err(group_error)?
+        .ok_or_else(|| NodeError::Group("the group's document is missing".to_owned()))?;
+    let author = docs.author_default().await.map_err(group_error)?;
+    let bytes = postcard::to_stdvec(record).map_err(group_error)?;
+    doc.set_bytes(author, record_key(record).into_bytes(), bytes)
+        .await
+        .map_err(group_error)?;
+    Ok(())
+}
+
+/// Who is in a group, as its document says now.
+async fn members_of(receiving: &Receiving, row: &GroupRow) -> Result<Members, NodeError> {
+    let records = read_records(receiving, row.doc).await?;
+    Ok(Members::replay(row.id, row.founder, &records))
+}
+
+fn row_of(receiving: &Receiving, group: &GroupId) -> Result<GroupRow, NodeError> {
+    group_database(receiving)?
+        .group_row(group)
+        .map_err(group_error)?
+        .ok_or_else(|| NodeError::Group("there is no group with that id".to_owned()))
+}
+
+/// Runs a group's current topic, replacing whatever topic it was on. The key a group is at
+/// decides the topic, so this is called whenever the key changes.
+fn start_topic(receiving: &Receiving, group: GroupId) -> Result<(), NodeError> {
+    let row = row_of(receiving, &group)?;
+    let database = group_database(receiving)?;
+    let own = receiving.endpoint.id();
+    let members = database
+        .group_members(&group)
+        .map_err(group_error)?
+        .into_iter()
+        .filter(|member| *member != own)
+        .collect();
+    // The old topic's sender goes first, so nothing is sent on it once the key has changed.
+    receiving
+        .groups
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&group);
+    let task = tokio::spawn(run_group(
+        receiving.clone(),
+        group,
+        membership::topic_of(&row.key.key),
+        members,
+    ));
+    let previous = receiving
+        .topics
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(group, task.abort_handle());
+    if let Some(previous) = previous {
+        previous.abort();
+    }
+    Ok(())
+}
+
+/// Makes a new group, with this device as its founder and an admin. Returns its id.
+async fn create_group(receiving: &Receiving, name: &str) -> Result<GroupId, NodeError> {
+    let database = group_database(receiving)?;
+    let docs = docs_of(receiving)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(NodeError::Group("a group needs a name".to_owned()));
+    }
+    let secret = &receiving.secret;
+    let own = secret.public();
     let group = groups::new_group_id();
+    let namespace = docs.create().await.map_err(group_error)?.id();
+    let now = messages::now_millis();
+    let key = membership::sign_key(secret, group, 0, membership::new_key(), now);
     database
-        .create_group(group, name, messages::now_millis() / 1000)
+        .insert_group(&GroupRow {
+            id: group,
+            name: name.to_owned(),
+            created: now / 1000,
+            founder: own,
+            doc: namespace,
+            key,
+        })
         .map_err(group_error)?;
     database
-        .add_group_member(group, &receiving.endpoint.id())
+        .add_group_member(group, &own)
         .map_err(group_error)?;
-    tokio::spawn(run_group(receiving.clone(), group, Vec::new()));
+    write_record(
+        receiving,
+        namespace,
+        &membership::sign_record(secret, group, Change::Name(name.to_owned()), now),
+    )
+    .await?;
+    write_record(
+        receiving,
+        namespace,
+        &membership::sign_record(
+            secret,
+            group,
+            Change::Role {
+                member: own,
+                role: Some(Role::Admin),
+            },
+            now,
+        ),
+    )
+    .await?;
+    start_topic(receiving, group)?;
     Ok(group)
 }
 
-/// Joins a group from its ticket. The group's messages are fetched from the members named in
-/// the ticket, when they can be reached.
+/// Joins a group from its ticket. The admin it reaches admits this device as a member, and gives
+/// it the group's key. Then it fetches the group's messages from the members it can reach.
 async fn join_group(receiving: &Receiving, text: &str) -> Result<GroupId, NodeError> {
     let database = group_database(receiving)?;
+    let docs = docs_of(receiving)?;
     let ticket = GroupTicket::parse(text).map_err(group_error)?;
     let group = ticket.group;
-    if database.is_in_group(&group).map_err(group_error)? {
+    if database.group_row(&group).map_err(group_error)?.is_some() {
         return Ok(group);
     }
+    let own = receiving.endpoint.id();
+    let doc_ticket: DocTicket = ticket.doc.trim().parse().map_err(group_error)?;
+    let namespace = docs.import(doc_ticket).await.map_err(group_error)?.id();
     database
-        .create_group(group, "Group", messages::now_millis() / 1000)
+        .insert_group(&GroupRow {
+            id: group,
+            name: "Group".to_owned(),
+            created: messages::now_millis() / 1000,
+            founder: ticket.founder,
+            doc: namespace,
+            key: ticket.key.clone(),
+        })
         .map_err(group_error)?;
     database
-        .add_group_member(group, &receiving.endpoint.id())
+        .add_group_member(group, &own)
         .map_err(group_error)?;
-    let mut bootstrap = Vec::new();
-    for peer in &ticket.peers {
+    let peers: Vec<EndpointAddr> = ticket
+        .peers
+        .iter()
+        .filter(|peer| peer.id != own)
+        .cloned()
+        .collect();
+    for peer in &peers {
         remember_peer(receiving, peer);
         database
             .add_group_member(group, &peer.id)
             .map_err(group_error)?;
-        bootstrap.push(peer.id);
     }
-    tokio::spawn(run_group(receiving.clone(), group, bootstrap));
-    // Ask the first member that answers for the messages so far.
-    for peer in &ticket.peers {
-        if peer.id != receiving.endpoint.id()
-            && fetch_history(receiving, group, peer.id).await.is_ok()
-        {
+    start_topic(receiving, group)?;
+    // The first admin that admits us gives the key, which may be newer than the ticket's.
+    for peer in &peers {
+        if let Ok(Some(record)) = ask_key(receiving, group, peer.id, true).await {
+            accept_key(receiving, group, record, true).await.ok();
+            break;
+        }
+    }
+    for peer in &peers {
+        if fetch_history(receiving, group, peer.id).await.is_ok() {
             break;
         }
     }
     Ok(group)
 }
 
-/// The ticket that invites someone to a group: the group, and this device and the other members
-/// it has addresses for.
-fn group_ticket(receiving: &Receiving, group: GroupId) -> Result<String, NodeError> {
-    let database = group_database(receiving)?;
-    if !database.is_in_group(&group).map_err(group_error)? {
+/// The ticket that invites someone to a group. Only a member can give one.
+async fn group_ticket(receiving: &Receiving, group: GroupId) -> Result<String, NodeError> {
+    let row = row_of(receiving, &group)?;
+    let own = receiving.endpoint.id();
+    let members = members_of(receiving, &row).await?;
+    if !members.is_member(&own) {
         return Err(NodeError::Group(
-            "there is no group with that id".to_owned(),
+            "only a member can invite others".to_owned(),
         ));
     }
-    let own = receiving.endpoint.id();
+    let docs = docs_of(receiving)?;
+    let doc = folders::ticket(&docs, row.doc, folders::FolderAccess::Write)
+        .await
+        .map_err(group_error)?;
+    let database = group_database(receiving)?;
     let mut peers = vec![receiving.endpoint.addr()];
-    for member in database.group_members(&group).map_err(group_error)? {
-        if member == own {
-            continue;
-        }
+    for member in members.others(&own) {
         if let Some(addr) = database.address_of(&member).map_err(group_error)? {
             peers.push(addr);
         }
     }
     peers.truncate(MAX_TICKET_PEERS);
-    Ok(GroupTicket { group, peers }.encode())
+    Ok(GroupTicket {
+        group,
+        founder: row.founder,
+        doc,
+        key: row.key,
+        peers,
+    }
+    .encode())
 }
 
 /// Sends a message to a group. It is stored here, and sent to the members online now. The
@@ -1771,11 +2050,7 @@ fn send_group_message(
     reply_to: Option<MessageId>,
 ) -> Result<GroupMessage, NodeError> {
     let database = group_database(receiving)?;
-    if !database.is_in_group(&group).map_err(group_error)? {
-        return Err(NodeError::Group(
-            "there is no group with that id".to_owned(),
-        ));
-    }
+    row_of(receiving, &group)?;
     let body = messages::clean_body(&body).map_err(group_error)?;
     let own = receiving.endpoint.id();
     // Never earlier than this device's previous message to the group, so its own order holds.
@@ -1817,16 +2092,326 @@ fn send_group_message(
     })
 }
 
-/// Runs one group's gossip topic until the node stops. Messages that arrive are checked and
-/// stored, and each member that connects is asked for what it has.
-async fn run_group(receiving: Receiving, group: GroupId, bootstrap: Vec<EndpointId>) {
+/// The group as its members see it: its name, its key epoch, and each member's role.
+async fn group_details(receiving: &Receiving, group: GroupId) -> Result<GroupDetails, NodeError> {
+    let row = row_of(receiving, &group)?;
+    let own = receiving.endpoint.id();
+    let members = members_of(receiving, &row).await?;
+    if !members.is_member(&own) {
+        return Err(NodeError::Group(
+            "only a member can see the group".to_owned(),
+        ));
+    }
+    Ok(GroupDetails {
+        id: group,
+        name: members.name.clone().unwrap_or(row.name),
+        epoch: row.key.epoch,
+        you_are_admin: members.is_admin(&own),
+        members: members.roles.into_iter().collect(),
+    })
+}
+
+/// Changes a member's role, or removes them, as an admin. The change is recorded in the
+/// document; removing someone also changes the group's key, see [`remove_member`].
+async fn set_role(
+    receiving: &Receiving,
+    group: GroupId,
+    member: EndpointId,
+    role: Option<Role>,
+) -> Result<(), NodeError> {
+    let row = row_of(receiving, &group)?;
+    let own = receiving.endpoint.id();
+    let members = members_of(receiving, &row).await?;
+    if !members.is_admin(&own) {
+        return Err(NodeError::Group(
+            "only an admin can change roles".to_owned(),
+        ));
+    }
+    if member == row.founder && role != Some(Role::Admin) {
+        return Err(NodeError::Group("the founder stays an admin".to_owned()));
+    }
+    let now = messages::now_millis();
+    write_record(
+        receiving,
+        row.doc,
+        &membership::sign_record(&receiving.secret, group, Change::Role { member, role }, now),
+    )
+    .await
+}
+
+/// Removes a member as an admin. The group moves to a new key, so to a new topic, and the new
+/// key is given to each member who remains. The removed member is not sent it, so they stop
+/// receiving the group's new messages.
+async fn remove_member(
+    receiving: &Receiving,
+    group: GroupId,
+    member: EndpointId,
+) -> Result<(), NodeError> {
+    let row = row_of(receiving, &group)?;
+    let own = receiving.endpoint.id();
+    let members = members_of(receiving, &row).await?;
+    if !members.is_admin(&own) {
+        return Err(NodeError::Group(
+            "only an admin can remove a member".to_owned(),
+        ));
+    }
+    if member == row.founder {
+        return Err(NodeError::Group("the founder cannot be removed".to_owned()));
+    }
+    if !members.is_member(&member) {
+        return Err(NodeError::Group("that endpoint is not a member".to_owned()));
+    }
+    let now = messages::now_millis();
+    write_record(
+        receiving,
+        row.doc,
+        &membership::sign_record(
+            &receiving.secret,
+            group,
+            Change::Role { member, role: None },
+            now,
+        ),
+    )
+    .await?;
+    let remaining = members.others(&own);
+    let key = membership::sign_key(
+        &receiving.secret,
+        group,
+        row.key.epoch + 1,
+        membership::new_key(),
+        now,
+    );
+    group_database(receiving)?
+        .set_group_key(&group, &key)
+        .map_err(group_error)?;
+    start_topic(receiving, group)?;
+    for peer in remaining {
+        if peer == member {
+            continue;
+        }
+        let receiving = receiving.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            if let Err(error) = push_key(&receiving, peer, key).await {
+                warn!(%error, "a member could not be given the group's new key");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Gives a member the group's key for a newer epoch. Only the key is sent; the member checks
+/// it when it arrives.
+async fn push_key(
+    receiving: &Receiving,
+    peer: EndpointId,
+    key: KeyRecord,
+) -> Result<(), NodeError> {
+    let database = group_database(receiving)?;
+    let addr = database
+        .address_of(&peer)
+        .map_err(group_error)?
+        .unwrap_or_else(|| EndpointAddr::from(peer));
+    let (connection, _peer) = open_peer(
+        &receiving.endpoint,
+        addr,
+        &receiving.profile,
+        &receiving.events,
+        &receiving.gate,
+    )
+    .await?;
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &Request::GroupKeyPush(key))
+        .await
+        .map_err(NodeError::Connect)?;
+    let reply: Reply = protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)?;
+    connection.close(0u32.into(), b"key");
+    match reply {
+        Reply::Stored => Ok(()),
+        _ => Err(NodeError::Group(
+            "the member did not take the key".to_owned(),
+        )),
+    }
+}
+
+/// Asks a member for the group's current key. Joining asks to be admitted, which only an admin
+/// does; an existing member asks only for the key.
+async fn ask_key(
+    receiving: &Receiving,
+    group: GroupId,
+    peer: EndpointId,
+    join: bool,
+) -> Result<Option<KeyRecord>, NodeError> {
+    let database = group_database(receiving)?;
+    let addr = database
+        .address_of(&peer)
+        .map_err(group_error)?
+        .unwrap_or_else(|| EndpointAddr::from(peer));
+    let (connection, _peer) = open_peer(
+        &receiving.endpoint,
+        addr,
+        &receiving.profile,
+        &receiving.events,
+        &receiving.gate,
+    )
+    .await?;
+    let request = if join {
+        Request::GroupJoin { group }
+    } else {
+        Request::GroupKey { group }
+    };
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &request)
+        .await
+        .map_err(NodeError::Connect)?;
+    let key: Option<KeyRecord> = protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)?;
+    connection.close(0u32.into(), b"key");
+    Ok(key)
+}
+
+/// Keeps a group key if it is newer than the one held, and signed by a member who is an admin
+/// (or by the founder). When `wait` is set, a joiner waits for the signer to show as an admin in
+/// its own copy of the document, which can lag behind the admin that admitted it.
+async fn accept_key(
+    receiving: &Receiving,
+    group: GroupId,
+    record: KeyRecord,
+    wait: bool,
+) -> Result<bool, NodeError> {
+    let row = row_of(receiving, &group)?;
+    if record.group != group || !membership::verify_key(&record) || record.epoch <= row.key.epoch {
+        return Ok(false);
+    }
+    let started = Instant::now();
+    loop {
+        let members = members_of(receiving, &row).await?;
+        if members.is_admin(&record.by) || record.by == row.founder {
+            group_database(receiving)?
+                .set_group_key(&group, &record)
+                .map_err(group_error)?;
+            start_topic(receiving, group)?;
+            return Ok(true);
+        }
+        if !wait || started.elapsed() >= ADMIN_WAIT {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Brings this device up to date with a member: the group's current key, then the messages it
+/// missed.
+async fn sync_with(receiving: &Receiving, group: GroupId, peer: EndpointId) {
+    if let Ok(Some(record)) = ask_key(receiving, group, peer, false).await {
+        let _ = accept_key(receiving, group, record, false).await;
+    }
+    let _ = fetch_history(receiving, group, peer).await;
+}
+
+/// Answers a group request from a trusted peer. Only members get history and the key; the
+/// admin the peer asks to join admits it, if it is not a member yet.
+async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request) -> GroupAnswer {
+    let own = receiving.endpoint.id();
+    let group = match &request {
+        Request::GroupHistory { group, .. }
+        | Request::GroupKey { group }
+        | Request::GroupJoin { group } => *group,
+        Request::GroupKeyPush(record) => record.group,
+        _ => return GroupAnswer::Refused,
+    };
+    let Ok(row) = row_of(receiving, &group) else {
+        return GroupAnswer::Refused;
+    };
+    let Ok(mut members) = members_of(receiving, &row).await else {
+        return GroupAnswer::Refused;
+    };
+    match request {
+        Request::GroupHistory { group, after } => {
+            if !members.is_member(&peer) {
+                return GroupAnswer::Refused;
+            }
+            let Ok(database) = group_database(receiving) else {
+                return GroupAnswer::Refused;
+            };
+            let Ok(mut rows) = database.group_envelopes_after(&group, after, groups::PAGE_SIZE + 1)
+            else {
+                return GroupAnswer::Refused;
+            };
+            let more = rows.len() > groups::PAGE_SIZE;
+            rows.truncate(groups::PAGE_SIZE);
+            // The other members this device has addresses for, so the asker can reach them.
+            let addresses = members
+                .others(&own)
+                .into_iter()
+                .filter(|member| *member != peer)
+                .filter_map(|member| database.address_of(&member).ok().flatten())
+                .take(MAX_PAGE_MEMBERS)
+                .collect();
+            GroupAnswer::Page(GroupPage {
+                messages: rows,
+                more,
+                members: addresses,
+            })
+        }
+        Request::GroupKey { .. } => {
+            if members.is_member(&peer) {
+                GroupAnswer::Key(Some(row.key))
+            } else {
+                GroupAnswer::Refused
+            }
+        }
+        Request::GroupJoin { .. } => {
+            if !members.is_admin(&own) {
+                return GroupAnswer::Key(None);
+            }
+            if !members.is_member(&peer) {
+                let record = membership::sign_record(
+                    &receiving.secret,
+                    group,
+                    Change::Role {
+                        member: peer,
+                        role: Some(Role::Member),
+                    },
+                    messages::now_millis(),
+                );
+                if write_record(receiving, row.doc, &record).await.is_err() {
+                    return GroupAnswer::Refused;
+                }
+                members = match members_of(receiving, &row).await {
+                    Ok(members) => members,
+                    Err(_) => return GroupAnswer::Refused,
+                };
+            }
+            if members.is_member(&peer) {
+                GroupAnswer::Key(Some(row.key))
+            } else {
+                GroupAnswer::Refused
+            }
+        }
+        Request::GroupKeyPush(record) => match accept_key(receiving, group, record, false).await {
+            Ok(true) => GroupAnswer::Stored,
+            _ => GroupAnswer::Refused,
+        },
+        _ => GroupAnswer::Refused,
+    }
+}
+
+/// Runs one group's gossip topic until it is replaced or the node stops. Messages that arrive
+/// are checked and stored, and each member that connects is brought up to date.
+async fn run_group(
+    receiving: Receiving,
+    group: GroupId,
+    topic: TopicId,
+    bootstrap: Vec<EndpointId>,
+) {
     let Some(gossip) = receiving.gossip.clone() else {
         return;
     };
-    let topic = match gossip
-        .subscribe(TopicId::from_bytes(group), bootstrap)
-        .await
-    {
+    let topic = match gossip.subscribe(topic, bootstrap).await {
         Ok(topic) => topic,
         Err(error) => {
             warn!(%error, "could not join a group's topic");
@@ -1852,9 +2437,9 @@ async fn run_group(receiving: Receiving, group: GroupId, bootstrap: Vec<Endpoint
                 if let Some(database) = &receiving.database {
                     let _ = database.add_group_member(group, &member);
                 }
-                let fetching = receiving.clone();
+                let syncing = receiving.clone();
                 tokio::spawn(async move {
-                    let _ = fetch_history(&fetching, group, member).await;
+                    sync_with(&syncing, group, member).await;
                 });
             }
             Ok(_) => {}
@@ -1864,11 +2449,6 @@ async fn run_group(receiving: Receiving, group: GroupId, bootstrap: Vec<Endpoint
             }
         }
     }
-    receiving
-        .groups
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&group);
 }
 
 /// Stores a group message if it is genuine and from a trusted contact. Returns whether it was
@@ -3201,38 +3781,38 @@ impl Inbox {
                 }
                 reply_and_finish(&mut send, Reply::Stored).await;
             }
-            Request::GroupHistory { group, after } => {
-                let id = peer.endpoint_id;
-                // Only a trusted peer may read a group's history. Anyone else gets no answer.
-                if !self.gate.is_trusted(&id) {
+            request @ (Request::GroupHistory { .. }
+            | Request::GroupKey { .. }
+            | Request::GroupJoin { .. }
+            | Request::GroupKeyPush(_)) => {
+                // Only a trusted peer may take part in a group. Anyone else gets no answer.
+                if !self.gate.is_trusted(&peer.endpoint_id) {
                     return;
                 }
-                let Some(database) = self.database.clone() else {
+                let Some(commands) = self.commands.upgrade() else {
                     return;
                 };
-                let Ok(mut rows) =
-                    database.group_envelopes_after(&group, after, groups::PAGE_SIZE + 1)
-                else {
+                let (reply, answer) = oneshot::channel();
+                if commands
+                    .send(Command::GroupRequest(peer.endpoint_id, request, reply))
+                    .await
+                    .is_err()
+                {
                     return;
-                };
-                let more = rows.len() > groups::PAGE_SIZE;
-                rows.truncate(groups::PAGE_SIZE);
-                // The other members this device has addresses for, so the asker can reach them.
-                let members = database
-                    .group_members(&group)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|member| *member != id && *member != self.own_id)
-                    .filter_map(|member| database.address_of(&member).ok().flatten())
-                    .take(MAX_PAGE_MEMBERS)
-                    .collect();
-                let page = GroupPage {
-                    messages: rows,
-                    more,
-                    members,
-                };
-                if protocol::write_message(&mut send, &page).await.is_ok() {
-                    let _ = send.finish();
+                }
+                match answer.await {
+                    Ok(GroupAnswer::Page(page)) => {
+                        if protocol::write_message(&mut send, &page).await.is_ok() {
+                            let _ = send.finish();
+                        }
+                    }
+                    Ok(GroupAnswer::Key(key)) => {
+                        if protocol::write_message(&mut send, &key).await.is_ok() {
+                            let _ = send.finish();
+                        }
+                    }
+                    Ok(GroupAnswer::Stored) => reply_and_finish(&mut send, Reply::Stored).await,
+                    Ok(GroupAnswer::Refused) | Err(_) => {}
                 }
             }
             Request::Offer(offer) => {
@@ -3660,6 +4240,57 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::GroupMessages(group, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// A group as its members see it: its name, its key epoch, and each member's role.
+    pub async fn group_details(&self, group: GroupId) -> Result<GroupDetails, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::GroupDetailsFor(group, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Removes a member from a group, as an admin. The group moves to a new key, and the
+    /// removed member no longer receives its messages.
+    pub async fn remove_group_member(
+        &self,
+        group: GroupId,
+        member: EndpointId,
+    ) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::RemoveGroupMember(group, member, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Makes a member an admin or a plain member, as an admin. `None` removes them instead,
+    /// which is [`NodeHandle::remove_group_member`].
+    pub async fn set_group_role(
+        &self,
+        group: GroupId,
+        member: EndpointId,
+        role: Option<Role>,
+    ) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SetGroupRole(group, member, role, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Renames a group, as an admin.
+    pub async fn rename_group(&self, group: GroupId, name: String) -> Result<(), NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::RenameGroup(group, name, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

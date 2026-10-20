@@ -9,8 +9,9 @@
 //! member it reconnects to for the messages it missed, in pages, over the Groovy protocol.
 //! Each message in a page carries its signature, so the page can come from any member.
 //!
-//! The members come from the invitation (its ticket names some members) and from the members
-//! met later. Changing who may be a member, and removing one, come with #44.
+//! Who is a member, and in what role, is kept as signed records in the group's document; see
+//! [`crate::membership`]. Removing a member changes the group's key, and so its topic, and only
+//! the members who remain are given the new key.
 
 use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
 use rusqlite::{OptionalExtension, params};
@@ -18,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::db::{Database, DbError};
+use crate::membership::{KeyRecord, Role};
 use crate::messages::{MessageError, MessageId, clean_body};
+use iroh_docs::NamespaceId;
 
 /// The id of a group. Its gossip topic is the same bytes.
 pub type GroupId = [u8; 32];
@@ -77,11 +80,43 @@ pub struct GroupPage {
     pub members: Vec<EndpointAddr>,
 }
 
-/// What an invitation carries: the group, and some of its members to join through.
+/// What an invitation carries: the group, its founder, the document its membership is kept in,
+/// its current key, and some of its members to join through.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupTicket {
     pub group: GroupId,
+    pub founder: EndpointId,
+    /// The iroh-docs ticket for the group's membership document.
+    pub doc: String,
+    pub key: KeyRecord,
     pub peers: Vec<EndpointAddr>,
+}
+
+/// A group as its members see it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupDetails {
+    pub id: GroupId,
+    /// The name an admin last gave the group, or this device's name for it.
+    pub name: String,
+    /// The group's key epoch: how many members have been removed.
+    pub epoch: u32,
+    /// Whether this device is an admin, and so can change the membership.
+    pub you_are_admin: bool,
+    /// Every member, with their role.
+    pub members: Vec<(EndpointId, Role)>,
+}
+
+/// A group as this device keeps it: what it is called here, who founded it, its membership
+/// document, and the key it is at now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRow {
+    pub id: GroupId,
+    pub name: String,
+    /// Unix seconds.
+    pub created: i64,
+    pub founder: EndpointId,
+    pub doc: NamespaceId,
+    pub key: KeyRecord,
 }
 
 /// Errors from group chat.
@@ -247,13 +282,91 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
 
 impl Database {
     /// Records a group this device is in.
-    pub fn create_group(&self, group: GroupId, name: &str, now: i64) -> Result<(), DbError> {
+    pub fn insert_group(&self, row: &GroupRow) -> Result<(), DbError> {
+        let key = postcard::to_stdvec(&row.key).map_err(|error| {
+            DbError::Query(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO chat_groups (id, name, created) VALUES (?1, ?2, ?3)",
-                params![group.as_slice(), name, now],
+                "INSERT OR IGNORE INTO chat_groups
+                    (id, name, created, founder, doc, key_record)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.id.as_slice(),
+                    row.name,
+                    row.created,
+                    row.founder.as_bytes().as_slice(),
+                    row.doc.as_bytes().as_slice(),
+                    key,
+                ],
             )
             .map(|_| ())
+        })
+    }
+
+    /// One group, if this device is in it and it has a membership document. Groups recorded
+    /// before membership was added have none, and are not returned.
+    pub fn group_row(&self, group: &GroupId) -> Result<Option<GroupRow>, DbError> {
+        let found = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT name, created, founder, doc, key_record FROM chat_groups
+                 WHERE id = ?1 AND doc IS NOT NULL AND key_record IS NOT NULL",
+                [group.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+        })?;
+        Ok(found.and_then(|(name, created, founder, doc, key)| {
+            Some(GroupRow {
+                id: *group,
+                name,
+                created,
+                founder: EndpointId::from_bytes(&<[u8; 32]>::try_from(founder.as_slice()).ok()?)
+                    .ok()?,
+                doc: NamespaceId::from(<[u8; 32]>::try_from(doc.as_slice()).ok()?),
+                key: postcard::from_bytes(&key).ok()?,
+            })
+        }))
+    }
+
+    /// Stores the key a group is at now.
+    pub fn set_group_key(&self, group: &GroupId, key: &KeyRecord) -> Result<(), DbError> {
+        let bytes = postcard::to_stdvec(key).map_err(|error| {
+            DbError::Query(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE chat_groups SET key_record = ?2 WHERE id = ?1",
+                params![group.as_slice(), bytes],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Sets what this device calls a group.
+    pub fn set_group_name(&self, group: &GroupId, name: &str) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE chat_groups SET name = ?2 WHERE id = ?1",
+                params![group.as_slice(), name],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Forgets a group this device was in.
+    pub fn delete_group(&self, group: &GroupId) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM chat_groups WHERE id = ?1", [group.as_slice()])
+                .map(|_| ())
         })
     }
 
@@ -449,8 +562,12 @@ mod tests {
 
     #[test]
     fn a_ticket_round_trips_and_other_text_is_refused() {
+        let founder = SecretKey::generate();
         let ticket = GroupTicket {
             group: [3; 32],
+            founder: founder.public(),
+            doc: "docticket".into(),
+            key: crate::membership::sign_key(&founder, [3; 32], 0, [4; 32], 1),
             peers: vec![EndpointAddr::from(SecretKey::generate().public())],
         };
         let text = ticket.encode();
@@ -471,7 +588,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("groovy.db")).unwrap();
         let alice = SecretKey::generate();
-        db.create_group([7; 32], "friends", 1).unwrap();
+        db.insert_group(&GroupRow {
+            id: [7; 32],
+            name: "friends".into(),
+            created: 1,
+            founder: alice.public(),
+            doc: NamespaceId::from([5; 32]),
+            key: crate::membership::sign_key(&alice, [7; 32], 0, [1; 32], 1),
+        })
+        .unwrap();
 
         let first = sign(&alice, [7; 32], [2; 16], 20, "one".into(), None);
         let second = sign(&alice, [7; 32], [1; 16], 10, "two".into(), None);

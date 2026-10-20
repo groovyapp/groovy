@@ -76,6 +76,18 @@ pub enum Request {
         group: [u8; 32],
         after: Option<(i64, [u8; 16])>,
     },
+    /// Asks a trusted member for the group's current key. Only a current member gets it.
+    GroupKey {
+        group: [u8; 32],
+    },
+    /// Asks an admin to admit this device to a group, and gives back the group's current key.
+    /// An admin that admits it writes its membership into the group's document.
+    GroupJoin {
+        group: [u8; 32],
+    },
+    /// Gives a member the key of a newer epoch, after a removal. Answered with `Reply::Stored`
+    /// if the member took it.
+    GroupKeyPush(crate::membership::KeyRecord),
 }
 
 /// What a sender offers: the top-level names being sent, and the collection that

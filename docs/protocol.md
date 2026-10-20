@@ -129,12 +129,22 @@ A message is queued for each device that must have it: the contact's own endpoin
 
 A group has a random 32-byte id, and its gossip topic is that id. A group message is a `GroupEnvelope`: version, group, a random id, the author's endpoint id, timestamp, body, optional `reply_to`, and a signature by the author's key over every other field. A member accepts a message only if its signature verifies and its author is the member or a trusted contact. A relayed message therefore still shows its real author.
 
-A ticket (`groovygroup1…`, base32 of postcard) invites someone: the group id, and up to eight members' addresses to join through. Gossip itself accepts only trusted peers, as the other gossip uses do.
+A ticket (`groovygroup1…`, base32 of postcard) invites someone: the group id, its founder, the membership document's ticket, the group's current key record, and up to eight members' addresses to join through. Gossip itself accepts only trusted peers, as the other gossip uses do.
 
 A member that connects to another member asks it for what it missed with `Request::GroupHistory { group, after }`, where `after` is the newest message the asker has. The answer is a `GroupPage`: up to eight envelopes in order, a flag saying whether more follow, and the addresses of the group's other members the answering device knows. Each envelope carries its signature, so a page can come from any member. Only trusted peers get an answer.
 
-Members and their roles, and removing a member, are not yet built (#44). Groups are not yet on screen (#47).
+### Membership and keys
+
+Membership is kept in the group's iroh-docs document as signed records: a name, and a member's role (admin, member) or removal. Records are replayed in time order, and a record counts only if its signer was an admin when it was made. The founder is always an admin. The document is writable by every member, so a record from a non-admin is ignored rather than refused.
+
+Each group has a key that starts at epoch 0. The group's gossip topic is derived from the key, so removing a member changes the topic. The admin who removes a member signs a new key at the next epoch, moves onto the new topic, and pushes the key to each remaining member with `Request::GroupKeyPush`. The key is never written into the document, since every member can read the document, including one who was removed.
+
+A member asks for the current key with `Request::GroupKey`, and only a current member gets an answer. A device that has been invited asks an admin with `Request::GroupJoin`; the admin writes its membership record and answers with the key. A key is accepted only if it is newer, and signed by an admin or the founder.
+
+Known limits: a member that has not yet seen a removal in the document can still give the removed member the new key, until the removal reaches it. Changing the document's authors and the mutual trust between members are not checked beyond the signatures. Roles can be changed by any admin, not only the founder.
+
+Groups are not yet on screen (#47).
 
 ## Not yet specified
 
-Group membership and permissions (#44), attachments (#45), and search (#46) are not built. Each will get a section here when it is.
+Attachments (#45) and search (#46) are not built. Each will get a section here when it is.

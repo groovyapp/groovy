@@ -2725,3 +2725,108 @@ async fn a_group_reaches_every_member_and_an_offline_member_catches_up() {
     assert!(ben.shutdown(TIMEOUT));
     assert!(cam.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_removed_member_no_longer_receives_the_groups_messages() {
+    use groovy_core::membership::Role;
+    let tmp = tempfile::tempdir().unwrap();
+    let keys = [
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    ];
+    let dirs = [
+        fresh_dir(&tmp, "ada"),
+        fresh_dir(&tmp, "ben"),
+        fresh_dir(&tmp, "cam"),
+    ];
+    for (i, dir) in dirs.iter().enumerate() {
+        for (j, key) in keys.iter().enumerate() {
+            if i != j {
+                trust_in(dir, key);
+            }
+        }
+    }
+    let (ada, _) = blob_node_collecting(&dirs[0], keys[0].clone(), None).await;
+    let (ben, _) = blob_node_collecting(&dirs[1], keys[1].clone(), None).await;
+    let (cam, _) = blob_node_collecting(&dirs[2], keys[2].clone(), None).await;
+
+    let group = ada.create_group("friends".into()).await.unwrap();
+    let ticket = ada.group_ticket(group).await.unwrap();
+    ben.join_group(ticket.clone()).await.unwrap();
+    cam.join_group(ticket).await.unwrap();
+    ada.send_group_message(group, "before".into(), None)
+        .await
+        .unwrap();
+    for node in [&ada, &ben, &cam] {
+        wait_for_group(node, group, "reached every member", |listed| {
+            listed.len() == 1
+        })
+        .await;
+    }
+
+    // Only an admin can remove someone. Ben is a member, so his attempt is refused.
+    assert!(
+        ben.remove_group_member(group, keys[2].public())
+            .await
+            .is_err()
+    );
+    let details = ada.group_details(group).await.unwrap();
+    assert!(details.you_are_admin);
+    assert!(
+        details
+            .members
+            .iter()
+            .any(|(id, role)| *id == keys[1].public() && *role == Role::Member)
+    );
+
+    ada.remove_group_member(group, keys[2].public())
+        .await
+        .unwrap();
+    let details = ada.group_details(group).await.unwrap();
+    assert_eq!(
+        details.epoch, 1,
+        "removing a member moves the group to a new key"
+    );
+    assert!(
+        !details
+            .members
+            .iter()
+            .any(|(id, _)| *id == keys[2].public())
+    );
+
+    // A message after the removal reaches ben, on the new topic, and not cam.
+    ada.send_group_message(group, "after the removal".into(), None)
+        .await
+        .unwrap();
+    wait_for_group(&ben, group, "reached ben after the removal", |listed| {
+        listed.len() == 2
+    })
+    .await;
+    // Cam sends on the old key. Nobody on the new topic hears it.
+    cam.send_group_message(group, "cam is still here".into(), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let ben_bodies: Vec<String> = ben
+        .group_messages(group)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.body)
+        .collect();
+    assert!(ben_bodies.contains(&"after the removal".to_owned()));
+    assert!(!ben_bodies.contains(&"cam is still here".to_owned()));
+    let cam_bodies: Vec<String> = cam
+        .group_messages(group)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.body)
+        .collect();
+    assert!(!cam_bodies.contains(&"after the removal".to_owned()));
+
+    assert!(ada.shutdown(TIMEOUT));
+    assert!(ben.shutdown(TIMEOUT));
+    assert!(cam.shutdown(TIMEOUT));
+}
