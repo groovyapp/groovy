@@ -57,10 +57,38 @@ impl TransferState {
     }
 }
 
+/// Whether a transfer brings files to this device or takes them away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Files this device receives.
+    Receive,
+    /// Files this device offers to a peer.
+    Send,
+}
+
+impl Direction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Direction::Receive => "receive",
+            Direction::Send => "send",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "receive" => Some(Direction::Receive),
+            "send" => Some(Direction::Send),
+            _ => None,
+        }
+    }
+}
+
 /// One accepted offer, and how far it has got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer {
     pub id: i64,
+    pub direction: Direction,
+    /// The other side: who the files come from, or who they go to.
     pub peer: EndpointId,
     pub offer: FileOffer,
     pub state: TransferState,
@@ -79,8 +107,8 @@ impl Database {
         let (state, error) = transfer.state.to_row();
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO transfers (id, peer, offer, state, error, done, created, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO transfers (id, peer, offer, state, error, done, created, updated, direction)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     transfer.id,
                     transfer.peer.as_bytes().as_slice(),
@@ -90,6 +118,7 @@ impl Database {
                     transfer.done as i64,
                     transfer.created,
                     transfer.updated,
+                    transfer.direction.as_str(),
                 ],
             )
             .map(|_| ())
@@ -127,7 +156,7 @@ impl Database {
     pub fn transfers(&self) -> Result<Vec<Transfer>, DbError> {
         let rows = self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT id, peer, offer, state, error, done, created, updated
+                "SELECT id, peer, offer, state, error, done, created, updated, direction
                  FROM transfers ORDER BY id",
             )?;
             let rows = statement
@@ -141,6 +170,7 @@ impl Database {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -148,9 +178,12 @@ impl Database {
         })?;
 
         let mut transfers = Vec::with_capacity(rows.len());
-        for (id, peer, offer, state, error, done, created, updated) in rows {
+        for (id, peer, offer, state, error, done, created, updated, direction) in rows {
             // A row that does not decode is skipped rather than failing the whole list.
             let Some(state) = TransferState::from_row(&state, error) else {
+                continue;
+            };
+            let Some(direction) = Direction::from_str(&direction) else {
                 continue;
             };
             let Ok(peer_key) = <[u8; 32]>::try_from(peer.as_slice()) else {
@@ -164,6 +197,7 @@ impl Database {
             };
             transfers.push(Transfer {
                 id,
+                direction,
                 peer,
                 offer,
                 state,

@@ -76,6 +76,9 @@ const MIGRATIONS: &[&str] = &[
         path      TEXT,
         created   INTEGER NOT NULL
     );",
+    // Whether a transfer is a receive or a send. Transfers recorded before this were receives.
+    "ALTER TABLE transfers ADD COLUMN direction TEXT NOT NULL DEFAULT 'receive'
+        CHECK (direction IN ('receive', 'send'));",
 ];
 
 /// The schema version this build writes.

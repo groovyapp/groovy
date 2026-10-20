@@ -379,6 +379,11 @@ pub fn start(cx: &mut App) {
                     NodeEvent::FileOffered { peer, offer } => {
                         state.offers.push(FileOfferRequest { peer, offer });
                     }
+                    NodeEvent::OfferWithdrawn { peer } => {
+                        state
+                            .offers
+                            .retain(|request| request.peer.endpoint_id != peer);
+                    }
                     NodeEvent::TransferChanged(transfer) => state.record_transfer(transfer),
                     NodeEvent::FileReceived {
                         transfer, saved, ..

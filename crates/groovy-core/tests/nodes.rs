@@ -985,6 +985,7 @@ async fn transfers_survive_a_restart_and_unfinished_ones_resume() {
         .unwrap()
         .insert_transfer(&Transfer {
             id: 99,
+            direction: groovy_core::transfers::Direction::Receive,
             peer: alice_key.public(),
             offer,
             state: TransferState::Queued,
@@ -1052,6 +1053,7 @@ async fn a_paused_transfer_stays_paused_across_a_restart_until_resumed() {
         .unwrap()
         .insert_transfer(&Transfer {
             id: 7,
+            direction: groovy_core::transfers::Direction::Receive,
             peer: alice_key.public(),
             offer,
             state: TransferState::Paused,
@@ -1674,4 +1676,206 @@ async fn deleting_a_file_leaves_files_whose_names_start_the_same() {
     assert_eq!(keys_of(&entries), ["x.txt2"]);
 
     assert!(alice.shutdown(TIMEOUT));
+}
+
+/// The sends this node has made, as its transfer list shows them.
+fn sends_of(node: &NodeHandle) -> Vec<groovy_core::transfers::Transfer> {
+    node.transfers()
+        .into_iter()
+        .filter(|t| t.direction == groovy_core::transfers::Direction::Send)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_send_is_recorded_and_completes_when_the_peer_accepts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+
+    let sent = sends_of(&alice);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].state,
+        groovy_core::transfers::TransferState::Completed
+    );
+    assert_eq!(sent[0].peer, bob.endpoint_id());
+    assert_eq!(sent[0].offer.files, 3);
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_declined_send_is_recorded_as_not_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), false).await.unwrap();
+    assert!(matches!(
+        send.await.unwrap(),
+        Err(groovy_core::NodeError::OfferDeclined)
+    ));
+
+    let sent = sends_of(&alice);
+    assert!(matches!(
+        sent[0].state,
+        groovy_core::transfers::TransferState::Failed(_)
+    ));
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn cancelling_a_send_while_it_waits_withdraws_the_offer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+
+    // Bob has not answered. Alice cancels, and the offer is withdrawn on bob's side.
+    let transfer = sends_of(&alice)[0].id;
+    alice
+        .cancel_transfer(transfer)
+        .await
+        .expect("the send is cancelled");
+    let withdrawn = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if let NodeEvent::OfferWithdrawn { peer } = bob_events.next().await.unwrap() {
+                return peer;
+            }
+        }
+    })
+    .await
+    .expect("bob learns the offer was withdrawn");
+    assert_eq!(withdrawn, alice.endpoint_id());
+    assert_eq!(
+        sends_of(&alice)[0].state,
+        groovy_core::transfers::TransferState::Cancelled
+    );
+    send.await.unwrap().expect("the cancelled send returns");
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn cancelling_an_accepted_send_stops_even_trusted_peers_fetching_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key.clone()).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key.clone()).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    let offer = next_file_offer(&mut bob_events).await;
+    bob.answer_offer(alice_key.public(), true).await.unwrap();
+    send.await.unwrap().unwrap();
+    next_file_received(&mut bob_events).await;
+
+    // Before cancelling, a trusted peer can fetch the offered collection.
+    let dialer = dialer_with(bob_key).await;
+    let connection = dialer
+        .connect(alice.addr().await.unwrap(), iroh_blobs::ALPN)
+        .await
+        .unwrap();
+    assert!(
+        iroh_blobs::get::request::get_blob(connection, offer.root)
+            .await
+            .is_ok()
+    );
+
+    let transfer = sends_of(&alice)[0].id;
+    alice
+        .cancel_transfer(transfer)
+        .await
+        .expect("the accepted send is cancelled");
+
+    let connection = dialer
+        .connect(alice.addr().await.unwrap(), iroh_blobs::ALPN)
+        .await
+        .unwrap();
+    assert!(
+        iroh_blobs::get::request::get_blob(connection, offer.root)
+            .await
+            .is_err(),
+        "a withdrawn send was still served"
+    );
+
+    dialer.close().await;
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_send_cannot_be_paused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node(&alice_dir, alice_key).await;
+    let (bob, mut bob_events) = blob_node(&bob_dir, bob_key).await;
+    let paths = write_sample_files(&tmp.path().join("source"));
+
+    let bob_addr = bob.addr().await.unwrap();
+    let send = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.send_files(bob_addr, paths).await }
+    });
+    next_file_offer(&mut bob_events).await;
+    let transfer = sends_of(&alice)[0].id;
+    assert!(matches!(
+        alice.pause_transfer(transfer).await,
+        Err(groovy_core::NodeError::WrongTransferState(_))
+    ));
+    alice.cancel_transfer(transfer).await.unwrap();
+    send.abort();
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
 }

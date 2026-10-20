@@ -38,7 +38,7 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::blobs::{self, SharedHashes};
+use crate::blobs::{self, SharedHashes, Withdrawn};
 use crate::config::{Discovery, RelaySetting};
 use crate::contacts;
 use crate::db::Database;
@@ -51,7 +51,7 @@ use crate::presence::{Route, route_of};
 use crate::protocol::{self, FileOffer, PeerInfo, PeerProfile, ProtocolError, Reply, Request};
 use crate::shares::Share;
 use crate::storage::StorageUsage;
-use crate::transfers::{Transfer, TransferState};
+use crate::transfers::{Direction, Transfer, TransferState};
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -196,6 +196,11 @@ pub enum NodeEvent {
     PairingRequested {
         peer: PeerInfo,
         code: String,
+    },
+    /// A peer that offered files closed the connection before the user answered, so the
+    /// offer is gone.
+    OfferWithdrawn {
+        peer: EndpointId,
     },
     /// A trusted peer offers files. The user accepts or declines them.
     FileOffered {
@@ -355,6 +360,7 @@ impl Node {
                             Slot {
                                 transfer,
                                 abort: None,
+                                cancel: None,
                             },
                         );
                     }
@@ -481,6 +487,7 @@ async fn run(
     // Hashes that shared folders reference. Collection keeps them, so it is refreshed from
     // the folders, and grows as files are added.
     let folder_live: Protected = Arc::new(Mutex::new(HashSet::new()));
+    let withdrawn: Withdrawn = Arc::new(Mutex::new(HashSet::new()));
     let blobs = match &config.blobs {
         Some(dir) => {
             let mut options = iroh_blobs::store::fs::options::Options::new(dir);
@@ -508,6 +515,9 @@ async fn run(
         next_id: startup.next_id.clone(),
         database: config.database.clone(),
         shared: startup.shared.clone(),
+        withdrawn: withdrawn.clone(),
+        profile: profile.clone(),
+        gate: gate.clone(),
     };
     let mut router = Router::builder(endpoint.clone()).accept(
         protocol::ALPN,
@@ -581,6 +591,7 @@ async fn run(
             messages,
             gate.clone(),
             receiving.shared.clone(),
+            withdrawn.clone(),
         ));
         router = router.accept(iroh_blobs::ALPN, BlobsProtocol::new(store, Some(events)));
     }
@@ -898,19 +909,23 @@ async fn run(
                     let _ = reply.send(resume_transfer(&receiving, id));
                 }
                 Some(Command::CancelTransfer(id, reply)) => {
-                    let _ = reply.send(stop_transfer(&receiving, id, TransferState::Cancelled));
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(cancel_transfer(&receiving, id).await);
+                    });
+                }
+                Some(Command::SendFiles(addr, paths, reply)) if receiving.store.is_none() => {
+                    let _ = reply.send(Err(NodeError::BlobsDisabled));
+                    let _ = (addr, paths);
                 }
                 Some(Command::SendFiles(addr, paths, reply)) => {
-                    let endpoint = endpoint.clone();
-                    let profile = profile.clone();
-                    let events = events.clone();
-                    let gate = gate.clone();
-                    let store = blobs.clone();
+                    let id = receiving.next_id.fetch_add(1, Ordering::SeqCst);
+                    let (cancel, cancelled) = oneshot::channel();
+                    record_send(&receiving, id, addr.id, cancel);
+                    let task_receiving = receiving.clone();
                     tokio::spawn(async move {
-                        let outcome = send_files(
-                            &endpoint, addr, &profile, &events, &gate, store, paths,
-                        )
-                        .await;
+                        let outcome =
+                            send_files(&task_receiving, id, addr, paths, cancelled).await;
                         let _ = reply.send(outcome);
                     });
                 }
@@ -1046,6 +1061,8 @@ type Book = Arc<Mutex<BTreeMap<i64, Slot>>>;
 struct Slot {
     transfer: Transfer,
     abort: Option<tokio::task::AbortHandle>,
+    /// For a send that is still waiting for its answer: fires to cancel it.
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 /// Receives at most this many offers at once. The rest wait in the queue.
@@ -1162,26 +1179,63 @@ struct Receiving {
     next_id: Arc<AtomicI64>,
     database: Option<Arc<Database>>,
     shared: SharedHashes,
+    withdrawn: Withdrawn,
+    profile: SharedProfile,
+    gate: Arc<dyn PeerGate>,
 }
 
-/// Imports `paths` into the blob store, offers them to a trusted peer, and waits for
-/// its answer. An accepted offer is fetched by the peer from this node's store.
+/// What a send's offer carries before its files are imported.
+fn unsent_offer(receiving: &Receiving) -> FileOffer {
+    FileOffer {
+        names: Vec::new(),
+        root: Hash::EMPTY,
+        files: 0,
+        bytes: 0,
+        from: receiving.endpoint.addr(),
+    }
+}
+
+/// Offers `paths` to a trusted peer, as transfer `id`, and waits for its answer. An accepted
+/// offer is fetched by the peer from this node's store. The send can be cancelled while it
+/// waits, which stops it at once.
 async fn send_files(
-    endpoint: &Endpoint,
+    receiving: &Receiving,
+    id: i64,
     addr: EndpointAddr,
-    profile: &SharedProfile,
-    events: &broadcast::Sender<NodeEvent>,
-    gate: &Arc<dyn PeerGate>,
-    store: Option<FsStore>,
+    paths: Vec<PathBuf>,
+    cancelled: oneshot::Receiver<()>,
+) -> Result<(), NodeError> {
+    tokio::select! {
+        outcome = offer_files(receiving, id, addr, paths) => outcome,
+        _ = cancelled => Ok(()),
+    }
+}
+
+async fn offer_files(
+    receiving: &Receiving,
+    id: i64,
+    addr: EndpointAddr,
     paths: Vec<PathBuf>,
 ) -> Result<(), NodeError> {
-    let store = store.ok_or(NodeError::BlobsDisabled)?;
-    let progress = events.clone();
-    let imported = files::import(&store, &paths, |done, total| {
+    let store = receiving.store.clone().ok_or(NodeError::BlobsDisabled)?;
+    let progress = receiving.events.clone();
+    let imported = match files::import(&store, &paths, |done, total| {
         let _ = progress.send(NodeEvent::ImportProgress { done, total });
     })
     .await
-    .map_err(|error| NodeError::Files(error.to_string()))?;
+    {
+        Ok(imported) => imported,
+        Err(error) => {
+            let error = NodeError::Files(error.to_string());
+            set_transfer(
+                receiving,
+                id,
+                Some(TransferState::Failed(error.to_string())),
+                None,
+            );
+            return Err(error);
+        }
+    };
     store
         .tags()
         .set(
@@ -1190,15 +1244,47 @@ async fn send_files(
         )
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
+    // Sending the same content again makes it available again.
+    let hashes = hashes_of_collection(&store, imported.root).await?;
+    for hash in &hashes {
+        lock_withdrawn(&receiving.withdrawn).remove(hash);
+    }
     let offer = FileOffer {
         names: imported.names,
         root: imported.root,
         files: imported.files,
         bytes: imported.bytes,
-        from: endpoint.addr(),
+        from: receiving.endpoint.addr(),
     };
+    record_offer(receiving, id, offer.clone());
 
-    let (connection, _peer) = open_peer(endpoint, addr, profile, events, gate).await?;
+    let outcome = exchange_offer(receiving, addr, offer).await;
+    match &outcome {
+        Ok(()) => set_transfer(receiving, id, Some(TransferState::Completed), None),
+        Err(error) => set_transfer(
+            receiving,
+            id,
+            Some(TransferState::Failed(error.to_string())),
+            None,
+        ),
+    }
+    outcome
+}
+
+/// Sends the offer, and reads the peer's answer.
+async fn exchange_offer(
+    receiving: &Receiving,
+    addr: EndpointAddr,
+    offer: FileOffer,
+) -> Result<(), NodeError> {
+    let (connection, _peer) = open_peer(
+        &receiving.endpoint,
+        addr,
+        &receiving.profile,
+        &receiving.events,
+        &receiving.gate,
+    )
+    .await?;
     let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
     protocol::write_message(&mut send, &Request::Offer(offer))
         .await
@@ -1211,6 +1297,105 @@ async fn send_files(
         Reply::Accepted => Ok(()),
         Reply::Declined => Err(NodeError::OfferDeclined),
         Reply::Pong => Err(NodeError::Connect(ProtocolError::Closed)),
+    }
+}
+
+/// The root and every file of a collection, which is everything a share or send serves.
+async fn hashes_of_collection(store: &FsStore, root: Hash) -> Result<Vec<Hash>, NodeError> {
+    let bytes = store
+        .blobs()
+        .get_bytes(root)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let links = HashSeq::try_from(bytes).map_err(|error| NodeError::Files(error.to_string()))?;
+    let mut hashes = vec![root];
+    hashes.extend(links.iter());
+    Ok(hashes)
+}
+
+fn lock_withdrawn(
+    withdrawn: &Withdrawn,
+) -> std::sync::MutexGuard<'_, std::collections::HashSet<Hash>> {
+    withdrawn.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Records a send as waiting for its answer, before its files are imported.
+fn record_send(receiving: &Receiving, id: i64, peer: EndpointId, cancel: oneshot::Sender<()>) {
+    let now = contacts::now();
+    let transfer = Transfer {
+        id,
+        direction: Direction::Send,
+        peer,
+        offer: unsent_offer(receiving),
+        state: TransferState::Queued,
+        done: 0,
+        created: now,
+        updated: now,
+    };
+    lock_book(&receiving.book).insert(
+        id,
+        Slot {
+            transfer: transfer.clone(),
+            abort: None,
+            cancel: Some(cancel),
+        },
+    );
+    let _ = receiving.events.send(NodeEvent::TransferChanged(transfer));
+}
+
+/// Stores the send's offer once its files are imported, and saves the send.
+fn record_offer(receiving: &Receiving, id: i64, offer: FileOffer) {
+    let saved = {
+        let mut book = lock_book(&receiving.book);
+        let Some(slot) = book.get_mut(&id) else {
+            return;
+        };
+        slot.transfer.offer = offer;
+        slot.transfer.updated = contacts::now();
+        slot.transfer.clone()
+    };
+    if let Some(Err(error)) = receiving
+        .database
+        .as_ref()
+        .map(|database| database.insert_transfer(&saved))
+    {
+        warn!(%error, "could not save a transfer");
+    }
+    let _ = receiving.events.send(NodeEvent::TransferChanged(saved));
+}
+
+/// Cancels a send. A send still waiting for its answer stops at once. One the peer has
+/// accepted stops being served, to everyone, including trusted contacts.
+async fn cancel_send(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    let (state, root, cancel) = {
+        let mut book = lock_book(&receiving.book);
+        let slot = book.get_mut(&id).ok_or(NodeError::UnknownTransfer)?;
+        (
+            slot.transfer.state.clone(),
+            slot.transfer.offer.root,
+            slot.cancel.take(),
+        )
+    };
+    match state {
+        TransferState::Queued => {
+            if let Some(cancel) = cancel {
+                let _ = cancel.send(());
+            }
+            set_transfer(receiving, id, Some(TransferState::Cancelled), None);
+            Ok(())
+        }
+        TransferState::Completed => {
+            if let Some(store) = &receiving.store {
+                let hashes = hashes_of_collection(store, root).await?;
+                lock_withdrawn(&receiving.withdrawn).extend(hashes);
+                if let Err(error) = store.tags().delete(format!("send-{root}")).await {
+                    warn!(%error, "could not release a sent file");
+                }
+            }
+            set_transfer(receiving, id, Some(TransferState::Cancelled), None);
+            Ok(())
+        }
+        _ => Err(NodeError::WrongTransferState("cancelled")),
     }
 }
 
@@ -1236,12 +1421,25 @@ async fn answer_offer(
     Ok(())
 }
 
+/// Cancels a transfer, whichever way it goes.
+async fn cancel_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
+    let direction = lock_book(&receiving.book)
+        .get(&id)
+        .map(|slot| slot.transfer.direction)
+        .ok_or(NodeError::UnknownTransfer)?;
+    match direction {
+        Direction::Send => cancel_send(receiving, id).await,
+        Direction::Receive => stop_transfer(receiving, id, TransferState::Cancelled),
+    }
+}
+
 /// Records a new transfer as queued, and returns its id.
 fn new_transfer(receiving: &Receiving, peer: EndpointId, offer: FileOffer) -> i64 {
     let id = receiving.next_id.fetch_add(1, Ordering::SeqCst);
     let now = contacts::now();
     let transfer = Transfer {
         id,
+        direction: Direction::Receive,
         peer,
         offer,
         state: TransferState::Queued,
@@ -1261,6 +1459,7 @@ fn new_transfer(receiving: &Receiving, peer: EndpointId, offer: FileOffer) -> i6
         Slot {
             transfer: transfer.clone(),
             abort: None,
+            cancel: None,
         },
     );
     let _ = receiving.events.send(NodeEvent::TransferChanged(transfer));
@@ -1397,6 +1596,9 @@ fn resume_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
     let (peer, offer) = {
         let book = lock_book(&receiving.book);
         let slot = book.get(&id).ok_or(NodeError::UnknownTransfer)?;
+        if slot.transfer.direction == Direction::Send {
+            return Err(NodeError::WrongTransferState("resumed"));
+        }
         match slot.transfer.state {
             TransferState::Paused | TransferState::Failed(_) => {}
             _ => return Err(NodeError::WrongTransferState("resumed")),
@@ -1416,6 +1618,9 @@ fn stop_transfer(receiving: &Receiving, id: i64, state: TransferState) -> Result
     let abort = {
         let mut book = lock_book(&receiving.book);
         let slot = book.get_mut(&id).ok_or(NodeError::UnknownTransfer)?;
+        if slot.transfer.direction == Direction::Send {
+            return Err(NodeError::WrongTransferState("paused"));
+        }
         let stoppable = matches!(
             slot.transfer.state,
             TransferState::Queued | TransferState::Active | TransferState::Paused
@@ -1528,7 +1733,7 @@ async fn revoke_share_and_release(receiving: &Receiving, id: i64) -> Result<(), 
 /// Deletes a transfer from the history, and releases its content. A transfer that is
 /// still moving cannot be deleted; pause or cancel it first.
 async fn delete_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
-    {
+    let (direction, root) = {
         let book = lock_book(&receiving.book);
         let slot = book.get(&id).ok_or(NodeError::UnknownTransfer)?;
         if matches!(
@@ -1537,17 +1742,22 @@ async fn delete_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError
         ) {
             return Err(NodeError::WrongTransferState("deleted"));
         }
-    }
+        (slot.transfer.direction, slot.transfer.offer.root)
+    };
     lock_book(&receiving.book).remove(&id);
     if let Some(database) = &receiving.database {
         database
             .delete_transfer(id)
             .map_err(|error| NodeError::Files(error.to_string()))?;
     }
-    if let Some(store) = &receiving.store
-        && let Err(error) = store.tags().delete(format!("transfer-{id}")).await
-    {
-        warn!(%error, "could not release a transfer's content");
+    if let Some(store) = &receiving.store {
+        let tag = match direction {
+            Direction::Receive => format!("transfer-{id}"),
+            Direction::Send => format!("send-{root}"),
+        };
+        if let Err(error) = store.tags().delete(tag).await {
+            warn!(%error, "could not release a transfer's content");
+        }
     }
     Ok(())
 }
@@ -1557,24 +1767,14 @@ async fn delete_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError
 async fn clear_cache(receiving: &Receiving) -> Result<(), NodeError> {
     let finished: Vec<i64> = lock_book(&receiving.book)
         .values()
-        .filter(|slot| slot.transfer.state == TransferState::Completed)
+        .filter(|slot| {
+            slot.transfer.direction == Direction::Receive
+                && slot.transfer.state == TransferState::Completed
+        })
         .map(|slot| slot.transfer.id)
         .collect();
     for id in finished {
         delete_transfer(receiving, id).await?;
-    }
-    if let Some(store) = &receiving.store {
-        let mut sent = store
-            .tags()
-            .list_prefix("send-")
-            .await
-            .map_err(|error| NodeError::Files(error.to_string()))?;
-        while let Some(tag) = sent.next().await {
-            let tag = tag.map_err(|error| NodeError::Files(error.to_string()))?;
-            if let Err(error) = store.tags().delete(tag.name.0.clone()).await {
-                warn!(%error, "could not release a sent file");
-            }
-        }
     }
     Ok(())
 }
@@ -1586,7 +1786,10 @@ async fn storage_usage(
 ) -> Result<StorageUsage, NodeError> {
     let received_bytes = lock_book(&receiving.book)
         .values()
-        .filter(|slot| slot.transfer.state == TransferState::Completed)
+        .filter(|slot| {
+            slot.transfer.direction == Direction::Receive
+                && slot.transfer.state == TransferState::Completed
+        })
         .map(|slot| slot.transfer.offer.bytes)
         .sum();
     let mut folder_bytes = 0;
@@ -1909,6 +2112,17 @@ impl ProtocolHandler for GroovyProtocol {
                         },
                         _ = connection.closed() => break,
                     }
+                }
+                // An offer the peer has not had answered is withdrawn when it leaves.
+                let withdrawn = inbox
+                    .offers
+                    .lock()
+                    .map(|mut offers| offers.remove(&endpoint_id).is_some())
+                    .unwrap_or(false);
+                if withdrawn {
+                    let _ = inbox
+                        .events
+                        .send(NodeEvent::OfferWithdrawn { peer: endpoint_id });
                 }
                 let _ = inbox.events.send(NodeEvent::PeerDisconnected(endpoint_id));
             }

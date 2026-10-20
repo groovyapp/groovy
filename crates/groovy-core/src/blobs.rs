@@ -16,6 +16,9 @@ use crate::node::PeerGate;
 /// The hashes anyone may fetch: the roots and files of active shares.
 pub type SharedHashes = Arc<Mutex<HashSet<Hash>>>;
 
+/// Hashes withdrawn by their sender. They are refused to everyone, trusted peers included.
+pub type Withdrawn = Arc<Mutex<HashSet<Hash>>>;
+
 /// The event sender blob serving reports to, and the receiver the decisions are made on.
 pub fn event_channel() -> (EventSender, mpsc::Receiver<ProviderMessage>) {
     let (tx, rx) = mpsc::channel(64);
@@ -33,6 +36,7 @@ pub async fn decide(
     mut messages: mpsc::Receiver<ProviderMessage>,
     gate: Arc<dyn PeerGate>,
     shared: SharedHashes,
+    withdrawn: Withdrawn,
 ) {
     // Which peer each connection belongs to, so a request can be checked against it.
     let mut peers = HashMap::new();
@@ -53,12 +57,19 @@ pub async fn decide(
             }
             ProviderMessage::GetRequestReceived(msg) => {
                 let hash = msg.inner.request.hash;
+                let withdrawn_hash = withdrawn
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&hash);
                 let trusted = trusted(&peers, &gate, msg.inner.connection_id);
                 let shared = shared
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .contains(&hash);
-                let _ = msg.tx.send(verdict(trusted || shared)).await;
+                let _ = msg
+                    .tx
+                    .send(verdict(!withdrawn_hash && (trusted || shared)))
+                    .await;
             }
             // Asking for several blobs at once is for contacts only.
             ProviderMessage::GetManyRequestReceived(msg) => {

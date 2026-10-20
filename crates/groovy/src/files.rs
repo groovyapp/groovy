@@ -10,7 +10,7 @@ use gpui::{
     prelude::*, px,
 };
 use groovy_core::shares::Share;
-use groovy_core::transfers::{Transfer, TransferState};
+use groovy_core::transfers::{Direction, Transfer, TransferState};
 use groovy_core::{Database, EndpointAddr, EndpointId, SharePreview, Trust};
 use tracing::warn;
 
@@ -298,8 +298,18 @@ pub fn format_eta(remaining: Duration) -> String {
     }
 }
 
-fn state_label(state: &TransferState) -> SharedString {
-    match state {
+/// What a transfer's state reads as. A send is waiting for, or has, the peer's answer.
+fn state_label(transfer: &Transfer) -> SharedString {
+    if transfer.direction == Direction::Send {
+        return match &transfer.state {
+            TransferState::Queued => "Waiting for an answer".into(),
+            TransferState::Completed => "Accepted".into(),
+            TransferState::Failed(error) => format!("Not sent: {error}").into(),
+            TransferState::Cancelled => "Cancelled".into(),
+            TransferState::Active | TransferState::Paused => "Sending".into(),
+        };
+    }
+    match &transfer.state {
         TransferState::Queued => "Queued".into(),
         TransferState::Active => "Receiving".into(),
         TransferState::Paused => "Paused".into(),
@@ -386,7 +396,9 @@ impl Render for FilesView {
             .collect();
         let transfer_rows = transfers
             .iter()
-            .filter(|transfer| transfer.state != TransferState::Completed)
+            .filter(|transfer| {
+                transfer.direction == Direction::Send || transfer.state != TransferState::Completed
+            })
             .map(|transfer| {
                 let id = transfer.id;
                 let fraction = if transfer.offer.bytes == 0 {
@@ -416,30 +428,45 @@ impl Render for FilesView {
                 };
 
                 let mut controls = div().flex().flex_row().gap_2();
-                if matches!(
-                    transfer.state,
-                    TransferState::Queued | TransferState::Active
-                ) {
+                // A send cannot be paused or resumed. It can be cancelled while it waits, or after
+                // it is accepted, which stops the peer getting the files.
+                let receiving = transfer.direction == Direction::Receive;
+                if receiving
+                    && matches!(
+                        transfer.state,
+                        TransferState::Queued | TransferState::Active
+                    )
+                {
                     controls = controls.child(
                         Button::new(format!("transfer-pause-{id}"), "Pause")
                             .variant(Variant::Secondary)
                             .on_click(move |_, cx| control(cx, id, Control::Pause)),
                     );
                 }
-                if matches!(
-                    transfer.state,
-                    TransferState::Paused | TransferState::Failed(_)
-                ) {
+                if receiving
+                    && matches!(
+                        transfer.state,
+                        TransferState::Paused | TransferState::Failed(_)
+                    )
+                {
                     controls = controls.child(
                         Button::new(format!("transfer-resume-{id}"), "Resume")
                             .variant(Variant::Secondary)
                             .on_click(move |_, cx| control(cx, id, Control::Resume)),
                     );
                 }
-                if matches!(
-                    transfer.state,
-                    TransferState::Queued | TransferState::Active | TransferState::Paused
-                ) {
+                let cancellable = if receiving {
+                    matches!(
+                        transfer.state,
+                        TransferState::Queued | TransferState::Active | TransferState::Paused
+                    )
+                } else {
+                    matches!(
+                        transfer.state,
+                        TransferState::Queued | TransferState::Completed
+                    )
+                };
+                if cancellable {
                     controls = controls.child(
                         Button::new(format!("transfer-cancel-{id}"), "Cancel")
                             .variant(Variant::Danger)
@@ -466,9 +493,10 @@ impl Render for FilesView {
                                     .child(div().text_sm().child(describe(transfer)))
                                     .child(div().text_xs().text_color(theme.text_muted).child(
                                         format!(
-                                            "From {} · {}",
+                                            "{} {} · {}",
+                                            if receiving { "From" } else { "To" },
                                             abbreviate_id(&transfer.peer.to_string()),
-                                            state_label(&transfer.state)
+                                            state_label(transfer)
                                         ),
                                     )),
                             )
@@ -481,7 +509,10 @@ impl Render for FilesView {
         // Received files: each one can be opened, or shown in its folder.
         let received = node.map(|node| {
             node.transfers()
-                .filter(|transfer| transfer.state == TransferState::Completed)
+                .filter(|transfer| {
+                    transfer.direction == Direction::Receive
+                        && transfer.state == TransferState::Completed
+                })
                 .flat_map(|transfer| node.saved_files(transfer.id).to_vec())
                 .map(|path| {
                     let open_path = path.clone();
