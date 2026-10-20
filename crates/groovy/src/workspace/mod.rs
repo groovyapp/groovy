@@ -14,6 +14,7 @@ use crate::{
     data::AppData,
     files::FilesView,
     folders::FoldersView,
+    messages::MessagesView,
     node::{NodeState, answer_pairing},
     onboarding::{self, Onboarding, OnboardingEvent},
     peers::PeersView,
@@ -42,6 +43,7 @@ pub struct Workspace {
     peers: Entity<PeersView>,
     files: Entity<FilesView>,
     folders: Entity<FoldersView>,
+    messages: Entity<MessagesView>,
     _appearance_subscription: Subscription,
 }
 
@@ -89,6 +91,7 @@ impl Workspace {
         let peers = cx.new(|cx| PeersView::new(database.clone(), cx));
         let files = cx.new(|cx| FilesView::new(database.clone(), cx));
         let folders = cx.new(FoldersView::new);
+        let messages = cx.new(|cx| MessagesView::new(database.clone(), cx));
 
         Self {
             current,
@@ -99,6 +102,7 @@ impl Workspace {
             peers,
             files,
             folders,
+            messages,
             _appearance_subscription,
         }
     }
@@ -262,16 +266,21 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .p_6()
-                    .gap_2()
+                    .min_h_0()
+                    .when(self.current != Screen::Messages, |d| d.p_6().gap_2())
                     .id("screen-content")
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.current.label()),
-                    )
+                    .when(self.current != Screen::Messages, |d| d.overflow_y_scroll())
+                    .when(self.current != Screen::Messages, |d| {
+                        d.child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.current.label()),
+                        )
+                    })
+                    .when(self.current == Screen::Messages, |d| {
+                        d.child(self.messages.clone())
+                    })
                     .when(self.current == Screen::Settings, |d| {
                         d.child(self.settings.clone())
                     })
@@ -287,7 +296,11 @@ impl Workspace {
                     .when(
                         !matches!(
                             self.current,
-                            Screen::Settings | Screen::Peers | Screen::Files | Screen::Storage
+                            Screen::Settings
+                                | Screen::Peers
+                                | Screen::Files
+                                | Screen::Storage
+                                | Screen::Messages
                         ),
                         |d| {
                             d.child(
