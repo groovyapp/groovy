@@ -16,6 +16,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh::EndpointId;
+use iroh_blobs::Hash;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,9 +24,31 @@ use thiserror::Error;
 use crate::db::{Database, DbError};
 
 /// The version of [`WireMessage`]. A message in another version is refused.
-pub const MESSAGE_VERSION: u16 = 1;
+pub const MESSAGE_VERSION: u16 = 2;
 /// Longest body accepted, in bytes. Well under the protocol's message limit.
 pub const MAX_BODY_BYTES: usize = 4 * 1024;
+/// Most attachments a message carries.
+pub const MAX_ATTACHMENTS: usize = 8;
+/// Largest preview an attachment carries, in bytes. A larger one is left out.
+pub const MAX_PREVIEW_BYTES: usize = 32 * 1024;
+/// Longest name an attachment can have, in bytes.
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// A file sent with a message. The file is fetched from the sender on request; the preview, if
+/// there is one, comes with the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// The file's name, as the sender had it.
+    pub name: String,
+    /// The root of the collection holding the file, which the recipient fetches.
+    pub root: Hash,
+    /// How many files the collection holds. Always one for an attachment.
+    pub files: u64,
+    /// The file's size, in bytes.
+    pub bytes: u64,
+    /// A small PNG of an image, so the message can show it before the file is fetched.
+    pub preview: Option<Vec<u8>>,
+}
 
 /// The random identifier of a message.
 pub type MessageId = [u8; 16];
@@ -77,6 +100,8 @@ pub struct Message {
     pub body: String,
     pub reply_to: Option<MessageId>,
     pub state: DeliveryState,
+    /// Files sent with the message, in the order they were attached.
+    pub attachments: Vec<Attachment>,
 }
 
 impl Message {
@@ -94,6 +119,7 @@ pub struct WireMessage {
     pub timestamp: i64,
     pub body: String,
     pub reply_to: Option<MessageId>,
+    pub attachments: Vec<Attachment>,
 }
 
 /// Why a message is refused.
@@ -105,6 +131,38 @@ pub enum MessageError {
     TooLong,
     #[error("this message is in a version of Groovy messages this build does not read")]
     Version,
+    #[error("a message can carry at most {MAX_ATTACHMENTS} files")]
+    TooManyAttachments,
+    #[error("an attachment needs a name")]
+    NameMissing,
+}
+
+/// Checks a message's attachments: how many, their names, and that a preview is not too big.
+/// A preview that is too big is left out, and the attachment kept.
+pub fn clean_attachments(attachments: &[Attachment]) -> Result<Vec<Attachment>, MessageError> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(MessageError::TooManyAttachments);
+    }
+    attachments
+        .iter()
+        .map(|attachment| {
+            let name = attachment.name.trim();
+            if name.is_empty() {
+                return Err(MessageError::NameMissing);
+            }
+            if name.len() > MAX_NAME_BYTES {
+                return Err(MessageError::TooLong);
+            }
+            Ok(Attachment {
+                name: name.to_owned(),
+                preview: attachment
+                    .preview
+                    .clone()
+                    .filter(|preview| preview.len() <= MAX_PREVIEW_BYTES),
+                ..attachment.clone()
+            })
+        })
+        .collect()
 }
 
 /// Checks a body and returns it without surrounding whitespace.
@@ -168,6 +226,7 @@ fn decode(conversation: EndpointId, row: Row) -> Option<Message> {
         body,
         reply_to,
         state,
+        attachments: Vec::new(),
     })
 }
 
@@ -187,7 +246,7 @@ impl Database {
     /// when a sender resends one.
     pub fn insert_message(&self, message: &Message) -> Result<bool, DbError> {
         self.with_conn(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 "INSERT OR IGNORE INTO messages
                     (id, conversation, author, timestamp, body, reply_to, state)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -200,8 +259,26 @@ impl Database {
                     message.reply_to.as_ref().map(id_bytes),
                     message.state.as_str(),
                 ],
-            )
-            .map(|changed| changed > 0)
+            )?;
+            if changed > 0 {
+                for (position, attachment) in message.attachments.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO message_attachments
+                            (message, position, name, root, files, bytes, preview)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            id_bytes(&message.id),
+                            position as i64,
+                            attachment.name,
+                            attachment.root.as_bytes().as_slice(),
+                            attachment.files as i64,
+                            attachment.bytes as i64,
+                            attachment.preview,
+                        ],
+                    )?;
+                }
+            }
+            Ok(changed > 0)
         })
     }
 
@@ -227,6 +304,40 @@ impl Database {
         })
     }
 
+    /// The attachments of a message, in the order they were attached.
+    fn attachments_of(&self, id: &MessageId) -> Result<Vec<Attachment>, DbError> {
+        let rows = self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT name, root, files, bytes, preview FROM message_attachments
+                 WHERE message = ?1 ORDER BY position",
+            )?;
+            let rows = statement
+                .query_map([id_bytes(id)], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(name, root, files, bytes, preview)| {
+                Some(Attachment {
+                    name,
+                    root: Hash::from_bytes(<[u8; 32]>::try_from(root.as_slice()).ok()?),
+                    files: u64::try_from(files).ok()?,
+                    bytes: u64::try_from(bytes).ok()?,
+                    preview,
+                })
+            })
+            .collect())
+    }
+
     /// One message by id, if it is stored.
     pub fn message(&self, id: MessageId) -> Result<Option<Message>, DbError> {
         let found = self.with_conn(|conn| {
@@ -238,11 +349,20 @@ impl Database {
             )
             .optional()
         })?;
-        Ok(found.and_then(|(row, conversation)| {
-            let conversation =
-                EndpointId::from_bytes(&<[u8; 32]>::try_from(conversation).ok()?).ok()?;
-            decode(conversation, row)
-        }))
+        let Some((row, conversation)) = found else {
+            return Ok(None);
+        };
+        let Ok(conversation) = <[u8; 32]>::try_from(conversation.as_slice())
+            .map_err(|_| ())
+            .and_then(|bytes| EndpointId::from_bytes(&bytes).map_err(|_| ()))
+        else {
+            return Ok(None);
+        };
+        let Some(mut message) = decode(conversation, row) else {
+            return Ok(None);
+        };
+        message.attachments = self.attachments_of(&message.id)?;
+        Ok(Some(message))
     }
 
     /// The timestamp of this device's latest message in a conversation, if it has one.
@@ -278,6 +398,9 @@ impl Database {
             .into_iter()
             .filter_map(|row| decode(*conversation, row))
             .collect();
+        for message in &mut messages {
+            message.attachments = self.attachments_of(&message.id)?;
+        }
         order(&mut messages);
         Ok(messages)
     }
@@ -298,6 +421,7 @@ mod tests {
             body: "hi".to_owned(),
             reply_to: None,
             state: DeliveryState::Delivered,
+            attachments: Vec::new(),
         }
     }
 
@@ -336,6 +460,7 @@ mod tests {
             timestamp: 1_700_000_000_000,
             body: "hello".to_owned(),
             reply_to: Some([5; 16]),
+            attachments: Vec::new(),
         };
         let bytes = postcard::to_allocvec(&wire).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&bytes).unwrap();
