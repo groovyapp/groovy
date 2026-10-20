@@ -223,6 +223,21 @@ impl Database {
         })
     }
 
+    /// Every address kept, so the endpoint can reach those devices by id.
+    pub fn all_addresses(&self) -> Result<Vec<EndpointAddr>, DbError> {
+        let rows: Vec<Vec<u8>> = self.with_conn(|conn| {
+            let mut statement = conn.prepare("SELECT addr FROM device_addrs")?;
+            let rows = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|bytes| postcard::from_bytes::<EndpointAddr>(&bytes).ok())
+            .collect())
+    }
+
     /// The last address a device was reached at, if one is kept.
     pub fn address_of(&self, device: &EndpointId) -> Result<Option<EndpointAddr>, DbError> {
         let bytes: Option<Vec<u8>> = self.with_conn(|conn| {

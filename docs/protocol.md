@@ -125,4 +125,16 @@ A message is queued for each device that must have it: the contact's own endpoin
 
 ## Not yet specified
 
-Groups (#43 to #44), attachments (#45), and search (#46) are not built. Each will get a section here when it is.
+## Group chat
+
+A group has a random 32-byte id, and its gossip topic is that id. A group message is a `GroupEnvelope`: version, group, a random id, the author's endpoint id, timestamp, body, optional `reply_to`, and a signature by the author's key over every other field. A member accepts a message only if its signature verifies and its author is the member or a trusted contact. A relayed message therefore still shows its real author.
+
+A ticket (`groovygroup1…`, base32 of postcard) invites someone: the group id, and up to eight members' addresses to join through. Gossip itself accepts only trusted peers, as the other gossip uses do.
+
+A member that connects to another member asks it for what it missed with `Request::GroupHistory { group, after }`, where `after` is the newest message the asker has. The answer is a `GroupPage`: up to eight envelopes in order, a flag saying whether more follow, and the addresses of the group's other members the answering device knows. Each envelope carries its signature, so a page can come from any member. Only trusted peers get an answer.
+
+Members and their roles, and removing a member, are not yet built (#44). Groups are not yet on screen (#47).
+
+## Not yet specified
+
+Group membership and permissions (#44), attachments (#45), and search (#46) are not built. Each will get a section here when it is.

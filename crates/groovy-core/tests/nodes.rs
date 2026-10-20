@@ -2625,3 +2625,103 @@ async fn a_message_reaches_a_contacts_linked_device_when_the_contact_is_offline(
     assert!(alice.shutdown(TIMEOUT));
     assert!(phone.shutdown(TIMEOUT));
 }
+
+/// Waits until a node's messages in a group satisfy `check`.
+async fn wait_for_group(
+    node: &NodeHandle,
+    group: [u8; 32],
+    what: &str,
+    check: impl Fn(&[groovy_core::groups::GroupMessage]) -> bool,
+) -> Vec<groovy_core::groups::GroupMessage> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let listed = node
+                .group_messages(group)
+                .await
+                .expect("the group can be read");
+            if check(&listed) {
+                return listed;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the group's messages never {what}"))
+}
+
+#[tokio::test]
+async fn a_group_reaches_every_member_and_an_offline_member_catches_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keys = [
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    ];
+    let dirs = [
+        fresh_dir(&tmp, "ada"),
+        fresh_dir(&tmp, "ben"),
+        fresh_dir(&tmp, "cam"),
+    ];
+    // Every member trusts the other two.
+    for (i, dir) in dirs.iter().enumerate() {
+        for (j, key) in keys.iter().enumerate() {
+            if i != j {
+                trust_in(dir, key);
+            }
+        }
+    }
+    let (ada, _) = blob_node_collecting(&dirs[0], keys[0].clone(), None).await;
+    let (ben, _) = blob_node_collecting(&dirs[1], keys[1].clone(), None).await;
+    let (cam, _) = blob_node_collecting(&dirs[2], keys[2].clone(), None).await;
+
+    let group = ada.create_group("friends".into()).await.unwrap();
+    let ticket = ada.group_ticket(group).await.unwrap();
+    ben.join_group(ticket.clone()).await.unwrap();
+    cam.join_group(ticket).await.unwrap();
+
+    ada.send_group_message(group, "hello from ada".into(), None)
+        .await
+        .unwrap();
+    ben.send_group_message(group, "hello from ben".into(), None)
+        .await
+        .unwrap();
+    for (name, node) in [("ada", &ada), ("ben", &ben), ("cam", &cam)] {
+        let listed = wait_for_group(node, group, "reached every member", |listed| {
+            listed.len() == 2
+        })
+        .await;
+        let authors: Vec<_> = listed.iter().map(|m| m.author).collect();
+        assert!(
+            authors.contains(&keys[0].public()),
+            "{name} has ada's message"
+        );
+        assert!(
+            authors.contains(&keys[1].public()),
+            "{name} has ben's message"
+        );
+    }
+
+    // Cam goes offline. The others keep talking.
+    assert!(cam.shutdown(TIMEOUT));
+    ada.send_group_message(group, "while cam was away".into(), None)
+        .await
+        .unwrap();
+    ben.send_group_message(group, "ben too".into(), None)
+        .await
+        .unwrap();
+    wait_for_group(&ada, group, "had three messages", |listed| {
+        listed.len() == 3
+    })
+    .await;
+
+    // Cam comes back, and asks the members it reconnects to for what it missed.
+    let (cam, _) = blob_node_collecting(&dirs[2], keys[2].clone(), None).await;
+    let caught_up = wait_for_group(&cam, group, "caught up", |listed| listed.len() == 4).await;
+    let bodies: Vec<&str> = caught_up.iter().map(|m| m.body.as_str()).collect();
+    assert!(bodies.contains(&"while cam was away"));
+    assert!(bodies.contains(&"ben too"));
+
+    assert!(ada.shutdown(TIMEOUT));
+    assert!(ben.shutdown(TIMEOUT));
+    assert!(cam.shutdown(TIMEOUT));
+}

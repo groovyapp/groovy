@@ -49,6 +49,7 @@ use crate::folders::{
     self, ExportReport, Folder, FolderAccess, FolderEntry, FolderStatus, Protected,
 };
 use crate::gated::TrustedOnly;
+use crate::groups::{self, GroupEnvelope, GroupId, GroupMessage, GroupPage, GroupTicket};
 use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
 use crate::messages::{self, DeliveryState, MESSAGE_VERSION, Message, MessageId};
 use crate::outbox::{Outbox, Trigger};
@@ -60,6 +61,9 @@ use crate::shares::Share;
 use crate::storage::StorageUsage;
 use crate::transfers::{Direction, Transfer, TransferState};
 use crate::user::{DeviceCert, Revocation, UserClaim, UserDevice, UserKeyStore};
+use iroh::address_lookup::MemoryLookup;
+use iroh_gossip::api::{Event as GossipEvent, GossipSender};
+use iroh_gossip::proto::TopicId;
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -105,6 +109,8 @@ pub enum NodeError {
     Folder(String),
     #[error("message failed: {0}")]
     Message(String),
+    #[error("group chat failed: {0}")]
+    Group(String),
     #[error("linking devices failed: {0}")]
     User(String),
     #[error("there is no transfer with that id")]
@@ -229,6 +235,8 @@ pub enum NodeEvent {
     },
     /// A direct message arrived from a contact and is stored.
     MessageReceived(Message),
+    /// A group message arrived from a member and is stored.
+    GroupMessageReceived(GroupMessage),
     /// A transfer was added, or its state or progress changed. Progress updates come
     /// at most every 100 ms for each transfer.
     TransferChanged(Transfer),
@@ -322,6 +330,20 @@ enum Command {
         oneshot::Sender<Result<Message, NodeError>>,
     ),
     Messages(EndpointId, oneshot::Sender<Result<Vec<Message>, NodeError>>),
+    CreateGroup(String, oneshot::Sender<Result<GroupId, NodeError>>),
+    JoinGroup(String, oneshot::Sender<Result<GroupId, NodeError>>),
+    GroupTicketFor(GroupId, oneshot::Sender<Result<String, NodeError>>),
+    SendGroupMessage(
+        GroupId,
+        String,
+        Option<MessageId>,
+        oneshot::Sender<Result<GroupMessage, NodeError>>,
+    ),
+    GroupMessages(
+        GroupId,
+        oneshot::Sender<Result<Vec<GroupMessage>, NodeError>>,
+    ),
+    Groups(oneshot::Sender<Result<Vec<groups::GroupInfo>, NodeError>>),
     FolderStatus(
         NamespaceId,
         oneshot::Sender<Result<FolderStatus, NodeError>>,
@@ -466,7 +488,9 @@ impl Node {
     }
 }
 
-async fn bind(config: &NodeConfig) -> Result<Endpoint, NodeError> {
+async fn bind(config: &NodeConfig) -> Result<(Endpoint, MemoryLookup), NodeError> {
+    // Addresses this node learns of other devices, so it can reach them by id.
+    let directory = MemoryLookup::new();
     let builder = match config.network {
         Network::Public => {
             let mut builder = Endpoint::builder(presets::N0);
@@ -502,9 +526,11 @@ async fn bind(config: &NodeConfig) -> Result<Endpoint, NodeError> {
             .map_err(NodeError::InvalidBindAddress)?,
     };
     builder
+        .address_lookup(directory.clone())
         .secret_key(config.secret_key.clone())
         .bind()
         .await
+        .map(|endpoint| (endpoint, directory))
         .map_err(NodeError::Bind)
 }
 
@@ -518,8 +544,8 @@ async fn run(
     // Weak, so the node still stops once every handle is dropped.
     startup: Startup,
 ) {
-    let endpoint = match bind(&config).await {
-        Ok(endpoint) => endpoint,
+    let (endpoint, directory) = match bind(&config).await {
+        Ok(bound) => bound,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
@@ -554,7 +580,24 @@ async fn run(
         }
         None => None,
     };
+    // Gossip carries group chat and the shared folders' replicas, so it runs wherever there is a
+    // database to keep them in.
+    let gossip = config
+        .database
+        .as_ref()
+        .map(|_| Gossip::builder().spawn(endpoint.clone()));
+    if let Some(database) = &config.database
+        && let Ok(addresses) = database.all_addresses()
+    {
+        for addr in addresses {
+            directory.add_endpoint_info(addr);
+        }
+    }
     let receiving = Receiving {
+        gossip: gossip.clone(),
+        groups: Arc::new(Mutex::new(HashMap::new())),
+        secret: config.secret_key.clone(),
+        directory: directory.clone(),
         endpoint: endpoint.clone(),
         events: events.clone(),
         store: blobs.clone(),
@@ -578,6 +621,7 @@ async fn run(
     if let Some(outbox) = receiving.outbox.clone() {
         spawn_outbox(receiving.clone(), outbox, events.subscribe());
     }
+    spawn_groups(&receiving);
     let mut router = Router::builder(endpoint.clone()).accept(
         protocol::ALPN,
         GroovyProtocol {
@@ -591,13 +635,16 @@ async fn run(
                 commands: startup.commands.clone(),
                 limiter: Arc::new(std::sync::Mutex::new(RateLimiter::default())),
                 database: config.database.clone(),
+                directory: directory.clone(),
             },
         },
     );
+    if let Some(gossip) = &gossip {
+        router = router.accept(GOSSIP_ALPN, TrustedOnly::new(gossip.clone(), gate.clone()));
+    }
     // Shared folders keep their replicas beside the blobs, and need both to work.
-    let folders = match (&blobs, &config.blobs, &config.database) {
-        (Some(store), Some(blobs_dir), Some(database)) => {
-            let gossip = Gossip::builder().spawn(endpoint.clone());
+    let folders = match (&blobs, &config.blobs, &config.database, &gossip) {
+        (Some(store), Some(blobs_dir), Some(database), Some(gossip)) => {
             let docs_dir = blobs_dir.parent().unwrap_or(blobs_dir).join("docs");
             if let Err(error) = std::fs::create_dir_all(&docs_dir) {
                 warn!(%error, "shared folders are not available");
@@ -638,12 +685,10 @@ async fn run(
                         Ok(saved) => saved.iter().for_each(|folder| state.sync(folder)),
                         Err(error) => warn!(%error, "could not read the shared folders"),
                     }
-                    router = router
-                        .accept(GOSSIP_ALPN, TrustedOnly::new(gossip.clone(), gate.clone()))
-                        .accept(
-                            iroh_docs::ALPN,
-                            TrustedOnly::new(docs.clone(), gate.clone()),
-                        );
+                    router = router.accept(
+                        iroh_docs::ALPN,
+                        TrustedOnly::new(docs.clone(), gate.clone()),
+                    );
                     Some(state)
                 }
                 Err(error) => {
@@ -1006,6 +1051,33 @@ async fn run(
                         let outcome = send_message(&receiving, addr, body, reply_to).await;
                         let _ = reply.send(outcome);
                     });
+                }
+                Some(Command::CreateGroup(name, reply)) => {
+                    let outcome = create_group(&receiving, &name);
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::JoinGroup(ticket, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = join_group(&receiving, &ticket).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::GroupTicketFor(group, reply)) => {
+                    let _ = reply.send(group_ticket(&receiving, group));
+                }
+                Some(Command::SendGroupMessage(group, body, reply_to, reply)) => {
+                    let _ = reply.send(send_group_message(&receiving, group, body, reply_to));
+                }
+                Some(Command::GroupMessages(group, reply)) => {
+                    let outcome = group_database(&receiving)
+                        .and_then(|database| database.group_messages(&group).map_err(group_error));
+                    let _ = reply.send(outcome);
+                }
+                Some(Command::Groups(reply)) => {
+                    let outcome = group_database(&receiving)
+                        .and_then(|database| database.groups().map_err(group_error));
+                    let _ = reply.send(outcome);
                 }
                 Some(Command::Messages(peer, reply)) => {
                     let outcome = match &receiving.database {
@@ -1512,6 +1584,13 @@ struct Receiving {
     gate: Arc<dyn PeerGate>,
     /// Messages waiting for their devices to take them. Kept only where there is a database.
     outbox: Option<Outbox>,
+    gossip: Option<Gossip>,
+    /// The gossip senders of the groups this node is running.
+    groups: GroupSenders,
+    /// This node's key, which signs the group messages it writes.
+    secret: SecretKey,
+    /// Addresses of other devices, so they can be dialed by id.
+    directory: MemoryLookup,
 }
 
 /// What a send's offer carries before its files are imported.
@@ -1548,6 +1627,7 @@ async fn send_message(
     database
         .remember_address(addr.id, &addr)
         .map_err(|error| NodeError::Message(error.to_string()))?;
+    receiving.directory.add_endpoint_info(addr.clone());
     // Never earlier than this device's previous message to the contact, so its own order holds.
     let timestamp = match database.last_sent_timestamp(&addr.id, &own) {
         Ok(Some(last)) => messages::now_millis().max(last + 1),
@@ -1577,6 +1657,350 @@ async fn send_message(
     }
     Ok(message)
 }
+
+/// The senders of the groups this node is running, so a message can be sent to a group's topic.
+type GroupSenders = Arc<Mutex<HashMap<GroupId, GossipSender>>>;
+
+/// Starts the gossip topic of each group this device is in. Each one joins with the members it
+/// knows, and fetches what it missed from them once they are connected.
+fn spawn_groups(receiving: &Receiving) {
+    let Some(database) = receiving.database.clone() else {
+        return;
+    };
+    let groups = match database.groups() {
+        Ok(groups) => groups,
+        Err(error) => {
+            warn!(%error, "could not read the groups");
+            return;
+        }
+    };
+    let own = receiving.endpoint.id();
+    for group in groups {
+        let members: Vec<EndpointId> = database
+            .group_members(&group.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|member| *member != own)
+            .collect();
+        tokio::spawn(run_group(receiving.clone(), group.id, members));
+    }
+}
+
+/// Makes a new group, and returns its id. Its ticket is what others join with.
+fn create_group(receiving: &Receiving, name: &str) -> Result<GroupId, NodeError> {
+    let database = group_database(receiving)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(NodeError::Group("a group needs a name".to_owned()));
+    }
+    let group = groups::new_group_id();
+    database
+        .create_group(group, name, messages::now_millis() / 1000)
+        .map_err(group_error)?;
+    database
+        .add_group_member(group, &receiving.endpoint.id())
+        .map_err(group_error)?;
+    tokio::spawn(run_group(receiving.clone(), group, Vec::new()));
+    Ok(group)
+}
+
+/// Joins a group from its ticket. The group's messages are fetched from the members named in
+/// the ticket, when they can be reached.
+async fn join_group(receiving: &Receiving, text: &str) -> Result<GroupId, NodeError> {
+    let database = group_database(receiving)?;
+    let ticket = GroupTicket::parse(text).map_err(group_error)?;
+    let group = ticket.group;
+    if database.is_in_group(&group).map_err(group_error)? {
+        return Ok(group);
+    }
+    database
+        .create_group(group, "Group", messages::now_millis() / 1000)
+        .map_err(group_error)?;
+    database
+        .add_group_member(group, &receiving.endpoint.id())
+        .map_err(group_error)?;
+    let mut bootstrap = Vec::new();
+    for peer in &ticket.peers {
+        remember_peer(receiving, peer);
+        database
+            .add_group_member(group, &peer.id)
+            .map_err(group_error)?;
+        bootstrap.push(peer.id);
+    }
+    tokio::spawn(run_group(receiving.clone(), group, bootstrap));
+    // Ask the first member that answers for the messages so far.
+    for peer in &ticket.peers {
+        if peer.id != receiving.endpoint.id()
+            && fetch_history(receiving, group, peer.id).await.is_ok()
+        {
+            break;
+        }
+    }
+    Ok(group)
+}
+
+/// The ticket that invites someone to a group: the group, and this device and the other members
+/// it has addresses for.
+fn group_ticket(receiving: &Receiving, group: GroupId) -> Result<String, NodeError> {
+    let database = group_database(receiving)?;
+    if !database.is_in_group(&group).map_err(group_error)? {
+        return Err(NodeError::Group(
+            "there is no group with that id".to_owned(),
+        ));
+    }
+    let own = receiving.endpoint.id();
+    let mut peers = vec![receiving.endpoint.addr()];
+    for member in database.group_members(&group).map_err(group_error)? {
+        if member == own {
+            continue;
+        }
+        if let Some(addr) = database.address_of(&member).map_err(group_error)? {
+            peers.push(addr);
+        }
+    }
+    peers.truncate(MAX_TICKET_PEERS);
+    Ok(GroupTicket { group, peers }.encode())
+}
+
+/// Sends a message to a group. It is stored here, and sent to the members online now. The
+/// others fetch it when they come back.
+fn send_group_message(
+    receiving: &Receiving,
+    group: GroupId,
+    body: String,
+    reply_to: Option<MessageId>,
+) -> Result<GroupMessage, NodeError> {
+    let database = group_database(receiving)?;
+    if !database.is_in_group(&group).map_err(group_error)? {
+        return Err(NodeError::Group(
+            "there is no group with that id".to_owned(),
+        ));
+    }
+    let body = messages::clean_body(&body).map_err(group_error)?;
+    let own = receiving.endpoint.id();
+    // Never earlier than this device's previous message to the group, so its own order holds.
+    let timestamp = match database.latest_author_timestamp(&group, &own) {
+        Ok(Some(last)) => messages::now_millis().max(last + 1),
+        Ok(None) => messages::now_millis(),
+        Err(error) => return Err(group_error(error)),
+    };
+    let envelope = groups::sign(
+        &receiving.secret,
+        group,
+        messages::new_id(),
+        timestamp,
+        body,
+        reply_to,
+    );
+    database
+        .insert_group_message(&envelope)
+        .map_err(group_error)?;
+    let sender = receiving
+        .groups
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&group)
+        .cloned();
+    if let Some(sender) = sender {
+        let content = postcard::to_stdvec(&envelope).map_err(group_error)?;
+        tokio::spawn(async move {
+            let _ = sender.broadcast(bytes::Bytes::from(content)).await;
+        });
+    }
+    Ok(GroupMessage {
+        id: envelope.id,
+        group,
+        author: own,
+        timestamp,
+        body: envelope.body,
+        reply_to,
+    })
+}
+
+/// Runs one group's gossip topic until the node stops. Messages that arrive are checked and
+/// stored, and each member that connects is asked for what it has.
+async fn run_group(receiving: Receiving, group: GroupId, bootstrap: Vec<EndpointId>) {
+    let Some(gossip) = receiving.gossip.clone() else {
+        return;
+    };
+    let topic = match gossip
+        .subscribe(TopicId::from_bytes(group), bootstrap)
+        .await
+    {
+        Ok(topic) => topic,
+        Err(error) => {
+            warn!(%error, "could not join a group's topic");
+            return;
+        }
+    };
+    let (sender, mut receiver) = topic.split();
+    receiving
+        .groups
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(group, sender);
+    while let Some(event) = receiver.next().await {
+        match event {
+            Ok(GossipEvent::Received(message)) => {
+                if let Ok(envelope) = postcard::from_bytes::<GroupEnvelope>(&message.content)
+                    && envelope.group == group
+                {
+                    store_group_envelope(&receiving, envelope);
+                }
+            }
+            Ok(GossipEvent::NeighborUp(member)) => {
+                if let Some(database) = &receiving.database {
+                    let _ = database.add_group_member(group, &member);
+                }
+                let fetching = receiving.clone();
+                tokio::spawn(async move {
+                    let _ = fetch_history(&fetching, group, member).await;
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "a group's topic stopped");
+                break;
+            }
+        }
+    }
+    receiving
+        .groups
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&group);
+}
+
+/// Stores a group message if it is genuine and from a trusted contact. Returns whether it was
+/// new.
+fn store_group_envelope(receiving: &Receiving, envelope: GroupEnvelope) -> bool {
+    let Some(database) = receiving.database.clone() else {
+        return false;
+    };
+    let own = receiving.endpoint.id();
+    if groups::verify(&envelope).is_err() {
+        warn!("a group message's signature does not match its author; dropped");
+        return false;
+    }
+    if envelope.author != own && !receiving.gate.is_trusted(&envelope.author) {
+        return false;
+    }
+    match database.insert_group_message(&envelope) {
+        Ok(true) => {
+            let _ = receiving
+                .events
+                .send(NodeEvent::GroupMessageReceived(GroupMessage {
+                    id: envelope.id,
+                    group: envelope.group,
+                    author: envelope.author,
+                    timestamp: envelope.timestamp,
+                    body: envelope.body,
+                    reply_to: envelope.reply_to,
+                }));
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            warn!(%error, "could not store a group message");
+            false
+        }
+    }
+}
+
+/// Asks a member for the group's messages this device does not have, a page at a time.
+/// Returns how many new messages were stored.
+async fn fetch_history(
+    receiving: &Receiving,
+    group: GroupId,
+    peer: EndpointId,
+) -> Result<usize, NodeError> {
+    let database = group_database(receiving)?;
+    let own = receiving.endpoint.id();
+    let mut after = database
+        .latest_group_position(&group)
+        .map_err(group_error)?;
+    let mut stored = 0;
+    loop {
+        let addr = database
+            .address_of(&peer)
+            .map_err(group_error)?
+            .unwrap_or_else(|| EndpointAddr::from(peer));
+        let (connection, _peer) = open_peer(
+            &receiving.endpoint,
+            addr,
+            &receiving.profile,
+            &receiving.events,
+            &receiving.gate,
+        )
+        .await?;
+        let page = request_page(&connection, group, after).await;
+        connection.close(0u32.into(), b"synced");
+        let page = page?;
+        for member in page.members {
+            if member.id != own {
+                remember_peer(receiving, &member);
+                database
+                    .add_group_member(group, &member.id)
+                    .map_err(group_error)?;
+            }
+        }
+        if page.messages.is_empty() {
+            break;
+        }
+        let mut last = after;
+        for envelope in page.messages {
+            last = Some((envelope.timestamp, envelope.id));
+            if store_group_envelope(receiving, envelope) {
+                stored += 1;
+            }
+        }
+        if !page.more {
+            break;
+        }
+        after = last;
+    }
+    Ok(stored)
+}
+
+/// Sends one history request on a connection, and reads the page that answers it.
+async fn request_page(
+    connection: &Connection,
+    group: GroupId,
+    after: Option<(i64, MessageId)>,
+) -> Result<GroupPage, NodeError> {
+    let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
+    protocol::write_message(&mut send, &Request::GroupHistory { group, after })
+        .await
+        .map_err(NodeError::Connect)?;
+    protocol::read_message(&mut recv)
+        .await
+        .map_err(NodeError::Connect)
+}
+
+/// Remembers how to reach a peer, in the database and the endpoint's address book.
+fn remember_peer(receiving: &Receiving, addr: &EndpointAddr) {
+    if let Some(database) = &receiving.database {
+        let _ = database.remember_address(addr.id, addr);
+    }
+    receiving.directory.add_endpoint_info(addr.clone());
+}
+
+/// The database that group chat keeps its data in.
+fn group_database(receiving: &Receiving) -> Result<Arc<Database>, NodeError> {
+    receiving
+        .database
+        .clone()
+        .ok_or_else(|| NodeError::Group("group chat needs a database".to_owned()))
+}
+
+fn group_error(error: impl std::fmt::Display) -> NodeError {
+    NodeError::Group(error.to_string())
+}
+
+/// Most members a ticket names, so it stays short enough to paste.
+const MAX_TICKET_PEERS: usize = 8;
+/// Most members a history page names, so a page stays under the message limit.
+const MAX_PAGE_MEMBERS: usize = 16;
 
 /// Starts the outbox's background work: a flush to each device that connects, and a periodic
 /// check for messages whose retry time has come. The check also runs once at startup.
@@ -2695,6 +3119,7 @@ struct Inbox {
     commands: mpsc::WeakSender<Command>,
     limiter: Arc<std::sync::Mutex<RateLimiter>>,
     database: Option<Arc<Database>>,
+    directory: MemoryLookup,
 }
 
 impl Inbox {
@@ -2776,6 +3201,40 @@ impl Inbox {
                 }
                 reply_and_finish(&mut send, Reply::Stored).await;
             }
+            Request::GroupHistory { group, after } => {
+                let id = peer.endpoint_id;
+                // Only a trusted peer may read a group's history. Anyone else gets no answer.
+                if !self.gate.is_trusted(&id) {
+                    return;
+                }
+                let Some(database) = self.database.clone() else {
+                    return;
+                };
+                let Ok(mut rows) =
+                    database.group_envelopes_after(&group, after, groups::PAGE_SIZE + 1)
+                else {
+                    return;
+                };
+                let more = rows.len() > groups::PAGE_SIZE;
+                rows.truncate(groups::PAGE_SIZE);
+                // The other members this device has addresses for, so the asker can reach them.
+                let members = database
+                    .group_members(&group)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|member| *member != id && *member != self.own_id)
+                    .filter_map(|member| database.address_of(&member).ok().flatten())
+                    .take(MAX_PAGE_MEMBERS)
+                    .collect();
+                let page = GroupPage {
+                    messages: rows,
+                    more,
+                    members,
+                };
+                if protocol::write_message(&mut send, &page).await.is_ok() {
+                    let _ = send.finish();
+                }
+            }
             Request::Offer(offer) => {
                 let id = peer.endpoint_id;
                 // Only a trusted peer may offer files. Anyone else gets no answer.
@@ -2842,10 +3301,9 @@ impl ProtocolHandler for GroovyProtocol {
                 inbox.gate.handshook(&peer);
                 let endpoint_id = peer.endpoint_id;
                 if let Some(database) = &inbox.database {
-                    let _ = database.remember_address(
-                        endpoint_id,
-                        &crate::outbox::address_of_connection(&connection),
-                    );
+                    let addr = crate::outbox::address_of_connection(&connection);
+                    let _ = database.remember_address(endpoint_id, &addr);
+                    inbox.directory.add_endpoint_info(addr);
                 }
                 let _ = inbox.events.send(NodeEvent::PeerConnected(peer.clone()));
                 loop {
@@ -3147,6 +3605,71 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::LeaveFolder(namespace, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Makes a group, and returns its id. Invite others with [`NodeHandle::group_ticket`].
+    pub async fn create_group(&self, name: String) -> Result<GroupId, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::CreateGroup(name, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Joins a group from its ticket. Its messages are fetched from the members it names.
+    pub async fn join_group(&self, ticket: String) -> Result<GroupId, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::JoinGroup(ticket, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// A ticket that invites someone to a group.
+    pub async fn group_ticket(&self, group: GroupId) -> Result<String, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::GroupTicketFor(group, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Sends a message to a group. Members that are offline get it when they come back.
+    pub async fn send_group_message(
+        &self,
+        group: GroupId,
+        body: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<GroupMessage, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SendGroupMessage(group, body, reply_to, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// The messages of a group, in order.
+    pub async fn group_messages(&self, group: GroupId) -> Result<Vec<GroupMessage>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::GroupMessages(group, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// The groups this device is in.
+    pub async fn groups(&self) -> Result<Vec<groups::GroupInfo>, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Groups(reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?
