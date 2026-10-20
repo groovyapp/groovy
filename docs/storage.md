@@ -1,6 +1,6 @@
 # Storage model: shared folders and replication
 
-Status: **partly built**. Shared folders (#35) follow this model: a folder is an iroh-docs replica, paths are keys, hashes are values, and deletes are empty entries. Garbage collection, the storage cap and clearing the cache (#38) are built, as described below. Not built yet: conflict copies (the newest entry wins for now), and replication status (#37). The open decisions at the end are answered by the recommendations, which #35 follows.
+Status: **built**, except replication status (#37). Shared folders (#35) follow this model: a folder is an iroh-docs replica, paths are keys, hashes are values, and deletes are tombstones. Conflict copies work as described below. Garbage collection, the storage cap and clearing the cache (#38) are built. The open decisions at the end are answered by the recommendations, which #35 follows.
 
 ## What a shared folder is
 
@@ -25,7 +25,8 @@ Members never see each other's local paths, downloads folder, or quotas. Only th
 
 - **Delete** writes a tombstone entry for the path, rather than removing it. Tombstones let a delete reach members who are offline, and are kept until every member has seen them. The file's blob is then no longer needed by that path.
 - **Rename** is a delete of the old path and a create of the new one. The blob is the same hash, so nothing is copied again.
-- **Conflicts** happen when two members change the same path while apart. iroh-docs keeps both entries. Recommendation: show the entry with the later modification time as the file, and keep the other as a copy named `name (conflict from <member>, <date>).ext`. Nothing is lost, and the user decides what to do with the copy. A conflict is shown in the folder's status, not hidden.
+- **Conflicts** happen when two members change the same path while apart. Each write also records the versions its writer had seen, as `history:` entries. A version that another write saw is superseded. The versions nothing supersedes are the conflict. The newest keeps the path, and each other is kept as a copy named `name (conflict from <member>, <date>).ext`. A later write that has seen them all replaces them, and the copies go.
+- **Deletes** are tombstones: the path holds a fixed marker, not an empty entry, because the replica deletes by prefix. Keys are stored with a terminating NUL byte, for the same reason, so that `x.txt` and `x.txt2` never remove each other.
 
 ## Keeping content alive, and garbage collection
 
