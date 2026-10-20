@@ -220,6 +220,7 @@ docs/
   decisions/             Architecture decision records (0001: SQLite for local state; 0002: encryption at rest relies on the OS)
   benchmarks.md          How to run the benchmarks, and the results
   storage.md             Storage model: shared folders, replication, garbage collection (proposal)
+  identity.md            One user across several devices, linking and revoking (proposal)
   protocol.md            Groovy protocol: handshake, trust, pairing, presence, files, shares
   relay.md               Running your own relay
 ```
