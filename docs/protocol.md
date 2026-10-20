@@ -115,7 +115,7 @@ A folder's ticket names one of its members and the folder's capability, with rea
 
 ## Direct messages
 
-A message to a trusted contact is sent as `Request::Message(WireMessage)` on a new stream. The `WireMessage` carries a version (`1`), a random 16-byte id, the sender's timestamp in milliseconds, the body (at most 4 KiB, trimmed), and an optional `reply_to` id. The author is the connection's peer, so a message cannot name another author.
+A message to a trusted contact is sent as `Request::Message(WireMessage)` on a new stream. The `WireMessage` carries a version (`2`, which added attachments; version 1 messages are refused), a random 16-byte id, the sender's timestamp in milliseconds, the body (at most 4 KiB, trimmed), and an optional `reply_to` id. The author is the connection's peer, so a message cannot name another author.
 
 The receiver stores the message, unless a message with that id is already stored, and answers `Reply::Stored`. A resent message is acknowledged again without a second event. A receiver that does not trust the sender, or that does not read the version, gives no answer, and the sender sees the message as failed.
 
@@ -124,6 +124,10 @@ Each side keeps its copy with a delivery state: `sending` (queued, not yet writt
 A message is queued for each device that must have it: the contact's own endpoint, and each of the contact's linked devices that has not been revoked. A queued message is retried when the device connects to this node, at startup, and every minute as its retry time comes. Retries back off from 30 seconds to 15 minutes. A device is dialed at the address it last connected from, and by its id when none is known. The state becomes `delivered` as soon as any one device acknowledges it.
 
 ## Not yet specified
+
+### Attachments
+
+A message can carry up to eight attachments. Each names a file, gives the root of the collection holding it, its size, and an optional preview: a small PNG for an image, at most 32 KiB, so a preview travels inside the message. The file itself is not sent with the message. The recipient fetches it on request, as a transfer from the sender, which shows progress and can be paused like any other receive. The sender keeps the collection tagged while the message refers to it.
 
 ## Group chat
 

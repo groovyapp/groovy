@@ -381,6 +381,7 @@ impl Outbox {
                 timestamp: message.timestamp,
                 body: message.body,
                 reply_to: message.reply_to,
+                attachments: message.attachments,
             };
             let database = self.database.clone();
             let written = move || {

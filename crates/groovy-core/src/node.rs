@@ -39,6 +39,7 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::avatar;
 use crate::blobs::{self, SharedHashes, Withdrawn};
 use crate::config::{Discovery, RelaySetting};
 use crate::contacts;
@@ -54,7 +55,7 @@ use crate::groups::{
 };
 use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
 use crate::membership::{self, Change, KeyRecord, Members, Record, Role, record_key};
-use crate::messages::{self, DeliveryState, MESSAGE_VERSION, Message, MessageId};
+use crate::messages::{self, Attachment, DeliveryState, MESSAGE_VERSION, Message, MessageId};
 use crate::outbox::{Outbox, Trigger};
 use crate::pairing::{RateLimiter, verification_code};
 use crate::presence::{Route, route_of};
@@ -334,6 +335,13 @@ enum Command {
         Option<MessageId>,
         oneshot::Sender<Result<Message, NodeError>>,
     ),
+    SendAttachment(
+        EndpointAddr,
+        String,
+        PathBuf,
+        oneshot::Sender<Result<Message, NodeError>>,
+    ),
+    DownloadAttachment(MessageId, usize, oneshot::Sender<Result<i64, NodeError>>),
     Messages(EndpointId, oneshot::Sender<Result<Vec<Message>, NodeError>>),
     CreateGroup(String, oneshot::Sender<Result<GroupId, NodeError>>),
     JoinGroup(String, oneshot::Sender<Result<GroupId, NodeError>>),
@@ -1072,9 +1080,21 @@ async fn run(
                 Some(Command::SendMessage(addr, body, reply_to, reply)) => {
                     let receiving = receiving.clone();
                     tokio::spawn(async move {
-                        let outcome = send_message(&receiving, addr, body, reply_to).await;
+                        let outcome =
+                            send_message(&receiving, addr, body, reply_to, Vec::new()).await;
                         let _ = reply.send(outcome);
                     });
+                }
+                Some(Command::SendAttachment(addr, body, path, reply)) => {
+                    let receiving = receiving.clone();
+                    tokio::spawn(async move {
+                        let outcome = send_attachment(&receiving, addr, body, path).await;
+                        let _ = reply.send(outcome);
+                    });
+                }
+                Some(Command::DownloadAttachment(message, index, reply)) => {
+                    let outcome = download_attachment(&receiving, message, index);
+                    let _ = reply.send(outcome);
                 }
                 Some(Command::CreateGroup(name, reply)) => {
                     let receiving = receiving.clone();
@@ -1682,12 +1702,18 @@ async fn send_message(
     addr: EndpointAddr,
     body: String,
     reply_to: Option<MessageId>,
+    attachments: Vec<Attachment>,
 ) -> Result<Message, NodeError> {
     let Some(database) = receiving.database.clone() else {
         return Err(NodeError::Message("messages need a database".to_owned()));
     };
-    let body =
-        messages::clean_body(&body).map_err(|error| NodeError::Message(error.to_string()))?;
+    let attachments = messages::clean_attachments(&attachments)
+        .map_err(|error| NodeError::Message(error.to_string()))?;
+    let body = if body.trim().is_empty() && !attachments.is_empty() {
+        String::new()
+    } else {
+        messages::clean_body(&body).map_err(|error| NodeError::Message(error.to_string()))?
+    };
     if !receiving.gate.is_trusted(&addr.id) {
         return Err(NodeError::Message(
             "messages go only to trusted contacts".to_owned(),
@@ -1712,6 +1738,7 @@ async fn send_message(
         body,
         reply_to,
         state: DeliveryState::Sending,
+        attachments,
     };
     database
         .insert_message(&message)
@@ -1774,6 +1801,111 @@ async fn rename_group(receiving: &Receiving, group: GroupId, name: &str) -> Resu
     group_database(receiving)?
         .set_group_name(&group, name)
         .map_err(group_error)
+}
+
+/// Sends a message with a file attached. The file goes into the blob store and the contact is
+/// told where to fetch it: nothing is sent until the contact asks for it. An image also gets a
+/// small preview, which travels with the message.
+async fn send_attachment(
+    receiving: &Receiving,
+    addr: EndpointAddr,
+    body: String,
+    path: PathBuf,
+) -> Result<Message, NodeError> {
+    let store = receiving.store.clone().ok_or(NodeError::BlobsDisabled)?;
+    let imported = files::import(&store, std::slice::from_ref(&path), |_, _| {})
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    // Keeps the file while a message refers to it, as a send does.
+    store
+        .tags()
+        .set(
+            format!("attachment-{}", imported.root),
+            HashAndFormat::hash_seq(imported.root),
+        )
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let preview = attachment_preview(path).await;
+    let attachment = Attachment {
+        name: imported.names.first().cloned().unwrap_or_default(),
+        root: imported.root,
+        files: imported.files,
+        bytes: imported.bytes,
+        preview,
+    };
+    send_message(receiving, addr, body, None, vec![attachment]).await
+}
+
+/// A preview for an image, if the file is one and its preview is small enough to send.
+async fn attachment_preview(path: PathBuf) -> Option<Vec<u8>> {
+    let is_image = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp"
+            )
+        });
+    if !is_image {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || avatar::thumbnail_from_file(&path).ok())
+        .await
+        .ok()
+        .flatten()
+        .filter(|preview| preview.len() <= messages::MAX_PREVIEW_BYTES)
+}
+
+/// Fetches an attachment of a message from the contact who sent it, as a transfer. The transfer
+/// reports its progress, and can be paused and resumed like any other receive.
+fn download_attachment(
+    receiving: &Receiving,
+    message: MessageId,
+    index: usize,
+) -> Result<i64, NodeError> {
+    let database = group_database_for_messages(receiving)?;
+    let found = database
+        .message(message)
+        .map_err(|error| NodeError::Message(error.to_string()))?
+        .ok_or_else(|| NodeError::Message("there is no message with that id".to_owned()))?;
+    if found.author == receiving.endpoint.id() {
+        return Err(NodeError::Message(
+            "this device sent the file, so it has it".to_owned(),
+        ));
+    }
+    let attachment = found
+        .attachments
+        .get(index)
+        .cloned()
+        .ok_or_else(|| NodeError::Message("the message has no such attachment".to_owned()))?;
+    if receiving.store.is_none() {
+        return Err(NodeError::BlobsDisabled);
+    }
+    let sender = found.author;
+    let from = database
+        .address_of(&sender)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| EndpointAddr::from(sender));
+    let offer = FileOffer {
+        names: vec![attachment.name],
+        root: attachment.root,
+        files: attachment.files,
+        bytes: attachment.bytes,
+        from,
+    };
+    let id = new_transfer(receiving, sender, offer.clone());
+    spawn_receive(receiving, id, sender, offer);
+    Ok(id)
+}
+
+/// The database that messages are kept in.
+fn group_database_for_messages(receiving: &Receiving) -> Result<Arc<Database>, NodeError> {
+    receiving
+        .database
+        .clone()
+        .ok_or_else(|| NodeError::Message("messages need a database".to_owned()))
 }
 
 /// The senders of the groups' current topics, so a message can be sent to a group.
@@ -3756,8 +3888,16 @@ impl Inbox {
                     warn!(peer = %id, "a peer sent a message in a version this build does not read");
                     return;
                 }
-                let Ok(body) = messages::clean_body(&wire.body) else {
+                let Ok(attachments) = messages::clean_attachments(&wire.attachments) else {
                     return;
+                };
+                let body = if wire.body.trim().is_empty() && !attachments.is_empty() {
+                    String::new()
+                } else {
+                    match messages::clean_body(&wire.body) {
+                        Ok(body) => body,
+                        Err(_) => return,
+                    }
                 };
                 let message = Message {
                     id: wire.id,
@@ -3767,6 +3907,7 @@ impl Inbox {
                     body,
                     reply_to: wire.reply_to,
                     state: DeliveryState::Delivered,
+                    attachments,
                 };
                 match database.insert_message(&message) {
                     // A message seen before is acknowledged again, without a second event.
@@ -4317,6 +4458,37 @@ impl NodeHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::SendMessage(to, body, reply_to, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Sends a message with a file attached. The contact fetches the file with
+    /// [`NodeHandle::download_attachment`] when it wants it.
+    pub async fn send_attachment(
+        &self,
+        to: EndpointAddr,
+        body: String,
+        path: PathBuf,
+    ) -> Result<Message, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::SendAttachment(to, body, path, reply))
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        response.await.map_err(|_| NodeError::Stopped)?
+    }
+
+    /// Fetches an attachment of a message from the contact who sent it. Returns the transfer,
+    /// which reports progress.
+    pub async fn download_attachment(
+        &self,
+        message: MessageId,
+        index: usize,
+    ) -> Result<i64, NodeError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::DownloadAttachment(message, index, reply))
             .await
             .map_err(|_| NodeError::Stopped)?;
         response.await.map_err(|_| NodeError::Stopped)?

@@ -2830,3 +2830,88 @@ async fn a_removed_member_no_longer_receives_the_groups_messages() {
     assert!(ben.shutdown(TIMEOUT));
     assert!(cam.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_file_sent_with_a_message_is_fetched_on_request_and_an_image_comes_with_a_preview() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+
+    let notes = tmp.path().join("notes.txt");
+    let text = b"the notes, sent as an attachment".to_vec();
+    std::fs::write(&notes, &text).unwrap();
+    let picture = tmp.path().join("picture.png");
+    image::RgbImage::from_pixel(64, 48, image::Rgb([200, 30, 30]))
+        .save(&picture)
+        .unwrap();
+
+    let bob_addr = bob.addr().await.unwrap();
+    alice
+        .send_attachment(bob_addr.clone(), "see these".into(), notes.clone())
+        .await
+        .unwrap();
+    alice
+        .send_attachment(bob_addr, String::new(), picture.clone())
+        .await
+        .unwrap();
+
+    let received = wait_for_messages(
+        &bob,
+        alice_key.public(),
+        "arrived with their files",
+        |listed| listed.len() == 2,
+    )
+    .await;
+    let note = &received[0];
+    assert_eq!(note.body, "see these");
+    assert_eq!(note.attachments.len(), 1);
+    assert_eq!(note.attachments[0].name, "notes.txt");
+    assert_eq!(note.attachments[0].bytes, text.len() as u64);
+    assert!(note.attachments[0].preview.is_none(), "text has no preview");
+    let photo = &received[1];
+    assert!(photo.body.is_empty(), "an attachment can go without text");
+    let preview = photo.attachments[0]
+        .preview
+        .as_ref()
+        .expect("the image has a preview");
+    assert!(!preview.is_empty() && preview.len() <= groovy_core::messages::MAX_PREVIEW_BYTES);
+
+    // The file is not fetched until asked for. Then it arrives, and is the same file.
+    let transfer = bob
+        .download_attachment(note.id, 0)
+        .await
+        .expect("bob asks for the file");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let done = bob.transfers().into_iter().any(|t| {
+                t.id == transfer && t.state == groovy_core::transfers::TransferState::Completed
+            });
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the attachment arrives");
+    let saved = std::fs::read(bob_dir.root().join("Downloads").join("notes.txt"))
+        .expect("the file is saved to the downloads folder");
+    assert_eq!(saved, text);
+
+    // Alice has the file already, so asking her for it is refused.
+    let own = alice
+        .messages(bob_key.public())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| !m.attachments.is_empty())
+        .unwrap();
+    assert!(alice.download_attachment(own.id, 0).await.is_err());
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}

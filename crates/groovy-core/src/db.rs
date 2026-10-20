@@ -164,6 +164,17 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE chat_groups ADD COLUMN founder BLOB CHECK (founder IS NULL OR length(founder) = 32);
     ALTER TABLE chat_groups ADD COLUMN doc BLOB CHECK (doc IS NULL OR length(doc) = 32);
     ALTER TABLE chat_groups ADD COLUMN key_record BLOB;",
+    // Files sent with a message. The file itself is fetched from the sender, as a transfer.
+    "CREATE TABLE message_attachments (
+        message  BLOB NOT NULL CHECK (length(message) = 16),
+        position INTEGER NOT NULL,
+        name     TEXT NOT NULL,
+        root     BLOB NOT NULL CHECK (length(root) = 32),
+        files    INTEGER NOT NULL,
+        bytes    INTEGER NOT NULL,
+        preview  BLOB,
+        PRIMARY KEY (message, position)
+    );",
 ];
 
 /// The schema version this build writes.
