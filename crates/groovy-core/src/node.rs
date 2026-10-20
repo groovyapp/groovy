@@ -488,12 +488,17 @@ async fn run(
     // the folders, and grows as files are added.
     let folder_live: Protected = Arc::new(Mutex::new(HashSet::new()));
     let withdrawn: Withdrawn = Arc::new(Mutex::new(HashSet::new()));
+    // The content of downloads in progress, so collection leaves it alone.
+    let in_flight: Protected = Arc::new(Mutex::new(HashSet::new()));
     let blobs = match &config.blobs {
         Some(dir) => {
             let mut options = iroh_blobs::store::fs::options::Options::new(dir);
             options.gc = config.garbage_interval.map(|interval| GcConfig {
                 interval,
-                add_protected: Some(protect_folder_content(folder_live.clone())),
+                add_protected: Some(protect_folder_content(vec![
+                    folder_live.clone(),
+                    in_flight.clone(),
+                ])),
             });
             match FsStore::load_with_opts(dir.join("blobs.db"), options).await {
                 Ok(store) => Some(store),
@@ -516,6 +521,7 @@ async fn run(
         database: config.database.clone(),
         shared: startup.shared.clone(),
         withdrawn: withdrawn.clone(),
+        in_flight: in_flight.clone(),
         profile: profile.clone(),
         gate: gate.clone(),
     };
@@ -1153,9 +1159,13 @@ const FOLDER_REFRESH: Duration = Duration::from_secs(2);
 
 /// Lets collection keep what shared folders reference. The protection is read at the
 /// start of each collection, so a file is protected from the moment it is in a folder.
-fn protect_folder_content(live: Protected) -> ProtectCb {
+/// Lets collection also keep the content of downloads in progress, which no tag holds until
+/// their file list has arrived.
+fn protect_folder_content(sets: Vec<Protected>) -> ProtectCb {
     Arc::new(move |protected: &mut HashSet<Hash>| {
-        protected.extend(lock_live(&live).iter().copied());
+        for live in &sets {
+            protected.extend(lock_live(live).iter().copied());
+        }
         Box::pin(std::future::ready(ProtectOutcome::Continue))
     })
 }
@@ -1202,6 +1212,8 @@ struct Receiving {
     database: Option<Arc<Database>>,
     shared: SharedHashes,
     withdrawn: Withdrawn,
+    /// Content being downloaded, which collection must not remove.
+    in_flight: Protected,
     profile: SharedProfile,
     gate: Arc<dyn PeerGate>,
 }
@@ -1500,6 +1512,21 @@ async fn resume_transfer_any(receiving: &Receiving, id: i64) -> Result<(), NodeE
     }
 }
 
+/// Stops protecting a download's content as in progress. The transfer's tag, if it has one,
+/// still keeps it. Removes only what is known: the root, and its files if the list is stored.
+async fn forget_in_flight(receiving: &Receiving, root: Hash) {
+    let hashes = match &receiving.store {
+        Some(store) => hashes_of_collection(store, root)
+            .await
+            .unwrap_or_else(|_| vec![root]),
+        None => vec![root],
+    };
+    let mut in_flight = lock_live(&receiving.in_flight);
+    for hash in hashes {
+        in_flight.remove(&hash);
+    }
+}
+
 /// Cancels a transfer, whichever way it goes.
 async fn cancel_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError> {
     let direction = lock_book(&receiving.book)
@@ -1576,10 +1603,28 @@ fn set_transfer(receiving: &Receiving, id: i64, state: Option<TransferState>, do
 fn spawn_receive(receiving: &Receiving, id: i64, peer: EndpointId, offer: FileOffer) {
     let task = receiving.clone();
     let handle = tokio::spawn(async move {
+        // Tag the content first, so collection keeps what is already fetched for as long as the
+        // transfer exists. Without this, a download longer than the collection interval has its
+        // partial blobs removed, and fails when it is saved.
+        if let Some(store) = &task.store
+            && let Err(error) = store
+                .tags()
+                .set(
+                    format!("transfer-{id}"),
+                    HashAndFormat::hash_seq(offer.root),
+                )
+                .await
+        {
+            warn!(%error, "could not keep a transfer's content");
+        }
         let _slot = task.slots.clone().acquire_owned().await;
         set_transfer(&task, id, Some(TransferState::Active), None);
         match receive(&task, id, &offer).await {
-            Ok(()) => set_transfer(&task, id, Some(TransferState::Completed), Some(offer.bytes)),
+            Ok(()) => {
+                set_transfer(&task, id, Some(TransferState::Completed), Some(offer.bytes));
+                // The transfer's tag keeps the content from here on.
+                forget_in_flight(&task, offer.root).await;
+            }
             Err(error) => {
                 let message = error.to_string();
                 set_transfer(
@@ -1613,6 +1658,18 @@ async fn receive(receiving: &Receiving, id: i64, offer: &FileOffer) -> Result<()
         .connect(offer.from.clone(), iroh_blobs::ALPN)
         .await
         .map_err(connection_error)?;
+
+    // Read the list of files first, and protect every file from collection before any of its
+    // data arrives. Collection could otherwise remove a file partway through its download.
+    let list = iroh_blobs::get::request::get_blob(connection.clone(), offer.root)
+        .await
+        .map_err(|error| NodeError::Files(error.to_string()))?;
+    let links = HashSeq::try_from(list).map_err(|error| NodeError::Files(error.to_string()))?;
+    {
+        let mut in_flight = lock_live(&receiving.in_flight);
+        in_flight.insert(offer.root);
+        in_flight.extend(links.iter());
+    }
 
     let mut fetched = 0;
     let mut last_report: Option<Instant> = None;
@@ -1824,6 +1881,9 @@ async fn delete_transfer(receiving: &Receiving, id: i64) -> Result<(), NodeError
         (slot.transfer.direction, slot.transfer.offer.root)
     };
     lock_book(&receiving.book).remove(&id);
+    if direction == Direction::Receive {
+        forget_in_flight(receiving, root).await;
+    }
     if let Some(database) = &receiving.database {
         database
             .delete_transfer(id)
