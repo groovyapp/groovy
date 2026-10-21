@@ -109,6 +109,8 @@ pub struct MessagesView {
     lines: Rc<Vec<Line>>,
     /// Whether older messages than the first one shown exist.
     has_older: bool,
+    /// Whether a page of older messages is being read now.
+    loading_older: bool,
     list: ListState,
     search: Entity<TextInput>,
     composer: Entity<TextInput>,
@@ -140,7 +142,7 @@ use gpui::SharedString;
 impl MessagesView {
     pub fn new(database: Arc<Database>, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextInput::new("Search messages", cx));
-        let composer = cx.new(|cx| TextInput::new("Write a message", cx));
+        let composer = cx.new(|cx| TextInput::new("Write a message", cx).multiline());
         let new_group = cx.new(|cx| TextInput::new("New group name", cx));
         let join = cx.new(|cx| TextInput::new("Paste a group invitation", cx));
         let rename = cx.new(|cx| TextInput::new("Rename the group", cx));
@@ -172,6 +174,7 @@ impl MessagesView {
             selected: None,
             lines: Rc::new(Vec::new()),
             has_older: false,
+            loading_older: false,
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
             search,
             composer,
@@ -191,6 +194,20 @@ impl MessagesView {
             _subscriptions,
         };
         view.reload_rows(cx);
+
+        // Reaching the top of the chat reads the page before it, so a long conversation scrolls
+        // back without pressing anything.
+        let weak = cx.entity().downgrade();
+        view.list.set_scroll_handler(move |event, _, cx| {
+            if event.visible_range.start == 0 {
+                weak.update(cx, |view, cx| {
+                    if view.has_older {
+                        view.load_older(cx);
+                    }
+                })
+                .ok();
+            }
+        });
 
         // The list of conversations, and the open chat, keep themselves current.
         cx.spawn(async move |this, cx| {
@@ -346,6 +363,7 @@ impl MessagesView {
     /// Opens a conversation: its newest messages are read, and it counts as read to the newest.
     fn select(&mut self, target: Target, cx: &mut Context<Self>) {
         self.selected = Some(target);
+        self.loading_older = false;
         self.lines = Rc::new(Vec::new());
         self.has_older = false;
         self.list.reset(0);
@@ -418,33 +436,73 @@ impl MessagesView {
 
     /// Puts a fresh page of the newest messages into the chat. Messages already shown keep their
     /// place; new ones are added in order, and the list is rebuilt only when something changed.
-    fn merge_latest(&mut self, latest: Vec<Line>) {
-        let mut lines: Vec<Line> = self.lines.iter().cloned().collect();
-        let known: HashMap<MessageId, usize> =
-            lines.iter().enumerate().map(|(i, l)| (l.id, i)).collect();
-        let mut changed = false;
+    fn merge_latest(&mut self, mut latest: Vec<Line>) {
+        let order = |a: &Line, b: &Line| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id));
+        // The first page of a conversation: a full page means older messages exist.
+        if self.lines.is_empty() {
+            self.has_older = latest.len() >= LATEST;
+            latest.sort_by(order);
+            self.list.reset(latest.len() + usize::from(self.has_older));
+            self.lines = Rc::new(latest);
+            return;
+        }
+        let offset = usize::from(self.has_older);
+        // Compare first, against the newest end of the chat, which is where a fresh page lands.
+        // The whole chat is copied only when something changed, not on every refresh.
+        let known: HashMap<MessageId, usize> = self
+            .lines
+            .iter()
+            .enumerate()
+            .rev()
+            .take(LATEST * 2)
+            .map(|(i, l)| (l.id, i))
+            .collect();
+        let mut changes = Vec::new();
+        let mut added = Vec::new();
         for line in latest {
             match known.get(&line.id) {
                 Some(&index) => {
-                    if lines[index] != line {
-                        lines[index] = line;
-                        changed = true;
+                    if self.lines[index] != line {
+                        changes.push((index, line));
                     }
                 }
-                None => {
-                    lines.push(line);
-                    changed = true;
-                }
+                None => added.push(line),
             }
         }
-        if changed {
-            lines.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
-            self.list.reset(lines.len() + usize::from(self.has_older));
-            self.lines = Rc::new(lines);
+        if changes.is_empty() && added.is_empty() {
+            return;
         }
-        if self.lines.is_empty() {
-            self.has_older = false;
+        let mut lines: Vec<Line> = self.lines.iter().cloned().collect();
+        let mut updated = Vec::with_capacity(changes.len());
+        for (index, line) in changes {
+            lines[index] = line;
+            updated.push(index);
         }
+        added.sort_by(order);
+        let newest = lines.last().map(|line| (line.timestamp, line.id));
+        let at_end = added
+            .first()
+            .is_none_or(|first| newest.is_none_or(|newest| (first.timestamp, first.id) > newest));
+        if at_end {
+            // The usual case: new messages after the last one. Only they are added, and a
+            // changed message is measured again, so a reader scrolled up stays where they are.
+            for index in updated {
+                self.list
+                    .remeasure_items(index + offset..index + offset + 1);
+            }
+            let end = lines.len() + offset;
+            let count = added.len();
+            lines.extend(added);
+            if count > 0 {
+                self.list.splice(end..end, count);
+            }
+        } else {
+            // A message from earlier arrived late: the order changes, so the list is rebuilt.
+            lines.extend(added);
+            lines.sort_by(order);
+            self.list.reset(lines.len() + offset);
+        }
+        self.lines = Rc::new(lines);
     }
 
     /// Reads the messages before the oldest one shown, and puts them at the top.
@@ -455,11 +513,15 @@ impl MessagesView {
         let Some(first) = self.lines.first() else {
             return;
         };
+        if self.loading_older {
+            return;
+        }
         let cursor = (first.timestamp, first.id);
         let database = self.database.clone();
         let Some(own) = Self::own_id(cx) else {
             return;
         };
+        self.loading_older = true;
         let read =
             cx.background_spawn(async move {
                 match target {
@@ -488,19 +550,27 @@ impl MessagesView {
                 Ok(older) => older,
                 Err(error) => {
                     warn!(%error, "could not read older messages");
+                    this.update(cx, |view, _| view.loading_older = false).ok();
                     return;
                 }
             };
             this.update(cx, |view, cx| {
+                view.loading_older = false;
                 if view.selected != Some(target) {
                     return;
                 }
+                let had_older = view.has_older;
                 view.has_older = older.len() == PAGE;
+                let count = older.len();
                 let mut lines: Vec<Line> = older;
                 lines.extend(view.lines.iter().cloned());
                 view.lines = Rc::new(lines);
-                view.list
-                    .reset(view.lines.len() + usize::from(view.has_older));
+                // The older messages go in at the top, in place of the "load older" row, so the
+                // messages on screen stay where they are.
+                view.list.splice(
+                    0..usize::from(had_older),
+                    usize::from(view.has_older) + count,
+                );
                 cx.notify();
             })
             .ok();
@@ -1439,7 +1509,7 @@ impl MessagesView {
                     .cloned()
                     .unwrap_or_else(|| abbreviate_id(&line.author.to_string()))
             };
-            let mut column = div().flex().flex_col().px_4().py_0p5();
+            let mut column = div().flex().flex_col().w_full().px_4().py_0p5();
             if new_day {
                 column = column.child(
                     div()
