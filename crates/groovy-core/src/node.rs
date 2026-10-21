@@ -37,7 +37,7 @@ use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::avatar;
 use crate::blobs::{self, SharedHashes, Withdrawn};
@@ -51,6 +51,7 @@ use crate::folders::{
 use crate::gated::TrustedOnly;
 use crate::groups::{
     self, GroupDetails, GroupEnvelope, GroupId, GroupMessage, GroupPage, GroupRow, GroupTicket,
+    ReceivedPage,
 };
 use crate::link::{self, LINK_ALPN, LinkProtocol, LinkTicket, OpenLinks};
 use crate::membership::{self, Change, KeyRecord, Members, Record, Role, record_key};
@@ -2026,6 +2027,7 @@ const ADMIN_WAIT: Duration = Duration::from_secs(15);
 /// What a member answers a group request with.
 enum GroupAnswer {
     Page(GroupPage),
+    Received(ReceivedPage),
     Key(Option<KeyRecord>),
     Stored,
     Refused,
@@ -2566,6 +2568,7 @@ async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request)
     let own = receiving.endpoint.id();
     let group = match &request {
         Request::GroupHistory { group, .. }
+        | Request::GroupReceived { group, .. }
         | Request::GroupKey { group }
         | Request::GroupJoin { group } => *group,
         Request::GroupKeyPush(record) => record.group,
@@ -2591,18 +2594,32 @@ async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request)
             };
             let more = rows.len() > groups::PAGE_SIZE;
             rows.truncate(groups::PAGE_SIZE);
-            // The other members this device has addresses for, so the asker can reach them.
-            let addresses = members
-                .others(&own)
-                .into_iter()
-                .filter(|member| *member != peer)
-                .filter_map(|member| database.address_of(&member).ok().flatten())
-                .take(MAX_PAGE_MEMBERS)
-                .collect();
             GroupAnswer::Page(GroupPage {
                 messages: rows,
                 more,
-                members: addresses,
+                members: member_addresses(&database, &members, own, peer),
+            })
+        }
+        Request::GroupReceived { group, after } => {
+            if !members.is_member(&peer) {
+                return GroupAnswer::Refused;
+            }
+            let Ok(database) = group_database(receiving) else {
+                return GroupAnswer::Refused;
+            };
+            let Ok(mut rows) =
+                database.group_envelopes_received_after(&group, after, groups::PAGE_SIZE + 1)
+            else {
+                return GroupAnswer::Refused;
+            };
+            let more = rows.len() > groups::PAGE_SIZE;
+            rows.truncate(groups::PAGE_SIZE);
+            let last = rows.last().map_or(after, |(received, _)| *received);
+            GroupAnswer::Received(ReceivedPage {
+                messages: rows.into_iter().map(|(_, envelope)| envelope).collect(),
+                last,
+                more,
+                members: member_addresses(&database, &members, own, peer),
             })
         }
         Request::GroupKey { .. } => {
@@ -2794,41 +2811,80 @@ fn store_group_envelope(receiving: &Receiving, envelope: GroupEnvelope) -> bool 
 
 /// Asks a member for the group's messages this device does not have, a page at a time.
 /// Returns how many new messages were stored.
+///
+/// It asks for what the member stored since this device last asked it, in the member's own
+/// order of storing them, so no message is skipped however the authors' clocks disagree. A
+/// member on an older version does not answer that, and is asked by position in the group's
+/// order instead.
 async fn fetch_history(
     receiving: &Receiving,
     group: GroupId,
     peer: EndpointId,
 ) -> Result<usize, NodeError> {
+    match fetch_received(receiving, group, peer).await {
+        Ok(stored) => Ok(stored),
+        Err(error) => {
+            debug!(%error, "a member did not answer by its order of storing; asking by position");
+            fetch_by_position(receiving, group, peer).await
+        }
+    }
+}
+
+/// Asks a member for what it stored since this device last asked, and remembers how far it
+/// read. Fails before storing anything if the member does not answer the request.
+async fn fetch_received(
+    receiving: &Receiving,
+    group: GroupId,
+    peer: EndpointId,
+) -> Result<usize, NodeError> {
     let database = group_database(receiving)?;
-    let own = receiving.endpoint.id();
+    let mut after = database
+        .group_sync_cursor(&group, &peer)
+        .map_err(group_error)?;
+    let mut stored = 0;
+    loop {
+        let connection = connect_member(receiving, &database, peer).await?;
+        let page = ask(&connection, &Request::GroupReceived { group, after }).await;
+        connection.close(0u32.into(), b"synced");
+        let page: ReceivedPage = page?;
+        remember_members(receiving, &database, group, &page.members)?;
+        for envelope in page.messages {
+            if store_group_envelope(receiving, envelope) {
+                stored += 1;
+            }
+        }
+        // Only what was stored is read past, so a page that fails is asked for again.
+        if page.last > after {
+            after = page.last;
+            database
+                .set_group_sync_cursor(&group, &peer, after)
+                .map_err(group_error)?;
+        }
+        if !page.more {
+            return Ok(stored);
+        }
+    }
+}
+
+/// Asks a member for the messages after this device's newest one in the group's order. Used
+/// with members that predate [`fetch_received`]; it misses a message whose author's clock was
+/// behind the newest one here.
+async fn fetch_by_position(
+    receiving: &Receiving,
+    group: GroupId,
+    peer: EndpointId,
+) -> Result<usize, NodeError> {
+    let database = group_database(receiving)?;
     let mut after = database
         .latest_group_position(&group)
         .map_err(group_error)?;
     let mut stored = 0;
     loop {
-        let addr = database
-            .address_of(&peer)
-            .map_err(group_error)?
-            .unwrap_or_else(|| EndpointAddr::from(peer));
-        let (connection, _peer) = open_peer(
-            &receiving.endpoint,
-            addr,
-            &receiving.profile,
-            &receiving.events,
-            &receiving.gate,
-        )
-        .await?;
-        let page = request_page(&connection, group, after).await;
+        let connection = connect_member(receiving, &database, peer).await?;
+        let page = ask(&connection, &Request::GroupHistory { group, after }).await;
         connection.close(0u32.into(), b"synced");
-        let page = page?;
-        for member in page.members {
-            if member.id != own {
-                remember_peer(receiving, &member);
-                database
-                    .add_group_member(group, &member.id)
-                    .map_err(group_error)?;
-            }
-        }
+        let page: GroupPage = page?;
+        remember_members(receiving, &database, group, &page.members)?;
         if page.messages.is_empty() {
             break;
         }
@@ -2847,19 +2903,73 @@ async fn fetch_history(
     Ok(stored)
 }
 
-/// Sends one history request on a connection, and reads the page that answers it.
-async fn request_page(
+/// Opens a connection to a group member, at the address this device knows for it.
+async fn connect_member(
+    receiving: &Receiving,
+    database: &Database,
+    peer: EndpointId,
+) -> Result<Connection, NodeError> {
+    let addr = database
+        .address_of(&peer)
+        .map_err(group_error)?
+        .unwrap_or_else(|| EndpointAddr::from(peer));
+    let (connection, _peer) = open_peer(
+        &receiving.endpoint,
+        addr,
+        &receiving.profile,
+        &receiving.events,
+        &receiving.gate,
+    )
+    .await?;
+    Ok(connection)
+}
+
+/// Sends one request on a connection, and reads the answer.
+async fn ask<T: serde::de::DeserializeOwned>(
     connection: &Connection,
-    group: GroupId,
-    after: Option<(i64, MessageId)>,
-) -> Result<GroupPage, NodeError> {
+    request: &Request,
+) -> Result<T, NodeError> {
     let (mut send, mut recv) = connection.open_bi().await.map_err(connection_error)?;
-    protocol::write_message(&mut send, &Request::GroupHistory { group, after })
+    protocol::write_message(&mut send, request)
         .await
         .map_err(NodeError::Connect)?;
     protocol::read_message(&mut recv)
         .await
         .map_err(NodeError::Connect)
+}
+
+/// Remembers the other members a page names, and how to reach them.
+fn remember_members(
+    receiving: &Receiving,
+    database: &Database,
+    group: GroupId,
+    members: &[EndpointAddr],
+) -> Result<(), NodeError> {
+    let own = receiving.endpoint.id();
+    for member in members.iter().filter(|member| member.id != own) {
+        remember_peer(receiving, member);
+        database
+            .add_group_member(group, &member.id)
+            .map_err(group_error)?;
+    }
+    Ok(())
+}
+
+/// The other members this device has addresses for, apart from the one asking, so the asker
+/// can reach them.
+fn member_addresses(
+    database: &Database,
+    members: &membership::Members,
+    own: EndpointId,
+    asker: EndpointId,
+) -> Vec<EndpointAddr> {
+    members
+        .others(&own)
+        .into_iter()
+        .filter(|member| *member != asker)
+        .filter_map(|member| database.address_of(&member).ok().flatten())
+        .take(MAX_PAGE_MEMBERS)
+        .collect()
 }
 
 /// Remembers how to reach a peer, in the database and the endpoint's address book.
@@ -4156,6 +4266,7 @@ impl Inbox {
                 reply_and_finish(&mut send, Reply::Stored).await;
             }
             request @ (Request::GroupHistory { .. }
+            | Request::GroupReceived { .. }
             | Request::GroupKey { .. }
             | Request::GroupJoin { .. }
             | Request::GroupKeyPush(_)) => {
@@ -4176,6 +4287,11 @@ impl Inbox {
                 }
                 match answer.await {
                     Ok(GroupAnswer::Page(page)) => {
+                        if protocol::write_message(&mut send, &page).await.is_ok() {
+                            let _ = send.finish();
+                        }
+                    }
+                    Ok(GroupAnswer::Received(page)) => {
                         if protocol::write_message(&mut send, &page).await.is_ok() {
                             let _ = send.finish();
                         }

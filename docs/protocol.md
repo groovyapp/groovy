@@ -135,7 +135,9 @@ A group has a random 32-byte id, and its gossip topic is that id. A group messag
 
 A ticket (`groovygroup1…`, base32 of postcard) invites someone: the group id, its founder, the membership document's ticket, the group's current key record, and up to eight members' addresses to join through. Gossip itself accepts only trusted peers, as the other gossip uses do.
 
-A member that connects to another member asks it for what it missed with `Request::GroupHistory { group, after }`, where `after` is the newest message the asker has. The answer is a `GroupPage`: up to eight envelopes in order, a flag saying whether more follow, and the addresses of the group's other members the answering device knows. Each envelope carries its signature, so a page can come from any member. Only trusted peers get an answer.
+A member asks the members it is connected to for what it missed: when one connects, shortly after one leaves, and once a minute. It asks only current members, so a removed member that is still on the old topic is not asked. The request is `Request::GroupReceived { group, after }`. Each device numbers the group messages it stores in the order it stores them, and `after` is how far the asker has read the answering member's numbering, kept for each member. The answer is a `ReceivedPage`: up to eight envelopes in that order, the number of the last one, a flag saying whether more follow, and the addresses of the group's other members the answering device knows. A message the member stored later always has a higher number, so nothing is skipped, whatever the authors' clocks said. Each envelope carries its signature, so a page can come from any member. Only trusted peers get an answer.
+
+A member that predates `GroupReceived` does not answer it. It is asked with `Request::GroupHistory { group, after }` instead, where `after` is the newest message the asker has in the group's order of timestamps, and it answers with a `GroupPage`. That can miss a message whose author's clock was behind.
 
 ### Membership and keys
 

@@ -2715,6 +2715,55 @@ async fn wait_for_group(
 }
 
 #[tokio::test]
+async fn catching_up_fetches_a_missed_message_from_an_authors_slow_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ada_key, ben_key) = (SecretKey::generate(), SecretKey::generate());
+    let (ada_dir, ben_dir) = (fresh_dir(&tmp, "ada"), fresh_dir(&tmp, "ben"));
+    trust_in(&ada_dir, &ben_key);
+    trust_in(&ben_dir, &ada_key);
+    let (ada, _) = blob_node_collecting(&ada_dir, ada_key.clone(), None).await;
+    let (ben, _) = blob_node_collecting(&ben_dir, ben_key.clone(), None).await;
+
+    let group = ada.create_group("friends".into()).await.unwrap();
+    ben.join_group(ada.group_ticket(group).await.unwrap())
+        .await
+        .unwrap();
+    ada.send_group_message(group, "now".into(), None)
+        .await
+        .unwrap();
+    wait_for_group(&ben, group, "reached ben", |listed| listed.len() == 1).await;
+
+    // Ada has a message ben missed, written while her clock was an hour behind. It sorts
+    // before the newest message ben has, so asking for what follows that would skip it.
+    let late = groovy_core::groups::sign(
+        &ada_key,
+        group,
+        [9; 16],
+        groovy_core::messages::now_millis() - 3_600_000,
+        "sent with a slow clock".into(),
+        None,
+    );
+    assert!(
+        Database::open(&ada_dir.database_file())
+            .unwrap()
+            .insert_group_message(&late)
+            .unwrap()
+    );
+
+    // Ben reconnects, and catches up from ada.
+    assert!(ben.shutdown(TIMEOUT));
+    let (ben, _) = blob_node_collecting(&ben_dir, ben_key.clone(), None).await;
+    let caught_up = wait_for_group(&ben, group, "caught up with the late message", |listed| {
+        listed.len() == 2
+    })
+    .await;
+    assert!(caught_up.iter().any(|m| m.body == "sent with a slow clock"));
+
+    assert!(ada.shutdown(TIMEOUT));
+    assert!(ben.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
 async fn a_group_reaches_every_member_and_an_offline_member_catches_up() {
     let tmp = tempfile::tempdir().unwrap();
     let keys = [

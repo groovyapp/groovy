@@ -205,6 +205,19 @@ const MIGRATIONS: &[&str] = &[
         seen      INTEGER NOT NULL,
         PRIMARY KEY (namespace, peer)
     );",
+    // The order in which this device stored each group message, so another member can ask
+    // for everything stored since it last asked, whatever the authors' clocks said. Messages
+    // stored before this keep the order they were stored in. `group_sync` is how far this
+    // device has read each member's order.
+    "ALTER TABLE group_messages ADD COLUMN received INTEGER;
+    UPDATE group_messages SET received = rowid;
+    CREATE INDEX group_messages_received ON group_messages (group_id, received);
+    CREATE TABLE group_sync (
+        group_id BLOB NOT NULL CHECK (length(group_id) = 32),
+        peer     BLOB NOT NULL CHECK (length(peer) = 32),
+        received INTEGER NOT NULL,
+        PRIMARY KEY (group_id, peer)
+    );",
 ];
 
 /// The schema version this build writes.
