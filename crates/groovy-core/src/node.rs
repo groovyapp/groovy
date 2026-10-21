@@ -660,6 +660,7 @@ async fn run(
     let receiving = Receiving {
         docs: docs.clone(),
         topics: Arc::new(Mutex::new(HashMap::new())),
+        contact_syncs: Arc::new(Mutex::new(HashMap::new())),
         gossip: gossip.clone(),
         groups: Arc::new(Mutex::new(HashMap::new())),
         secret: config.secret_key.clone(),
@@ -1751,6 +1752,8 @@ struct Receiving {
     docs: Option<Docs>,
     /// The task running each group's current topic.
     topics: GroupTasks,
+    /// When contacts were last exchanged with each of this user's other devices.
+    contact_syncs: Arc<Mutex<HashMap<EndpointId, Instant>>>,
 }
 
 /// What a send's offer carries before its files are imported.
@@ -2810,6 +2813,7 @@ fn spawn_outbox(receiving: Receiving, outbox: Outbox, mut events: broadcast::Rec
                             peer.endpoint_id,
                             Trigger::Connected,
                         ));
+                        tokio::spawn(sync_user_contacts(receiving.clone(), peer.endpoint_id));
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -2817,6 +2821,65 @@ fn spawn_outbox(receiving: Receiving, outbox: Outbox, mut events: broadcast::Rec
             }
         }
     });
+}
+
+/// How long two devices of a user wait before they exchange contacts again. Each exchange is a
+/// connection, which the other side sees as a connection too, so this keeps them from looping.
+const CONTACT_SYNC_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Asks another device of this user for the contacts it trusts, and trusts them here too.
+async fn sync_user_contacts(receiving: Receiving, peer: EndpointId) {
+    let Some(database) = receiving.database.clone() else {
+        return;
+    };
+    if !database.is_own_device(&peer).unwrap_or(false) {
+        return;
+    }
+    {
+        let mut synced = receiving
+            .contact_syncs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if synced
+            .get(&peer)
+            .is_some_and(|at| at.elapsed() < CONTACT_SYNC_COOLDOWN)
+        {
+            return;
+        }
+        synced.insert(peer, Instant::now());
+    }
+    let addr = database
+        .address_of(&peer)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| EndpointAddr::from(peer));
+    let Ok((connection, _)) = open_peer(
+        &receiving.endpoint,
+        addr,
+        &receiving.profile,
+        &receiving.events,
+        &receiving.gate,
+    )
+    .await
+    else {
+        return;
+    };
+    let contacts: Option<Vec<crate::user::SharedContact>> = async {
+        let (mut send, mut recv) = connection.open_bi().await.ok()?;
+        protocol::write_message(&mut send, &Request::UserContacts)
+            .await
+            .ok()?;
+        protocol::read_message(&mut recv).await.ok()
+    }
+    .await;
+    connection.close(0u32.into(), b"contacts");
+    let own = receiving.endpoint.id();
+    let now = contacts::now();
+    for contact in contacts.unwrap_or_default() {
+        if contact.endpoint != own && !database.is_own_device(&contact.endpoint).unwrap_or(false) {
+            let _ = database.adopt_contact(&contact, now);
+        }
+    }
 }
 
 /// How often the outbox is checked for messages whose retry time has come.
@@ -4022,6 +4085,19 @@ impl Inbox {
                     }
                     Ok(GroupAnswer::Stored) => reply_and_finish(&mut send, Reply::Stored).await,
                     Ok(GroupAnswer::Refused) | Err(_) => {}
+                }
+            }
+            Request::UserContacts => {
+                // Only another device of this user is told who this device trusts.
+                let Some(database) = self.database.clone() else {
+                    return;
+                };
+                if !database.is_own_device(&peer.endpoint_id).unwrap_or(false) {
+                    return;
+                }
+                let contacts = database.shared_contacts().unwrap_or_default();
+                if protocol::write_message(&mut send, &contacts).await.is_ok() {
+                    let _ = send.finish();
                 }
             }
             Request::Offer(offer) => {

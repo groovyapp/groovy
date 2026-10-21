@@ -118,6 +118,8 @@ enum LinkReply {
         /// Every device of the user, including the new one.
         devices: Vec<DeviceCert>,
         revocations: Vec<Revocation>,
+        /// The contacts the linking device trusts, so the new device trusts them too.
+        contacts: Vec<crate::user::SharedContact>,
     },
 }
 
@@ -204,6 +206,7 @@ impl LinkProtocol {
             sealed,
             devices,
             revocations,
+            contacts: self.database.shared_contacts().unwrap_or_default(),
         }
     }
 }
@@ -266,6 +269,7 @@ pub async fn accept_link(
         sealed,
         devices,
         revocations,
+        contacts,
     } = reply
     else {
         return Err(LinkError::Refused);
@@ -311,6 +315,15 @@ pub async fn accept_link(
         .filter(|revocation| revocation.user == ticket.user)
     {
         let _ = database.save_revocation(revocation);
+    }
+    // The user's contacts become this device's contacts, so they can reach it straight away.
+    let now = crate::contacts::now();
+    for contact in &contacts {
+        if contact.endpoint != endpoint.id()
+            && !database.is_own_device(&contact.endpoint).unwrap_or(false)
+        {
+            let _ = database.adopt_contact(contact, now);
+        }
     }
     Ok(ticket.user)
 }
