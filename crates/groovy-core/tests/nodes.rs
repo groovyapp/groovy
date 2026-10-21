@@ -2280,7 +2280,8 @@ async fn wait_for_health(
     what: &str,
     check: impl Fn(&groovy_core::replicas::ReplicaHealth) -> bool,
 ) -> groovy_core::replicas::ReplicaHealth {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let last = std::sync::Mutex::new(None);
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let health = node
                 .folder_health(namespace)
@@ -2289,11 +2290,21 @@ async fn wait_for_health(
             if check(&health) {
                 return health;
             }
+            *last.lock().unwrap() = Some(health);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("the folder health never {what}"))
+    .await;
+    match outcome {
+        Ok(health) => health,
+        Err(_) => {
+            let status = node.folder_status(namespace).await;
+            panic!(
+                "the folder health never {what}; last {:#?}; status {status:#?}",
+                last.lock().unwrap()
+            )
+        }
+    }
 }
 
 #[tokio::test]
@@ -2324,9 +2335,10 @@ async fn a_folder_shows_how_many_devices_hold_a_complete_copy() {
         .unwrap();
     bob.join_folder(ticket, None).await.unwrap();
 
-    // Once bob has the file, he reports a complete copy, and both devices see two.
+    // Once bob has the file, he reports a complete copy, and both devices see two. An empty
+    // folder counts as complete, so wait for the file to be there.
     wait_for_health(&bob, folder.namespace, "showed bob's copy complete", |h| {
-        h.devices[0].complete()
+        h.devices[0].files == 1 && h.devices[0].complete()
     })
     .await;
     bob.verify_folder(folder.namespace).await.unwrap();
@@ -2345,6 +2357,59 @@ async fn a_folder_shows_how_many_devices_hold_a_complete_copy() {
     wait_for_health(&bob, folder.namespace, "showed two copies to bob", |h| {
         h.copies == 2
     })
+    .await;
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_folder_keeps_syncing_after_a_member_restarts() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key) = (SecretKey::generate(), SecretKey::generate());
+    let (alice_dir, bob_dir) = (fresh_dir(&tmp, "alice"), fresh_dir(&tmp, "bob"));
+    trust_in(&alice_dir, &bob_key);
+    trust_in(&bob_dir, &alice_key);
+    let (alice, _alice_events) = blob_node_collecting(&alice_dir, alice_key.clone(), None).await;
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+
+    let folder = alice.create_folder("photos".into(), None).await.unwrap();
+    let first = tmp.path().join("a.txt");
+    std::fs::write(&first, b"alpha").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "a.txt".into(), first)
+        .await
+        .unwrap();
+    let ticket = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+    bob.join_folder(ticket, None).await.unwrap();
+    wait_for_folder(&bob, folder.namespace, "reached bob", |entries| {
+        entries.len() == 1
+    })
+    .await;
+
+    // Bob restarts. What alice adds afterwards still reaches him. These nodes have no address
+    // lookup, so bob learns where alice is by reaching her, as discovery would tell him.
+    assert!(bob.shutdown(TIMEOUT));
+    let (bob, _bob_events) = blob_node_collecting(&bob_dir, bob_key.clone(), None).await;
+    bob.check_presence(alice.addr().await.unwrap())
+        .await
+        .expect("bob reaches alice");
+    let second = tmp.path().join("b.txt");
+    std::fs::write(&second, b"beta").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "b.txt".into(), second)
+        .await
+        .unwrap();
+    wait_for_folder(
+        &bob,
+        folder.namespace,
+        "reached bob after he restarted",
+        |entries| entries.len() == 2,
+    )
     .await;
 
     assert!(alice.shutdown(TIMEOUT));

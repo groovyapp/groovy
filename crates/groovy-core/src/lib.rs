@@ -10,6 +10,7 @@ mod config;
 pub mod contacts;
 pub mod db;
 pub mod files;
+mod folder_peers;
 pub mod folder_sync;
 pub mod folders;
 pub mod gated;

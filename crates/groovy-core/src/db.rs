@@ -197,6 +197,14 @@ const MIGRATIONS: &[&str] = &[
     END;
     INSERT INTO message_search (message_search) VALUES ('rebuild');
     INSERT INTO group_search (group_search) VALUES ('rebuild');",
+    // The other devices each shared folder has synced with, so it can reach them again after
+    // a restart. `seen` is when, in Unix seconds.
+    "CREATE TABLE folder_peers (
+        namespace BLOB NOT NULL CHECK (length(namespace) = 32),
+        peer      BLOB NOT NULL CHECK (length(peer) = 32),
+        seen      INTEGER NOT NULL,
+        PRIMARY KEY (namespace, peer)
+    );",
 ];
 
 /// The schema version this build writes.
@@ -453,5 +461,34 @@ mod tests {
             matches!(err, DbError::NewerSchema { found: 99, .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_folder_remembers_its_members_until_it_is_left() {
+        use crate::folders::Folder;
+        let (_tmp, path) = db_path();
+        let db = Database::open(&path).unwrap();
+        let folder = Folder {
+            namespace: iroh_docs::NamespaceId::from([7; 32]),
+            name: "photos".to_owned(),
+            path: None,
+            created: 0,
+            keep_copy: true,
+        };
+        db.insert_folder(&folder).unwrap();
+        let (alice, bob) = (
+            iroh::SecretKey::generate().public(),
+            iroh::SecretKey::generate().public(),
+        );
+
+        db.record_folder_peer(folder.namespace, alice, 10).unwrap();
+        db.record_folder_peer(folder.namespace, bob, 20).unwrap();
+        assert_eq!(db.folder_peers(folder.namespace).unwrap(), vec![bob, alice]);
+        // Seeing a member again moves it to the front, without a second row.
+        db.record_folder_peer(folder.namespace, alice, 30).unwrap();
+        assert_eq!(db.folder_peers(folder.namespace).unwrap(), vec![alice, bob]);
+
+        db.delete_folder(folder.namespace).unwrap();
+        assert!(db.folder_peers(folder.namespace).unwrap().is_empty());
     }
 }

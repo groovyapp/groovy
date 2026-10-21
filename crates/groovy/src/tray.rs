@@ -7,13 +7,17 @@
 //! The tray's clicks run on its own thread, so they are queued and the app takes them on its
 //! next tick, the same way notifications are handled.
 
+#[cfg(target_os = "linux")]
 use std::sync::{Mutex, PoisonError};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use gpui::{App, AppContext, Global};
+#[cfg(target_os = "linux")]
 use groovy_core::transfers::{Direction, TransferState};
 
 /// What a tray click asks the app to do.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Open,
@@ -23,13 +27,16 @@ pub enum Command {
 }
 
 /// Clicks the tray has made since the last call, oldest first.
+#[cfg(target_os = "linux")]
 static COMMANDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 
 /// The commands queued since the last call.
+#[cfg(target_os = "linux")]
 pub fn take_commands() -> Vec<Command> {
     std::mem::take(&mut *COMMANDS.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
+#[cfg(target_os = "linux")]
 fn push(command: Command) {
     COMMANDS
         .lock()
@@ -78,6 +85,7 @@ pub fn start(cx: &mut App) -> bool {
 }
 
 /// Acts on the tray's clicks, and keeps its status current, every so often.
+#[cfg(target_os = "linux")]
 fn poll(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
@@ -95,6 +103,7 @@ fn poll(cx: &mut App) {
     .detach();
 }
 
+#[cfg(target_os = "linux")]
 fn act(cx: &mut App, command: Command) {
     match command {
         Command::Open => crate::show_main_window(cx),
@@ -128,6 +137,7 @@ fn act(cx: &mut App, command: Command) {
 }
 
 /// How many transfers are waiting or moving, and whether the node is online.
+#[cfg(target_os = "linux")]
 fn counts(cx: &App) -> (bool, usize) {
     let online = cx
         .try_global::<crate::node::NodeState>()
@@ -158,9 +168,6 @@ fn refresh_status(cx: &mut App) {
         });
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn refresh_status(_cx: &mut App) {}
 
 /// Changes the background settings, and saves the config. Starting on login also writes or
 /// removes the login entry.
