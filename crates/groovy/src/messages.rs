@@ -113,6 +113,7 @@ pub struct MessagesView {
     search: Entity<TextInput>,
     composer: Entity<TextInput>,
     new_group: Entity<TextInput>,
+    join: Entity<TextInput>,
     rename: Entity<TextInput>,
     /// The query the search results are for, and its results.
     query: String,
@@ -141,6 +142,7 @@ impl MessagesView {
         let search = cx.new(|cx| TextInput::new("Search messages", cx));
         let composer = cx.new(|cx| TextInput::new("Write a message", cx));
         let new_group = cx.new(|cx| TextInput::new("New group name", cx));
+        let join = cx.new(|cx| TextInput::new("Paste a group invitation", cx));
         let rename = cx.new(|cx| TextInput::new("Rename the group", cx));
         let _subscriptions = vec![
             cx.subscribe(&search, |view, _, event: &TextInputEvent, cx| {
@@ -158,6 +160,11 @@ impl MessagesView {
                     view.create_group(cx);
                 }
             }),
+            cx.subscribe(&join, |view, _, event: &TextInputEvent, cx| {
+                if *event == TextInputEvent::Submitted {
+                    view.join_group(cx);
+                }
+            }),
         ];
         let mut view = Self {
             database,
@@ -169,6 +176,7 @@ impl MessagesView {
             search,
             composer,
             new_group,
+            join,
             rename,
             query: String::new(),
             hits: Vec::new(),
@@ -662,8 +670,20 @@ impl MessagesView {
 
     fn create_group(&mut self, cx: &mut Context<Self>) {
         let name = self.new_group.read(cx).text().trim().to_owned();
+        if name.starts_with("groovygroup1") {
+            // An invitation pasted here is joined, not made into a group named after it.
+            self.join.update(cx, |input, cx| input.set_text(name, cx));
+            self.new_group
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            self.join_group(cx);
+            return;
+        }
         if name.is_empty() {
-            self.set_status(true, "Type a name for the group first.", cx);
+            self.set_status(
+                true,
+                "Type a name for the group first, or paste an invitation to join one.",
+                cx,
+            );
             return;
         }
         let Some(handle) = Self::handle(cx) else {
@@ -678,7 +698,11 @@ impl MessagesView {
                 Ok(group) => {
                     view.reload_rows(cx);
                     view.select(Target::Group(group), cx);
-                    view.set_status(false, "Group made. Invite people from its panel.", cx);
+                    view.set_status(
+                        false,
+                        "Group made. Use Invite in its header to bring people in.",
+                        cx,
+                    );
                 }
                 Err(error) => {
                     view.set_status(true, format!("The group could not be made: {error}"), cx)
@@ -719,6 +743,42 @@ impl MessagesView {
         .detach();
     }
 
+    /// Joins the group whose invitation is in the join field.
+    fn join_group(&mut self, cx: &mut Context<Self>) {
+        let ticket = self.join.read(cx).text().trim().to_owned();
+        if ticket.is_empty() {
+            self.set_status(true, "Paste an invitation first.", cx);
+            return;
+        }
+        let Some(handle) = Self::handle(cx) else {
+            self.set_status(true, "The node is not running yet.", cx);
+            return;
+        };
+        self.join
+            .update(cx, |input, cx| input.set_text(String::new(), cx));
+        cx.spawn(async move |this, cx| {
+            let outcome = handle.join_group(ticket).await;
+            this.update(cx, |view, cx| match outcome {
+                Ok(group) => {
+                    view.reload_rows(cx);
+                    view.select(Target::Group(group), cx);
+                    view.set_status(
+                        false,
+                        "Joined the group. Its messages arrive as members answer.",
+                        cx,
+                    );
+                }
+                Err(error) => view.set_status(
+                    true,
+                    format!("That invitation could not be used: {error}"),
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn copy_invite(&mut self, group: GroupId, cx: &mut Context<Self>) {
         let Some(handle) = Self::handle(cx) else {
             return;
@@ -730,7 +790,7 @@ impl MessagesView {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(ticket));
                     view.set_status(
                         false,
-                        "The invitation is copied. Anyone you send it to can join.",
+                        "Invitation copied. Send it to someone you have paired with; they paste it under Join a group.",
                         cx,
                     );
                 }
@@ -933,6 +993,21 @@ impl Render for MessagesView {
                             .on_click({
                                 let view = view.clone();
                                 move |_, cx| view.update(cx, |view, cx| view.create_group(cx))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(self.join.clone()))
+                    .child(
+                        Button::new("messages-join", "Join")
+                            .variant(Variant::Secondary)
+                            .on_click({
+                                let view = view.clone();
+                                move |_, cx| view.update(cx, |view, cx| view.join_group(cx))
                             }),
                     ),
             )
@@ -1152,6 +1227,15 @@ impl MessagesView {
                 .on_click(move |_, cx| crate::notifications::set_muted(cx, destination, muted)),
         );
         if let Target::Group(group) = target {
+            let invite_view = view.clone();
+            header_buttons = header_buttons.child(
+                Button::new("messages-invite", "Invite")
+                    .variant(Variant::Secondary)
+                    .tooltip("Make an invitation to this group")
+                    .on_click(move |_, cx| {
+                        invite_view.update(cx, |view, cx| view.copy_invite(group, cx))
+                    }),
+            );
             header_buttons = header_buttons.child(
                 Button::new(
                     "messages-group-info",
