@@ -92,7 +92,7 @@ impl Button {
 }
 
 impl RenderOnce for Button {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let (background, hover, foreground, border) = match self.variant {
             Variant::Primary => (
@@ -128,9 +128,23 @@ impl RenderOnce for Button {
         let focus_ring = theme.focus_ring;
         let disabled_text = theme.text_disabled;
 
+        // Every button can take keyboard focus: a caller's handle if it gave one, otherwise one
+        // kept for this button's id, so Tab reaches it without the caller doing anything.
+        let focus_handle = match self.focus_handle.clone() {
+            Some(handle) => handle,
+            None => window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone(),
+        };
+        // Screen readers announce the label, or the tooltip for a button with only an icon.
+        let accessible_name = self.label.clone().or_else(|| self.tooltip.clone());
+
         let icon_only = self.label.is_none();
         let mut button = div()
             .id(self.id.clone())
+            .role(gpui::Role::Button)
+            .aria_label(accessible_name.unwrap_or_default())
             .flex()
             .flex_none()
             .items_center()
@@ -159,11 +173,10 @@ impl RenderOnce for Button {
             button = button.tooltip(tooltip::text(text));
         }
 
-        if let Some(handle) = &self.focus_handle {
-            button = button
-                .track_focus(handle)
-                .focus_visible(|style| style.border_color(focus_ring));
-        }
+        button = button
+            .track_focus(&focus_handle)
+            .tab_stop(!self.disabled)
+            .focus_visible(|style| style.border_color(focus_ring));
 
         if self.disabled {
             return button

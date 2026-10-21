@@ -2,6 +2,8 @@
 //!
 //! To add a theme, create a file next to `one_dark.rs` with its own constructor.
 
+#[cfg(test)]
+mod contrast;
 mod gruvbox_dark_hard;
 mod gruvbox_light_hard;
 mod one_dark;

@@ -955,7 +955,7 @@ struct Palette {
 }
 
 impl Render for MessagesView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let palette = Palette {
             text: theme.text,
@@ -974,7 +974,8 @@ impl Render for MessagesView {
         let list_body = if searching {
             self.hits_view(&view, palette).into_any_element()
         } else {
-            self.rows_view(&view, palette, cx).into_any_element()
+            self.rows_view(&view, palette, window, cx)
+                .into_any_element()
         };
         let left = div()
             .flex()
@@ -986,7 +987,7 @@ impl Render for MessagesView {
             .h_full()
             .p_3()
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(palette.border)
             .child(
                 div()
                     .flex()
@@ -1055,7 +1056,13 @@ impl Render for MessagesView {
 
 impl MessagesView {
     /// The conversation rows, most recent first. Each opens its conversation.
-    fn rows_view(&self, view: &Entity<Self>, palette: Palette, cx: &App) -> impl IntoElement {
+    fn rows_view(
+        &self,
+        view: &Entity<Self>,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
         let rows: Vec<_> = self
             .rows
             .iter()
@@ -1067,7 +1074,13 @@ impl MessagesView {
                     Target::Contact(id) => Self::presence(cx, &id),
                     Target::Group(_) => false,
                 };
+                // A row takes keyboard focus, and Enter or Space opens its conversation.
+                let focus = window
+                    .use_keyed_state(("conversation-focus", index), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
                 let open = view.clone();
+                let open_from_key = view.clone();
                 let badge = (row.unread > 0).then(|| {
                     div()
                         .flex_none()
@@ -1084,6 +1097,28 @@ impl MessagesView {
                 });
                 div()
                     .id(("conversation", index))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!(
+                        "{}{}{}",
+                        row.label,
+                        if row.unread > 0 {
+                            format!(", {} unread", row.unread)
+                        } else {
+                            String::new()
+                        },
+                        if online { ", online" } else { "" }
+                    ))
+                    .track_focus(&focus)
+                    .tab_stop(true)
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .focus_visible(|style| style.border_color(palette.accent))
+                    .on_key_down(move |event, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            open_from_key.update(cx, |view, cx| view.select(target, cx));
+                            cx.stop_propagation();
+                        }
+                    })
                     .flex()
                     .flex_row()
                     .items_center()

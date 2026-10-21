@@ -341,8 +341,12 @@ impl Render for TextInput {
         };
 
         div()
+            .id(("text-input", entity.entity_id().as_u64()))
+            .role(gpui::Role::TextInput)
+            .aria_label(self.placeholder.clone())
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
+            .tab_stop(true)
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_left))

@@ -16,7 +16,9 @@ actions!(
         ShowMessages,
         ShowPeers,
         ShowStorage,
-        ShowSettings
+        ShowSettings,
+        FocusNext,
+        FocusPrevious
     ]
 );
 
@@ -140,6 +142,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-3", ShowPeers, None),
         KeyBinding::new("secondary-4", ShowStorage, None),
         KeyBinding::new("secondary-5", ShowSettings, None),
+        KeyBinding::new("tab", FocusNext, None),
+        KeyBinding::new("shift-tab", FocusPrevious, None),
     ]);
 }
 
