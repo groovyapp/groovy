@@ -152,6 +152,13 @@ impl PeersView {
         cx.notify();
     }
 
+    /// Fills in the pairing input with a link that was opened. Pairing still waits for the user.
+    pub fn prefill_pairing(&mut self, text: String, cx: &mut Context<Self>) {
+        self.tickets
+            .update(cx, |panel, cx| panel.set_input(text, cx));
+        cx.notify();
+    }
+
     fn presence(cx: &App, id: &EndpointId) -> Option<Route> {
         cx.try_global::<NodeState>().and_then(|node| node.route(id))
     }

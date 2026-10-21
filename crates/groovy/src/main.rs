@@ -4,9 +4,11 @@
 mod autostart;
 mod backup;
 mod data;
+mod deeplink;
 mod devices;
 mod files;
 mod folders;
+mod instance;
 mod messages;
 mod node;
 mod notifications;
@@ -19,6 +21,7 @@ mod tickets;
 mod title_bar;
 mod tray;
 mod ui;
+mod url_scheme;
 mod window_frame;
 mod workspace;
 
@@ -50,6 +53,12 @@ fn main() -> ExitCode {
 
 fn run() -> anyhow::Result<()> {
     let dir = data::prepare()?;
+    // A running copy takes this launch's arguments, and this launch ends.
+    let args: Vec<String> = std::env::args().collect();
+    let socket = dir.root().join("instance.sock");
+    if matches!(instance::claim(&socket, &args)?, instance::Claim::Forwarded) {
+        return Ok(());
+    }
     let _log_guard =
         groovy_core::logging::init(&dir.logs_dir()).context("failed to start logging")?;
     groovy_core::logging::install_panic_hook();
@@ -82,6 +91,7 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
             }
             quit_when_last_window_closes(cx);
 
+            spawn_instance_poll(cx);
             // With a tray, `--background` (the login entry's flag) starts without a window.
             let tray_running = tray::start(cx);
             let background = std::env::args().any(|arg| arg == "--background");
@@ -126,4 +136,43 @@ pub fn show_main_window(cx: &mut App) {
         }
     }
     cx.activate(true);
+}
+
+/// Takes the requests other launches made, and acts on them: bringing the window forward, or
+/// showing a link's place in the app.
+fn spawn_instance_poll(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            cx.update(|cx| {
+                for item in instance::take_incoming() {
+                    match item {
+                        instance::Incoming::Show => show_main_window(cx),
+                        instance::Incoming::Link(text) => {
+                            if let Some(link) = deeplink::parse(&text) {
+                                route_link(cx, link);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+/// Shows a link's place in the app. A link only fills in an input; the user presses the button.
+fn route_link(cx: &mut App, link: deeplink::Link) {
+    show_main_window(cx);
+    let workspace = cx
+        .windows()
+        .iter()
+        .find_map(|window| window.downcast::<Workspace>());
+    if let Some(workspace) = workspace {
+        workspace
+            .update(cx, |workspace, _, cx| workspace.open_link(link, cx))
+            .ok();
+    }
 }

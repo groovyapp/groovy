@@ -371,6 +371,44 @@ fn relay_row(
 }
 
 /// A switch for one way of finding peers. Takes effect the next time Groovy starts.
+/// A row that turns Groovy's `groovy://` link handling on or off.
+fn link_row(on: bool, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let button = Button::new("settings-link-handler", if on { "On" } else { "Off" })
+        .variant(if on {
+            Variant::Primary
+        } else {
+            Variant::Secondary
+        })
+        .on_click(move |_, cx| {
+            if let Err(error) = crate::url_scheme::set_registered(!on) {
+                tracing::warn!(%error, "could not change the groovy:// handler");
+            }
+            cx.refresh_windows();
+        });
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child("Open groovy:// links"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child("Links from the browser or other apps open here. A link only fills in the pairing or join field; you still press the button."),
+                ),
+        )
+        .child(button)
+}
+
 /// A row with an On/Off switch for one background setting, saved as soon as it changes.
 fn background_row(
     label: &'static str,
@@ -705,7 +743,8 @@ impl Render for SettingsScreen {
                 cx,
             ))
             .when(cfg!(target_os = "linux"), |d| {
-                d.child(background_row(
+                d.child(link_row(crate::url_scheme::is_registered(), cx))
+                .child(background_row(
                     "Close to tray",
                     "Closing the window keeps Groovy running. Without a tray icon, closing quits as before.",
                     "settings-close-to-tray",

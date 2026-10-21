@@ -137,6 +137,23 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows the place a link is about, with its input filled in for the user to confirm.
+    pub fn open_link(&mut self, link: crate::deeplink::Link, cx: &mut Context<Self>) {
+        match link {
+            crate::deeplink::Link::Pair(text) => {
+                self.select(Screen::Peers, cx);
+                self.peers
+                    .update(cx, |peers, cx| peers.prefill_pairing(text, cx));
+            }
+            crate::deeplink::Link::Join(text) => {
+                self.select(Screen::Messages, cx);
+                self.messages
+                    .update(cx, |messages, cx| messages.prefill_join(text, cx));
+            }
+            crate::deeplink::Link::Open => {}
+        }
+    }
+
     /// Takes the window to the place of each notification that was clicked.
     fn open_notifications(&mut self, cx: &mut Context<Self>) {
         for destination in crate::notifications::take_opened() {
