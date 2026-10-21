@@ -130,8 +130,27 @@ pub enum GroupError {
     Version,
     #[error("the group ticket is not valid")]
     BadTicket,
+    #[error("a group needs a name")]
+    NameMissing,
+    #[error("a group name can be at most 64 characters")]
+    NameTooLong,
     #[error(transparent)]
     Message(#[from] MessageError),
+}
+
+/// Longest name a group can have, in characters.
+pub const MAX_NAME_CHARS: usize = 64;
+
+/// Checks a group name: not blank, and at most [`MAX_NAME_CHARS`] characters. Returns it trimmed.
+pub fn clean_name(name: &str) -> Result<String, GroupError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(GroupError::NameMissing);
+    }
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(GroupError::NameTooLong);
+    }
+    Ok(name.to_owned())
 }
 
 /// What a signature covers: every field of the envelope but the signature itself.
@@ -618,6 +637,20 @@ mod tests {
         let mut forged = message;
         forged.author = SecretKey::generate().public();
         assert_eq!(verify(&forged), Err(GroupError::BadSignature));
+    }
+
+    #[test]
+    fn a_group_name_is_trimmed_and_limited_in_characters() {
+        assert_eq!(clean_name("  Friends  ").as_deref(), Ok("Friends"));
+        assert_eq!(clean_name("   "), Err(GroupError::NameMissing));
+        assert_eq!(
+            clean_name(&"é".repeat(MAX_NAME_CHARS)).map(|n| n.chars().count()),
+            Ok(MAX_NAME_CHARS)
+        );
+        assert_eq!(
+            clean_name(&"é".repeat(MAX_NAME_CHARS + 1)),
+            Err(GroupError::NameTooLong)
+        );
     }
 
     #[test]

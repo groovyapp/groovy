@@ -1848,10 +1848,7 @@ fn spawn_groups(receiving: &Receiving) {
 async fn rename_group(receiving: &Receiving, group: GroupId, name: &str) -> Result<(), NodeError> {
     let row = row_of(receiving, &group)?;
     let own = receiving.endpoint.id();
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(NodeError::Group("a group needs a name".to_owned()));
-    }
+    let name = groups::clean_name(name).map_err(group_error)?;
     if !members_of(receiving, &row).await?.is_admin(&own) {
         return Err(NodeError::Group(
             "only an admin can rename the group".to_owned(),
@@ -1869,7 +1866,7 @@ async fn rename_group(receiving: &Receiving, group: GroupId, name: &str) -> Resu
     )
     .await?;
     group_database(receiving)?
-        .set_group_name(&group, name)
+        .set_group_name(&group, &name)
         .map_err(group_error)
 }
 
@@ -2114,10 +2111,7 @@ fn start_topic(receiving: &Receiving, group: GroupId) -> Result<(), NodeError> {
 async fn create_group(receiving: &Receiving, name: &str) -> Result<GroupId, NodeError> {
     let database = group_database(receiving)?;
     let docs = docs_of(receiving)?;
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(NodeError::Group("a group needs a name".to_owned()));
-    }
+    let name = groups::clean_name(name).map_err(group_error)?;
     let secret = &receiving.secret;
     let own = secret.public();
     let group = groups::new_group_id();
@@ -2127,7 +2121,7 @@ async fn create_group(receiving: &Receiving, name: &str) -> Result<GroupId, Node
     database
         .insert_group(&GroupRow {
             id: group,
-            name: name.to_owned(),
+            name: name.clone(),
             created: now / 1000,
             founder: own,
             doc: namespace,
