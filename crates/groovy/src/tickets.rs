@@ -32,6 +32,13 @@ pub struct TicketPanel {
 }
 
 impl TicketPanel {
+    /// Puts a ticket or link in the input, for the user to check and press the button on.
+    pub fn set_input(&mut self, text: String, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        self.status = None;
+        cx.notify();
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("Paste a ticket or groovy:// link", cx));
         let _subscription =

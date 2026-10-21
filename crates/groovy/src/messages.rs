@@ -743,6 +743,12 @@ impl MessagesView {
         .detach();
     }
 
+    /// Fills in the join field with an invitation that was opened. Joining waits for the user.
+    pub fn prefill_join(&mut self, text: String, cx: &mut Context<Self>) {
+        self.join.update(cx, |input, cx| input.set_text(text, cx));
+        self.set_status(false, "Check the invitation, then press Join.", cx);
+    }
+
     /// Joins the group whose invitation is in the join field.
     fn join_group(&mut self, cx: &mut Context<Self>) {
         let ticket = self.join.read(cx).text().trim().to_owned();
