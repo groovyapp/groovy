@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use iroh_blobs::{
-    BlobFormat, Hash,
+    BlobFormat, Hash, HashAndFormat,
     api::Store,
     api::blobs::{AddPathOptions, ImportMode},
     format::collection::Collection,
@@ -54,8 +54,8 @@ pub struct Imported {
     pub bytes: u64,
 }
 
-/// Imports the files under `paths` into `store` as one collection, and tags the
-/// collection so its content is kept.
+/// Imports the files under `paths` into `store` as one collection, and tags it
+/// `<tag>-<root>` so its content is kept until that tag is deleted.
 ///
 /// `progress` is called after each file with the number of files done and the
 /// number in total. Files are copied in, so later changes to them do not affect
@@ -63,6 +63,7 @@ pub struct Imported {
 pub async fn import(
     store: &Store,
     paths: &[PathBuf],
+    tag: &str,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Imported, FileError> {
     let names = paths
@@ -92,10 +93,16 @@ pub async fn import(
         progress(done as u64 + 1, total);
     }
 
-    // Not tagged here: the caller names the tag that keeps the collection, so it can be
-    // released later. Until then the collection is at risk from garbage collection.
+    // The collection is tagged before the temporary tags go, so garbage collection never finds
+    // its files unprotected, even for a moment.
     let root_tag = collection.store(store).await.map_err(store_error)?;
     let root = root_tag.hash();
+    store
+        .tags()
+        .set(format!("{tag}-{root}"), HashAndFormat::hash_seq(root))
+        .await
+        .map_err(store_error)?;
+    drop(root_tag);
     drop(temps);
     Ok(Imported {
         root,

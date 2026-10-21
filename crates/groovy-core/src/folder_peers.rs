@@ -11,6 +11,10 @@
 //! - Starts the live sync with those members when the node starts, or the folder is created
 //!   or joined.
 //! - Syncs with a member again when a sync with it fails, waiting longer after each failure.
+//! - While the folder has no gossip neighbors but knows members, syncs with them again soon,
+//!   waiting longer each time. Gossip joins only once, so a join that failed, as when a member
+//!   could not be found yet after a restart, would otherwise leave the folder without live
+//!   updates until the next resync.
 //! - Now and then syncs with every member, which picks up a change that was made while a
 //!   sync was already running and so reached neither the sync nor gossip.
 
@@ -36,6 +40,9 @@ const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 /// How often the folder is synced with every member it knows.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a folder with no neighbors waits before syncing with its members again. It
+/// doubles each time, up to `RESYNC_INTERVAL`.
+const ALONE_FIRST: Duration = Duration::from_secs(5);
 
 /// Starts keeping a folder connected. The task runs until the node stops, or until it is
 /// aborted through the returned handle, as when the folder is left.
@@ -69,10 +76,28 @@ async fn run(docs: Docs, database: Arc<Database>, namespace: NamespaceId) -> Res
         tokio::time::Instant::now() + RESYNC_INTERVAL,
         RESYNC_INTERVAL,
     );
+    let mut neighbors: HashSet<EndpointId> = HashSet::new();
+    let mut alone_wait = ALONE_FIRST;
+    let alone = tokio::time::sleep(alone_wait);
+    tokio::pin!(alone);
     loop {
         tokio::select! {
+            () = &mut alone => {
+                if neighbors.is_empty() && sync_with_members(&doc, &database, namespace).await > 0 {
+                    alone_wait = (alone_wait * 2).min(RESYNC_INTERVAL);
+                } else {
+                    alone_wait = ALONE_FIRST;
+                }
+                alone.as_mut().reset(tokio::time::Instant::now() + alone_wait);
+            }
             event = events.next() => match event {
-                Some(Ok(LiveEvent::NeighborUp(peer))) => remember(&database, namespace, peer),
+                Some(Ok(LiveEvent::NeighborUp(peer))) => {
+                    neighbors.insert(peer);
+                    remember(&database, namespace, peer);
+                }
+                Some(Ok(LiveEvent::NeighborDown(peer))) => {
+                    neighbors.remove(&peer);
+                }
                 Some(Ok(LiveEvent::SyncFinished(sync))) => match sync.result {
                     Ok(_) => {
                         failures.remove(&sync.peer);
@@ -109,13 +134,16 @@ async fn run(docs: Docs, database: Arc<Database>, namespace: NamespaceId) -> Res
                     warn!(%error, "could not sync a shared folder again");
                 }
             }
-            _ = resync.tick() => sync_with_members(&doc, &database, namespace).await,
+            _ = resync.tick() => {
+                sync_with_members(&doc, &database, namespace).await;
+            }
         }
     }
 }
 
-/// Starts syncing with every member the folder knows. iroh-docs adds the ones it remembers.
-async fn sync_with_members(doc: &Doc, database: &Database, namespace: NamespaceId) {
+/// Starts syncing with every member the folder knows, and rejoins its gossip through them.
+/// iroh-docs adds the members it remembers. Returns how many members this device knows.
+async fn sync_with_members(doc: &Doc, database: &Database, namespace: NamespaceId) -> usize {
     let members = match database.folder_peers(namespace) {
         Ok(members) => members,
         Err(error) => {
@@ -123,10 +151,12 @@ async fn sync_with_members(doc: &Doc, database: &Database, namespace: NamespaceI
             Vec::new()
         }
     };
+    let known = members.len();
     let addrs = members.into_iter().map(EndpointAddr::new).collect();
     if let Err(error) = doc.start_sync(addrs).await {
         warn!(%error, "could not sync a shared folder");
     }
+    known
 }
 
 fn remember(database: &Database, namespace: NamespaceId, peer: EndpointId) {

@@ -597,9 +597,10 @@ async fn run(
     let gate = config.gate.clone();
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let offers: PendingOffers = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    // Hashes that shared folders reference. Collection keeps them, so it is refreshed from
-    // the folders, and grows as files are added.
-    let folder_live: Protected = Arc::new(Mutex::new(HashSet::new()));
+    // What shared folders reference, which collection keeps: it reads the folders' entries
+    // at the start of each run, once they can be read, and holds the files just added.
+    let folder_source: FolderSource = Arc::new(std::sync::OnceLock::new());
+    let held_adds = folders::HeldAdds::new(config.garbage_interval.is_some());
     let withdrawn: Withdrawn = Arc::new(Mutex::new(HashSet::new()));
     // The content of downloads in progress, so collection leaves it alone.
     let in_flight: Protected = Arc::new(Mutex::new(HashSet::new()));
@@ -608,10 +609,11 @@ async fn run(
             let mut options = iroh_blobs::store::fs::options::Options::new(dir);
             options.gc = config.garbage_interval.map(|interval| GcConfig {
                 interval,
-                add_protected: Some(protect_folder_content(vec![
-                    folder_live.clone(),
+                add_protected: Some(protect_content(
+                    folder_source.clone(),
+                    held_adds.clone(),
                     in_flight.clone(),
-                ])),
+                )),
             });
             match FsStore::load_with_opts(dir.join("blobs.db"), options).await {
                 Ok(store) => Some(store),
@@ -722,7 +724,7 @@ async fn run(
                 docs: docs.clone(),
                 store: store.clone(),
                 database: database.clone(),
-                live: folder_live.clone(),
+                held: held_adds.clone(),
                 me: endpoint.id(),
                 tasks: Arc::new(Mutex::new(HashMap::new())),
                 peers: Arc::new(Mutex::new(HashMap::new())),
@@ -735,16 +737,7 @@ async fn run(
                     tokio::time::sleep(VERIFY_INTERVAL).await;
                 }
             });
-            if config.garbage_interval.is_some() {
-                let refreshing = state.clone();
-                let live = folder_live.clone();
-                tokio::spawn(async move {
-                    loop {
-                        refresh_folder_live(&refreshing, &live).await;
-                        tokio::time::sleep(FOLDER_REFRESH).await;
-                    }
-                });
-            }
+            let _ = folder_source.set((docs.clone(), database.clone()));
             match database.folders() {
                 Ok(saved) => saved.iter().for_each(|folder| state.start(folder)),
                 Err(error) => warn!(%error, "could not read the shared folders"),
@@ -977,13 +970,13 @@ async fn run(
                 }
                 Some(Command::AddToFolder(namespace, key, source, seen, reply)) => {
                     let folders = folders.clone();
-                    let live = folder_live.clone();
                     tokio::spawn(async move {
                         let outcome = match folder_state(&folders) {
                             Ok(state) => {
                                 match folders::add_file_seeing(
                                     &state.docs,
                                     &state.store,
+                                    &state.held,
                                     namespace,
                                     &key,
                                     &source,
@@ -991,10 +984,7 @@ async fn run(
                                 )
                                 .await
                                 {
-                                    Ok(hash) => {
-                                        lock_live(&live).insert(hash);
-                                        Ok(())
-                                    }
+                                    Ok(_) => Ok(()),
                                     Err(error) => Err(folder_error(error)),
                                 }
                             }
@@ -1549,7 +1539,8 @@ struct FolderState {
     docs: Docs,
     store: FsStore,
     database: Arc<Database>,
-    live: Protected,
+    /// Files just added, held until collection has read the entries that name them.
+    held: folders::HeldAdds,
     /// This device, which names its copy in the folder's replica reports.
     me: EndpointId,
     /// The sync task of each folder this device saves, so leaving a folder can stop it.
@@ -1594,7 +1585,7 @@ impl FolderState {
                 std::ops::Deref::deref(&self.store).clone(),
                 folder.namespace,
                 dir.clone(),
-                self.live.clone(),
+                self.held.clone(),
             );
             if let Some(old) = self
                 .tasks
@@ -1698,19 +1689,43 @@ fn folder_error(error: folders::FolderError) -> NodeError {
     NodeError::Folder(error.to_string())
 }
 
-/// How often the hashes shared folders reference are read again.
-const FOLDER_REFRESH: Duration = Duration::from_secs(2);
+/// The folders' replicas and the database that lists the folders, once both are open.
+/// Collection reads the folders' entries through it.
+type FolderSource = Arc<std::sync::OnceLock<(Docs, Arc<Database>)>>;
 
-/// Lets collection keep what shared folders reference. The protection is read at the
-/// start of each collection, so a file is protected from the moment it is in a folder.
-/// Lets collection also keep the content of downloads in progress, which no tag holds until
-/// their file list has arrived.
-fn protect_folder_content(sets: Vec<Protected>) -> ProtectCb {
+/// Tells collection what to keep beyond the store's tags: the content of downloads in
+/// progress, which no tag holds until their file list has arrived; what the shared folders'
+/// entries name, read at the start of each run; and the files just added to folders, which
+/// may not show in the entries yet. A run that cannot read the entries is skipped.
+fn protect_content(
+    folders: FolderSource,
+    held: folders::HeldAdds,
+    in_flight: Protected,
+) -> ProtectCb {
     Arc::new(move |protected: &mut HashSet<Hash>| {
-        for live in &sets {
-            protected.extend(lock_live(live).iter().copied());
-        }
-        Box::pin(std::future::ready(ProtectOutcome::Continue))
+        protected.extend(lock_live(&in_flight).iter().copied());
+        // The files held now stay protected this run, whatever the entries show.
+        protected.extend(held.held());
+        let folders = folders.clone();
+        let held = held.clone();
+        // Read on its own task, since collection needs a future it can share between threads.
+        let reading = tokio::spawn(async move {
+            match folders.get() {
+                Some((docs, database)) => folder_hashes(docs, database).await,
+                None => Ok(HashSet::new()),
+            }
+        });
+        Box::pin(async move {
+            match reading.await {
+                Ok(Ok(hashes)) => {
+                    // Held files the entries now name are kept by the entries from here on.
+                    held.release_seen(&hashes);
+                    protected.extend(hashes);
+                    ProtectOutcome::Continue
+                }
+                _ => ProtectOutcome::Abort,
+            }
+        })
     })
 }
 
@@ -1718,25 +1733,26 @@ fn lock_live(live: &Protected) -> std::sync::MutexGuard<'_, HashSet<Hash>> {
     live.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Reads every hash the folders reference, and makes that the protected set.
-async fn refresh_folder_live(state: &FolderState, live: &Protected) {
-    let Ok(folders) = state.database.folders() else {
-        return;
-    };
+/// Every hash the folders reference: the files of each folder this device keeps, and every
+/// folder's own records, which are small and always kept.
+async fn folder_hashes(docs: &Docs, database: &Database) -> Result<HashSet<Hash>, NodeError> {
     let mut hashes = HashSet::new();
+    let folders = database
+        .folders()
+        .map_err(|error| NodeError::Folder(error.to_string()))?;
     for folder in folders {
-        // A device that does not keep a folder lets its files go. The folder's own records
-        // are small, and always kept.
-        if folder.keep_copy
-            && let Ok(entries) = folders::entries(&state.docs, folder.namespace).await
-        {
+        if folder.keep_copy {
+            let entries = folders::entries(docs, folder.namespace)
+                .await
+                .map_err(folder_error)?;
             hashes.extend(entries.iter().map(|entry| entry.hash));
         }
-        if let Ok(records) = replicas::record_hashes(&state.docs, folder.namespace).await {
-            hashes.extend(records);
-        }
+        let records = replicas::record_hashes(docs, folder.namespace)
+            .await
+            .map_err(folder_error)?;
+        hashes.extend(records);
     }
-    *lock_live(live) = hashes;
+    Ok(hashes)
 }
 
 /// What `start` hands the node thread: the transfer book, the next free transfer id,
@@ -1914,16 +1930,8 @@ async fn send_attachment(
     path: PathBuf,
 ) -> Result<Message, NodeError> {
     let store = receiving.store.clone().ok_or(NodeError::BlobsDisabled)?;
-    let imported = files::import(&store, std::slice::from_ref(&path), |_, _| {})
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
-    // Keeps the file while a message refers to it, as a send does.
-    store
-        .tags()
-        .set(
-            format!("attachment-{}", imported.root),
-            HashAndFormat::hash_seq(imported.root),
-        )
+    // Tagged so the file is kept while a message refers to it, as a send does.
+    let imported = files::import(&store, std::slice::from_ref(&path), "attachment", |_, _| {})
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
     let preview = attachment_preview(path).await;
@@ -3118,7 +3126,7 @@ async fn offer_files(
 ) -> Result<(), NodeError> {
     let store = receiving.store.clone().ok_or(NodeError::BlobsDisabled)?;
     let progress = receiving.events.clone();
-    let imported = match files::import(&store, &paths, |done, total| {
+    let imported = match files::import(&store, &paths, "send", |done, total| {
         let _ = progress.send(NodeEvent::ImportProgress { done, total });
     })
     .await
@@ -3135,14 +3143,6 @@ async fn offer_files(
             return Err(error);
         }
     };
-    store
-        .tags()
-        .set(
-            format!("send-{}", imported.root),
-            HashAndFormat::hash_seq(imported.root),
-        )
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
     // Sending the same content again makes it available again.
     let hashes = hashes_of_collection(&store, imported.root).await?;
     for hash in &hashes {
@@ -3789,15 +3789,7 @@ async fn create_share(
 ) -> Result<ShareTicket, NodeError> {
     let store = receiving.store.as_ref().ok_or(NodeError::BlobsDisabled)?;
     let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
-    let imported = files::import(store, &paths, |_, _| {})
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
-    store
-        .tags()
-        .set(
-            format!("share-{}", imported.root),
-            HashAndFormat::hash_seq(imported.root),
-        )
+    let imported = files::import(store, &paths, "share", |_, _| {})
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
     // The root's links are the metadata and every file, all of which the share serves.

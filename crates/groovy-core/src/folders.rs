@@ -64,8 +64,70 @@ pub struct ExportReport {
     pub missing: usize,
 }
 
-/// The hashes that shared folders reference. Garbage collection keeps every one of them.
+/// Hashes that garbage collection keeps, such as the content of downloads in progress.
 pub type Protected = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Hash>>>;
+
+/// The temporary tags of files just added to folders, held until garbage collection has seen
+/// them in the folders' entries.
+///
+/// Collection keeps what the folders' entries name, reading them at the start of each run. An
+/// entry just written may not show in what is read yet, since the replica commits its writes
+/// a little later. So each added file's temporary tag is held here, and a run lets it go only
+/// once the entries it read name the file. A file that never shows, because it was replaced
+/// before any run saw it, is let go after `HOLD_MAX`.
+#[derive(Clone, Default)]
+pub struct HeldAdds {
+    /// `None` when nothing collects garbage, so there is nothing to hold the tags for.
+    tags: Option<std::sync::Arc<std::sync::Mutex<Vec<HeldTag>>>>,
+}
+
+/// A held temporary tag, with when it was held.
+type HeldTag = (std::time::Instant, iroh_blobs::api::TempTag);
+
+/// How long a file's temporary tag is held at most, waiting to be seen in the entries.
+const HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl HeldAdds {
+    /// Holds tags for a store that collects garbage, or lets them go at once for one that
+    /// does not.
+    pub fn new(collecting: bool) -> Self {
+        Self {
+            tags: collecting.then(Default::default),
+        }
+    }
+
+    /// Holds a file's temporary tag until collection has seen the file in the entries.
+    pub fn hold(&self, tag: iroh_blobs::api::TempTag) {
+        if let Some(tags) = &self.tags {
+            tags.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((std::time::Instant::now(), tag));
+        }
+    }
+
+    /// The files held now, for a run that is about to read the entries.
+    pub(crate) fn held(&self) -> Vec<Hash> {
+        self.tags
+            .as_ref()
+            .map(|tags| {
+                tags.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .map(|(_, tag)| tag.hash())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Lets go of the files the entries now name, and of those held longer than `HOLD_MAX`.
+    pub(crate) fn release_seen(&self, seen: &std::collections::HashSet<Hash>) {
+        if let Some(tags) = &self.tags {
+            tags.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(since, tag)| !seen.contains(&tag.hash()) && since.elapsed() < HOLD_MAX);
+        }
+    }
+}
 
 /// Errors from shared folders.
 #[derive(Debug, Error)]
@@ -524,11 +586,12 @@ fn current(all: &[Version], key: &str) -> (Option<Version>, Vec<Version>) {
 pub async fn add_file(
     docs: &iroh_docs::protocol::Docs,
     store: &Store,
+    held: &HeldAdds,
     namespace: NamespaceId,
     key: &str,
     source: &Path,
 ) -> Result<Hash, FolderError> {
-    add_file_seeing(docs, store, namespace, key, source, None).await
+    add_file_seeing(docs, store, held, namespace, key, source, None).await
 }
 
 /// Like [`add_file`], but records that the write was made after `seen` rather than the
@@ -537,6 +600,7 @@ pub async fn add_file(
 pub async fn add_file_seeing(
     docs: &iroh_docs::protocol::Docs,
     store: &Store,
+    held: &HeldAdds,
     namespace: NamespaceId,
     key: &str,
     source: &Path,
@@ -561,7 +625,8 @@ pub async fn add_file_seeing(
         .temp_tag()
         .await
         .map_err(|error| FolderError::Store(error.to_string()))?;
-    // No tag: the folder's entries are what keeps this blob, and garbage collection reads them.
+    // No lasting tag: the folder's entries are what keep this blob, and garbage collection
+    // reads them. The temporary tag is held until it has.
     let seen = match seen {
         Some(seen) => seen,
         None => leaves(&all_entries(docs, namespace).await?, &key)
@@ -578,7 +643,9 @@ pub async fn add_file_seeing(
     doc.set_hash(author, stored_key(&key), temp.hash(), size)
         .await
         .map_err(replica)?;
-    Ok(temp.hash())
+    let hash = temp.hash();
+    held.hold(temp);
+    Ok(hash)
 }
 
 /// Removes the file at `key`. Members see it removed when they sync.
