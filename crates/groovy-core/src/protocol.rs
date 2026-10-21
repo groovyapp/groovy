@@ -91,6 +91,15 @@ pub enum Request {
     /// Asks another device of the same user for the contacts it trusts. Answered with a list of
     /// [`crate::user::SharedContact`], and only to the user's own devices.
     UserContacts,
+    /// Asks a trusted member for the group's messages it stored after a place in its own order
+    /// of storing them. Answered with a [`crate::groups::ReceivedPage`]. Unlike
+    /// [`Request::GroupHistory`], it cannot skip a message whose author's clock was behind.
+    /// It is last, so peers that predate it still read every other request; they do not answer
+    /// it, and the asker falls back to `GroupHistory`.
+    GroupReceived {
+        group: [u8; 32],
+        after: u64,
+    },
 }
 
 /// What a sender offers: the top-level names being sent, and the collection that

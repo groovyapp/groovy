@@ -5,9 +5,11 @@
 //! the signature and that the author is a trusted contact before it stores the message. So a
 //! message relayed by another member still shows who wrote it.
 //!
-//! Gossip only reaches the members online at the time. A member that comes back asks each
-//! member it reconnects to for the messages it missed, in pages, over the Groovy protocol.
-//! Each message in a page carries its signature, so the page can come from any member.
+//! Gossip only reaches the members online at the time. A member asks the members it is
+//! connected to for the messages it missed, in pages, over the Groovy protocol. It asks for
+//! what each member stored since it last asked, in that member's own order of storing them, so
+//! a message is not skipped because its author's clock was behind. Each message in a page
+//! carries its signature, so the page can come from any member.
 //!
 //! Who is a member, and in what role, is kept as signed records in the group's document; see
 //! [`crate::membership`]. Removing a member changes the group's key, and so its topic, and only
@@ -77,6 +79,21 @@ pub struct GroupPage {
     pub more: bool,
     /// Addresses of the group's other members that the answering member knows, so a member
     /// that has just joined can reach them.
+    pub members: Vec<EndpointAddr>,
+}
+
+/// A page of the messages a member stored after a place in its own order of storing them,
+/// oldest first. The asker keeps `last` and asks after it next time, so it gets every message
+/// the member has stored since, whatever the authors' clocks said.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceivedPage {
+    pub messages: Vec<GroupEnvelope>,
+    /// The place of the page's last message in the member's order, or the place asked after
+    /// if the page is empty.
+    pub last: u64,
+    /// Whether more messages follow this page.
+    pub more: bool,
+    /// Addresses of the group's other members that the answering member knows.
     pub members: Vec<EndpointAddr>,
 }
 
@@ -384,6 +401,10 @@ impl Database {
     /// Forgets a group this device was in.
     pub fn delete_group(&self, group: &GroupId) -> Result<(), DbError> {
         self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM group_sync WHERE group_id = ?1",
+                [group.as_slice()],
+            )?;
             conn.execute("DELETE FROM chat_groups WHERE id = ?1", [group.as_slice()])
                 .map(|_| ())
         })
@@ -462,8 +483,9 @@ impl Database {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO group_messages
-                    (id, group_id, author, timestamp, body, reply_to, signature)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (id, group_id, author, timestamp, body, reply_to, signature, received)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    (SELECT COALESCE(MAX(received), 0) + 1 FROM group_messages))",
                 params![
                     envelope.id.as_slice(),
                     envelope.group.as_slice(),
@@ -516,6 +538,69 @@ impl Database {
             Ok(rows)
         })?;
         Ok(rows.into_iter().filter_map(decode_row).collect())
+    }
+
+    /// The messages this device stored after `after` in its own order of storing them, oldest
+    /// first, at most `limit`, each with its place in that order. Unlike the group's order,
+    /// this one only grows: a message stored later always comes after, whatever its timestamp.
+    pub fn group_envelopes_received_after(
+        &self,
+        group: &GroupId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, GroupEnvelope)>, DbError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_conn(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {COLUMNS}, received FROM group_messages
+                 WHERE group_id = ?1 AND received > ?2
+                 ORDER BY received LIMIT ?3"
+            ))?;
+            let rows = statement
+                .query_map(params![group.as_slice(), after, limit], |row| {
+                    Ok((read_row(row)?, row.get::<_, i64>(7)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(row, received)| Some((u64::try_from(received).ok()?, decode_row(row)?)))
+            .collect())
+    }
+
+    /// How far this device has read a member's order of storing a group's messages.
+    pub fn group_sync_cursor(&self, group: &GroupId, peer: &EndpointId) -> Result<u64, DbError> {
+        let received = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT received FROM group_sync WHERE group_id = ?1 AND peer = ?2",
+                params![group.as_slice(), peer.as_bytes().as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })?;
+        Ok(received
+            .and_then(|received| u64::try_from(received).ok())
+            .unwrap_or(0))
+    }
+
+    /// Records how far this device has read a member's order of storing a group's messages.
+    pub fn set_group_sync_cursor(
+        &self,
+        group: &GroupId,
+        peer: &EndpointId,
+        received: u64,
+    ) -> Result<(), DbError> {
+        let received = i64::try_from(received).unwrap_or(i64::MAX);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO group_sync (group_id, peer, received) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (group_id, peer) DO UPDATE SET received = excluded.received",
+                params![group.as_slice(), peer.as_bytes().as_slice(), received],
+            )
+            .map(|_| ())
+        })
     }
 
     /// The newest message in a group, as a position to ask for messages after.
@@ -716,5 +801,62 @@ mod tests {
             Some((20, [2; 16]))
         );
         assert!(db.is_in_group(&[7; 32]).unwrap());
+    }
+
+    #[test]
+    fn messages_are_read_in_the_order_they_were_stored_whatever_their_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("groovy.db")).unwrap();
+        let alice = SecretKey::generate();
+        let bob = SecretKey::generate();
+        db.insert_group(&GroupRow {
+            id: [7; 32],
+            name: "friends".into(),
+            created: 1,
+            founder: alice.public(),
+            doc: NamespaceId::from([5; 32]),
+            key: crate::membership::sign_key(&alice, [7; 32], 0, [1; 32], 1),
+        })
+        .unwrap();
+
+        let newer = sign(&alice, [7; 32], [2; 16], 20, "newer".into(), None);
+        let older = sign(
+            &alice,
+            [7; 32],
+            [1; 16],
+            10,
+            "older, stored later".into(),
+            None,
+        );
+        assert!(db.insert_group_message(&newer).unwrap());
+        let all = db.group_envelopes_received_after(&[7; 32], 0, 8).unwrap();
+        assert_eq!(all.len(), 1);
+        let (seen, _) = all[0];
+
+        // A message stored later comes after, though its timestamp is earlier.
+        assert!(db.insert_group_message(&older).unwrap());
+        let since = db
+            .group_envelopes_received_after(&[7; 32], seen, 8)
+            .unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].1.body, "older, stored later");
+        assert!(since[0].0 > seen);
+        // Storing a message again does not move it.
+        assert!(!db.insert_group_message(&older).unwrap());
+        assert!(
+            db.group_envelopes_received_after(&[7; 32], since[0].0, 8)
+                .unwrap()
+                .is_empty()
+        );
+
+        // How far each member has been read is kept until the group is left.
+        assert_eq!(db.group_sync_cursor(&[7; 32], &bob.public()).unwrap(), 0);
+        db.set_group_sync_cursor(&[7; 32], &bob.public(), 5)
+            .unwrap();
+        db.set_group_sync_cursor(&[7; 32], &bob.public(), 9)
+            .unwrap();
+        assert_eq!(db.group_sync_cursor(&[7; 32], &bob.public()).unwrap(), 9);
+        db.delete_group(&[7; 32]).unwrap();
+        assert_eq!(db.group_sync_cursor(&[7; 32], &bob.public()).unwrap(), 0);
     }
 }
