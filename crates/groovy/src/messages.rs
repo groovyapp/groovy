@@ -336,6 +336,13 @@ impl MessagesView {
         self.select(target, cx);
     }
 
+    /// Opens a conversation and puts the cursor in its composer, so the next keys type a message.
+    fn open_and_focus(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(target, cx);
+        let handle = self.composer.read(cx).focus_handle().clone();
+        window.focus(&handle, cx);
+    }
+
     /// Opens a conversation: its newest messages are read, and it counts as read to the newest.
     fn select(&mut self, target: Target, cx: &mut Context<Self>) {
         self.selected = Some(target);
@@ -1076,7 +1083,9 @@ impl MessagesView {
                 };
                 // A row takes keyboard focus, and Enter or Space opens its conversation.
                 let focus = window
-                    .use_keyed_state(("conversation-focus", index), cx, |_, cx| cx.focus_handle())
+                    .use_keyed_state(("conversation-focus", index), cx, |_, cx| {
+                        cx.focus_handle().tab_stop(true)
+                    })
                     .read(cx)
                     .clone();
                 let open = view.clone();
@@ -1113,9 +1122,10 @@ impl MessagesView {
                     .border_1()
                     .border_color(gpui::transparent_black())
                     .focus_visible(|style| style.border_color(palette.accent))
-                    .on_key_down(move |event, _, cx| {
+                    .on_key_down(move |event, window, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            open_from_key.update(cx, |view, cx| view.select(target, cx));
+                            open_from_key
+                                .update(cx, |view, cx| view.open_and_focus(target, window, cx));
                             cx.stop_propagation();
                         }
                     })
@@ -1128,7 +1138,9 @@ impl MessagesView {
                     .rounded_md()
                     .cursor_pointer()
                     .when(selected, |d| d.bg(palette.surface))
-                    .on_click(move |_, _, cx| open.update(cx, |view, cx| view.select(target, cx)))
+                    .on_click(move |_, window, cx| {
+                        open.update(cx, |view, cx| view.open_and_focus(target, window, cx))
+                    })
                     .child(Avatar::new(row.label.clone()).size(px(28.)))
                     .child(
                         div()
@@ -1136,17 +1148,13 @@ impl MessagesView {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(div().text_sm().child(row.label.clone()))
+                            .child(div().text_sm().truncate().child(row.label.clone()))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(palette.muted)
-                                    .overflow_hidden()
-                                    .child(
-                                        row.last
-                                            .clone()
-                                            .unwrap_or_else(|| "No messages yet".to_owned()),
-                                    ),
+                                div().text_xs().text_color(palette.muted).truncate().child(
+                                    row.last
+                                        .clone()
+                                        .unwrap_or_else(|| "No messages yet".to_owned()),
+                                ),
                             ),
                     )
                     .when(online, |d| {
@@ -1484,7 +1492,7 @@ impl MessagesView {
                 .text_xs()
                 .text_color(palette.muted);
             meta = meta.child(clock_of(line.timestamp));
-            if let Some(state) = line.state {
+            if let Some(state) = line.state.filter(|_| line.own) {
                 let (text, failed) = state_label(state);
                 meta = meta.child(
                     div()

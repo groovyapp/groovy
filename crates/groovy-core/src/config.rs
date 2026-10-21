@@ -59,6 +59,13 @@ pub struct Background {
     /// Starts Groovy when the session starts, in the background.
     #[serde(default)]
     pub start_on_login: bool,
+    /// Opens `groovy://` links in Groovy. Registered with the desktop at startup.
+    #[serde(default = "open_links_default")]
+    pub open_links: bool,
+}
+
+fn open_links_default() -> bool {
+    true
 }
 
 fn close_to_tray_default() -> bool {
@@ -70,6 +77,7 @@ impl Default for Background {
         Self {
             close_to_tray: close_to_tray_default(),
             start_on_login: false,
+            open_links: open_links_default(),
         }
     }
 }

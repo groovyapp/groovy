@@ -130,13 +130,16 @@ impl RenderOnce for Button {
 
         // Every button can take keyboard focus: a caller's handle if it gave one, otherwise one
         // kept for this button's id, so Tab reaches it without the caller doing anything.
+        // GPUI takes a tracked handle's own tab-stop flag, not the element's, so the flag is set
+        // on the handle: a disabled button stays out of the Tab order.
         let focus_handle = match self.focus_handle.clone() {
             Some(handle) => handle,
             None => window
                 .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
                 .read(cx)
                 .clone(),
-        };
+        }
+        .tab_stop(!self.disabled);
         // Screen readers announce the label, or the tooltip for a button with only an icon.
         let accessible_name = self.label.clone().or_else(|| self.tooltip.clone());
 
