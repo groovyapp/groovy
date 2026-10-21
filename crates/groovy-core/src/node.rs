@@ -2820,10 +2820,16 @@ const MAX_PAGE_MEMBERS: usize = 16;
 /// check for messages whose retry time has come. The check also runs once at startup.
 fn spawn_outbox(receiving: Receiving, outbox: Outbox, mut events: broadcast::Receiver<NodeEvent>) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(OUTBOX_TICK);
+        // The first check runs at once.
+        let mut wake = tokio::time::Instant::now();
         loop {
             tokio::select! {
-                _ = tick.tick() => {
+                // A retry time was set; wake for it if it comes before the next check.
+                _ = outbox.rescheduled() => {
+                    wake = wake.min(next_outbox_check(&outbox));
+                }
+                _ = tokio::time::sleep_until(wake) => {
+                    wake = next_outbox_check(&outbox);
                     let now = messages::now_millis();
                     if let Err(error) = outbox.database().expire_outbox(now) {
                         warn!(%error, "could not expire the outbox");
@@ -2913,8 +2919,19 @@ async fn sync_user_contacts(receiving: Receiving, peer: EndpointId) {
     }
 }
 
-/// How often the outbox is checked for messages whose retry time has come.
+/// How often the outbox is checked for messages whose retry time has come, at the longest. It
+/// is checked sooner when a retry time comes first.
 const OUTBOX_TICK: Duration = Duration::from_secs(60);
+
+/// When the outbox should next be checked: at the next retry time, or after `OUTBOX_TICK`.
+fn next_outbox_check(outbox: &Outbox) -> tokio::time::Instant {
+    let now = messages::now_millis();
+    let wait = match outbox.database().next_outbox_attempt(now) {
+        Ok(Some(due)) => Duration::from_millis(u64::try_from(due - now).unwrap_or(0)),
+        _ => OUTBOX_TICK,
+    };
+    tokio::time::Instant::now() + wait.min(OUTBOX_TICK)
+}
 
 /// Writes the messages waiting for a device, dialing it first. Only one flush runs for a device
 /// at a time, and a flush with nothing due does not dial.
@@ -2922,9 +2939,23 @@ async fn flush_by_dial(receiving: Receiving, device: EndpointId, trigger: Trigge
     let Some(outbox) = receiving.outbox.clone() else {
         return;
     };
-    if !outbox.claim(&device, trigger) {
-        return;
+    let mut trigger = trigger;
+    loop {
+        if !outbox.claim(&device, trigger) {
+            return;
+        }
+        flush_once(&receiving, &outbox, device, trigger).await;
+        // A flush asked for while this one ran, as when a message was sent while it was
+        // dialing, runs now rather than at the message's retry time.
+        match outbox.release(&device) {
+            Some(again) => trigger = again,
+            None => return,
+        }
     }
+}
+
+/// Dials a device and writes what is waiting for it, if anything is.
+async fn flush_once(receiving: &Receiving, outbox: &Outbox, device: EndpointId, trigger: Trigger) {
     if outbox.has_work(&device, trigger) {
         let addr = outbox
             .database()
@@ -2932,24 +2963,28 @@ async fn flush_by_dial(receiving: Receiving, device: EndpointId, trigger: Trigge
             .ok()
             .flatten()
             .unwrap_or_else(|| EndpointAddr::from(device));
-        match open_peer(
+        let dial = open_peer(
             &receiving.endpoint,
             addr,
             &receiving.profile,
             &receiving.events,
             &receiving.gate,
-        )
-        .await
-        {
-            Ok((connection, _peer)) => {
+        );
+        match tokio::time::timeout(OUTBOX_DIAL_TIMEOUT, dial).await {
+            Ok(Ok((connection, _peer))) => {
                 outbox.flush_on(&connection, device, trigger).await;
                 connection.close(0u32.into(), b"flushed");
             }
-            Err(error) => outbox.unreachable(&device, &error.to_string(), trigger),
+            Ok(Err(error)) => outbox.unreachable(&device, &error.to_string(), trigger),
+            Err(_) => outbox.unreachable(&device, "the device did not answer in time", trigger),
         }
     }
-    outbox.release(&device);
 }
+
+/// How long the outbox waits for a device to answer a dial. A device that is there answers in
+/// a few seconds, even through a relay. A dial to an address the device has left would
+/// otherwise hold up a flush that a fresh connection from it asked for.
+const OUTBOX_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Offers `paths` to a trusted peer, as transfer `id`, and waits for its answer. An accepted
 /// offer is fetched by the peer from this node's store. The send can be cancelled while it
