@@ -1,6 +1,7 @@
 name: Release
 
-# A tag like v0.1.0 builds the Linux AppImage and attaches it to a GitHub release for the tag.
+# A tag like v0.1.0 builds the Linux AppImage and an unsigned Windows zip, and attaches both to a
+# GitHub release for the tag.
 on:
   push:
     tags: ["v*"]
@@ -45,4 +46,34 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.AppImage
+          generate_release_notes: true
+
+  windows:
+    name: Windows zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked -p groovy
+
+      # Unsigned for now: Windows will show a SmartScreen warning on first run.
+      - name: Zip the program
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $dir = "dist/Groovy-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item target/release/groovy.exe "$dir/groovy.exe"
+          Copy-Item LICENSE-MIT, LICENSE-APACHE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
           generate_release_notes: true
