@@ -3,7 +3,11 @@
 
 use std::time::Duration;
 
-use gpui::{Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px};
+use std::sync::Arc;
+
+use gpui::{
+    Context, Entity, FontWeight, Image, ImageFormat, SharedString, Window, div, img, prelude::*, px,
+};
 use groovy_core::EndpointId;
 use groovy_core::user::UserDevice;
 use tracing::warn;
@@ -30,6 +34,8 @@ pub struct DevicesSection {
     ticket_input: Entity<TextInput>,
     /// The ticket made most recently, to copy.
     new_ticket: Option<String>,
+    /// That ticket as a QR code, for a device that can scan it.
+    new_ticket_qr: Option<Arc<Image>>,
     /// The device the user has asked to revoke, waiting for the second click.
     revoking: Option<EndpointId>,
     status: Option<(bool, SharedString)>,
@@ -54,6 +60,7 @@ impl DevicesSection {
             ticket_input: cx
                 .new(|cx| TextInput::new("Paste a link ticket from another device", cx)),
             new_ticket: None,
+            new_ticket_qr: None,
             revoking: None,
             status: None,
         };
@@ -112,6 +119,13 @@ impl DevicesSection {
             let outcome = handle.link_device(name).await;
             this.update(cx, |section, cx| match outcome {
                 Ok(ticket) => {
+                    section.new_ticket_qr = match groovy_core::ticket::qr_png(&ticket) {
+                        Ok(png) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, png))),
+                        Err(error) => {
+                            warn!(%error, "could not draw the link ticket's QR code");
+                            None
+                        }
+                    };
                     section.new_ticket = Some(ticket);
                     section.status = None;
                     cx.notify();
@@ -310,8 +324,11 @@ impl Render for DevicesSection {
                         div()
                             .text_xs()
                             .text_color(theme.text_muted)
-                            .child("Paste this on the other device. It works once, for ten minutes."),
+                            .child("Paste this on the other device, or scan the code. It works once, for ten minutes."),
                     )
+                    .when_some(self.new_ticket_qr.clone(), |column, picture| {
+                        column.child(img(picture).size(px(160.)).flex_none())
+                    })
                     .child(div().text_xs().child(ticket))
                     .child(
                         Button::new("device-copy-ticket", "Copy ticket")

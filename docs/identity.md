@@ -55,6 +55,8 @@ All three were accepted as recommended.
 - `link.rs`: the link ticket (`groovylink1…`), the `groovy-link/0` protocol, which answers only while a link is open, and the new device's side.
 - The trust gate checks a certificate on every handshake, and takes it in only if it is for the connecting device and signed by the user's key. A device is trusted when a trusted contact belongs to the same user, and it has not been revoked or blocked.
 - The Devices section of Settings lists the user's devices, makes and copies a link ticket, links this device from one, and revokes a device after a second click.
+- A user's devices share their trusted contacts. A device that is linked receives the linking device's contacts, and two devices of the user exchange contacts each time they connect (at most every 30 seconds per pair). A contact blocked on a device stays blocked there. So a contact paired on one device can reach all of them, in both directions: the contact trusts the devices through the certificate, and the devices trust the contact.
+- The link ticket is also shown as a QR code, for a device that can scan it.
 
 ## Known limits
 

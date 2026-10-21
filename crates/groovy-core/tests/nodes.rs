@@ -3105,3 +3105,124 @@ async fn history_pages_back_through_a_conversation_and_deletes_locally() {
 
     assert!(ada.shutdown(TIMEOUT));
 }
+
+#[tokio::test]
+async fn a_shared_folder_reaches_a_device_linked_to_the_member() {
+    use groovy_core::folders::FolderAccess;
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, laptop_key, phone_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let (alice_dir, laptop_dir, phone_dir) = (
+        fresh_dir(&tmp, "alice"),
+        fresh_dir(&tmp, "laptop"),
+        fresh_dir(&tmp, "phone"),
+    );
+    // Alice has paired with the laptop only.
+    trust_in(&alice_dir, &laptop_key);
+    trust_in(&laptop_dir, &alice_key);
+    let (alice, _alice_events, alice_db) = user_node(&alice_dir, alice_key).await;
+    let (laptop, _laptop_events, _laptop_db) = user_node(&laptop_dir, laptop_key).await;
+    let (phone, _phone_events, _phone_db) = user_node(&phone_dir, phone_key.clone()).await;
+    let alice_addr = alice.addr().await.unwrap();
+
+    // The phone is linked to the laptop's user, and both meet Alice.
+    let ticket = laptop.link_device("laptop".into()).await.unwrap();
+    phone.accept_link(ticket, "phone".into()).await.unwrap();
+    laptop.connect(alice_addr.clone()).await.unwrap();
+    phone.connect(alice_addr).await.unwrap();
+    wait_until(|| alice_db.is_trusted_device(phone_key.public()).unwrap()).await;
+
+    // Alice shares a folder with the user, and both of the user's devices join it.
+    let folder = alice.create_folder("photos".into(), None).await.unwrap();
+    let source = tmp.path().join("a.txt");
+    std::fs::write(&source, b"for every device").unwrap();
+    alice
+        .add_to_folder(folder.namespace, "a.txt".into(), source)
+        .await
+        .unwrap();
+    let invite = alice
+        .folder_ticket(folder.namespace, FolderAccess::Write)
+        .await
+        .unwrap();
+    laptop.join_folder(invite.clone(), None).await.unwrap();
+    phone.join_folder(invite, None).await.unwrap();
+
+    // The phone gets the file, though it never paired with Alice.
+    let entries = wait_for_folder(&phone, folder.namespace, "reached the phone", |entries| {
+        entries.len() == 1
+    })
+    .await;
+    let fetched = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(bytes) = phone.read_blob(entries[0].hash).await.unwrap() {
+                return bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the phone downloads the file");
+    assert_eq!(fetched, b"for every device");
+
+    assert!(alice.shutdown(TIMEOUT));
+    assert!(laptop.shutdown(TIMEOUT));
+    assert!(phone.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn a_contact_paired_on_one_device_is_trusted_by_the_users_other_devices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_key, bob_key, laptop_key, phone_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let (laptop_dir, phone_dir) = (fresh_dir(&tmp, "laptop"), fresh_dir(&tmp, "phone"));
+    // Alice is the laptop's contact before the phone is linked.
+    trust_in(&laptop_dir, &alice_key);
+    let (laptop, _laptop_events, laptop_db) = user_node(&laptop_dir, laptop_key).await;
+    let (phone, _phone_events, phone_db) = user_node(&phone_dir, phone_key).await;
+
+    // Linking brings the laptop's contacts with it.
+    let ticket = laptop.link_device("laptop".into()).await.unwrap();
+    phone.accept_link(ticket, "phone".into()).await.unwrap();
+    assert_eq!(
+        phone_db
+            .contact(alice_key.public())
+            .unwrap()
+            .map(|c| c.trust),
+        Some(Trust::Trusted),
+        "the phone trusts the laptop's contact as soon as it is linked"
+    );
+
+    // Bob becomes a contact on the laptop afterwards. The phone learns him when it connects.
+    trust_in_db(&laptop_db, &bob_key);
+    phone.connect(laptop.addr().await.unwrap()).await.unwrap();
+    wait_until(|| {
+        phone_db
+            .contact(bob_key.public())
+            .unwrap()
+            .is_some_and(|c| c.trust == Trust::Trusted)
+    })
+    .await;
+
+    assert!(laptop.shutdown(TIMEOUT));
+    assert!(phone.shutdown(TIMEOUT));
+}
+
+/// Makes a peer a trusted contact in an open database.
+fn trust_in_db(db: &Database, peer: &SecretKey) {
+    db.record_handshake(
+        &groovy_core::PeerInfo {
+            endpoint_id: peer.public(),
+            profile: PeerProfile::default(),
+        },
+        0,
+    )
+    .unwrap();
+    db.set_trust(peer.public(), Trust::Trusted).unwrap();
+}

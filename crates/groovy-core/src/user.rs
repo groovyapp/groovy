@@ -13,8 +13,10 @@ use iroh::{EndpointId, PublicKey, SecretKey};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use crate::contacts::Trust;
 use crate::db::{Database, DbError};
 use crate::paths::DataDir;
+use crate::protocol::{PeerInfo, PeerProfile};
 
 const CERT_DOMAIN: &str = "groovy-device-certificate-v1";
 const REVOCATION_DOMAIN: &str = "groovy-device-revocation-v1";
@@ -345,6 +347,63 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, DbError> {
         .map_err(|error| DbError::Query(rusqlite::Error::ToSqlConversionFailure(Box::new(error))))
 }
 
+/// A contact one of the user's devices trusts. The user's other devices trust it too, so a
+/// contact paired on one device can reach all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedContact {
+    pub endpoint: EndpointId,
+    pub name: String,
+}
+
+impl Database {
+    /// The contacts this device trusts, to share with the user's other devices.
+    pub fn shared_contacts(&self) -> Result<Vec<SharedContact>, DbError> {
+        Ok(self
+            .contacts()?
+            .into_iter()
+            .filter(|contact| contact.trust == Trust::Trusted)
+            .map(|contact| SharedContact {
+                endpoint: contact.endpoint_id,
+                name: contact.display_name,
+            })
+            .collect())
+    }
+
+    /// Trusts a contact that another of the user's devices trusts. A contact blocked on this
+    /// device stays blocked. Returns whether anything changed.
+    pub fn adopt_contact(&self, contact: &SharedContact, now: i64) -> Result<bool, DbError> {
+        match self.contact(contact.endpoint)? {
+            Some(existing) if existing.trust != Trust::Pending => Ok(false),
+            Some(_) => self.set_trust(contact.endpoint, Trust::Trusted),
+            None => {
+                self.record_handshake(
+                    &PeerInfo {
+                        endpoint_id: contact.endpoint,
+                        profile: PeerProfile {
+                            display_name: contact.name.clone(),
+                            avatar_hash: None,
+                            user: None,
+                        },
+                    },
+                    now,
+                )?;
+                self.set_trust(contact.endpoint, Trust::Trusted)
+            }
+        }
+    }
+
+    /// Whether an endpoint is another device of this device's own user, and not revoked.
+    pub fn is_own_device(&self, endpoint: &EndpointId) -> Result<bool, DbError> {
+        let Some(user) = self.own_user()? else {
+            return Ok(false);
+        };
+        Ok(self
+            .devices_of(&user)?
+            .iter()
+            .any(|device| device.cert.device == *endpoint && device.revoked.is_none()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +435,60 @@ mod tests {
             ..revocation
         };
         assert!(!forged.verify());
+    }
+
+    #[test]
+    fn a_shared_contact_is_trusted_here_unless_it_was_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("groovy.db")).unwrap();
+        let ada = SecretKey::generate().public();
+        let eve = SecretKey::generate().public();
+        db.record_handshake(
+            &PeerInfo {
+                endpoint_id: eve,
+                profile: PeerProfile::default(),
+            },
+            1,
+        )
+        .unwrap();
+        db.set_trust(eve, Trust::Blocked).unwrap();
+
+        let shared = |endpoint| SharedContact {
+            endpoint,
+            name: "someone".to_owned(),
+        };
+        assert!(db.adopt_contact(&shared(ada), 2).unwrap());
+        assert_eq!(db.contact(ada).unwrap().unwrap().trust, Trust::Trusted);
+        assert!(!db.adopt_contact(&shared(eve), 2).unwrap());
+        assert_eq!(db.contact(eve).unwrap().unwrap().trust, Trust::Blocked);
+        let listed: Vec<EndpointId> = db
+            .shared_contacts()
+            .unwrap()
+            .iter()
+            .map(|c| c.endpoint)
+            .collect();
+        assert_eq!(listed, [ada]);
+    }
+
+    #[test]
+    fn only_a_device_of_this_user_that_is_not_revoked_is_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("groovy.db")).unwrap();
+        let user = SecretKey::generate();
+        let (laptop, phone) = (
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+        );
+        assert!(!db.is_own_device(&phone).unwrap(), "no user yet");
+        db.set_own_user(&user.public()).unwrap();
+        db.save_device(&DeviceCert::issue(&user, laptop, "laptop", 1))
+            .unwrap();
+        db.save_device(&DeviceCert::issue(&user, phone, "phone", 1))
+            .unwrap();
+        assert!(db.is_own_device(&phone).unwrap());
+        db.save_revocation(&Revocation::issue(&user, phone, 2))
+            .unwrap();
+        assert!(!db.is_own_device(&phone).unwrap());
+        assert!(db.is_own_device(&laptop).unwrap());
     }
 }

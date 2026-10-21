@@ -88,6 +88,9 @@ pub enum Request {
     /// Gives a member the key of a newer epoch, after a removal. Answered with `Reply::Stored`
     /// if the member took it.
     GroupKeyPush(crate::membership::KeyRecord),
+    /// Asks another device of the same user for the contacts it trusts. Answered with a list of
+    /// [`crate::user::SharedContact`], and only to the user's own devices.
+    UserContacts,
 }
 
 /// What a sender offers: the top-level names being sent, and the collection that
