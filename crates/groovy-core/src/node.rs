@@ -2110,14 +2110,7 @@ fn row_of(receiving: &Receiving, group: &GroupId) -> Result<GroupRow, NodeError>
 /// decides the topic, so this is called whenever the key changes.
 fn start_topic(receiving: &Receiving, group: GroupId) -> Result<(), NodeError> {
     let row = row_of(receiving, &group)?;
-    let database = group_database(receiving)?;
-    let own = receiving.endpoint.id();
-    let members = database
-        .group_members(&group)
-        .map_err(group_error)?
-        .into_iter()
-        .filter(|member| *member != own)
-        .collect();
+    let members = topic_bootstrap(receiving, group)?;
     // The old topic's sender goes first, so nothing is sent on it once the key has changed.
     receiving
         .groups
@@ -2139,6 +2132,18 @@ fn start_topic(receiving: &Receiving, group: GroupId) -> Result<(), NodeError> {
         previous.abort();
     }
     Ok(())
+}
+
+/// The other members a group's topic is joined through.
+fn topic_bootstrap(receiving: &Receiving, group: GroupId) -> Result<Vec<EndpointId>, NodeError> {
+    let database = group_database(receiving)?;
+    let own = receiving.endpoint.id();
+    Ok(database
+        .group_members(&group)
+        .map_err(group_error)?
+        .into_iter()
+        .filter(|member| *member != own)
+        .collect())
 }
 
 /// Makes a new group, with this device as its founder and an admin. Returns its id.
@@ -2540,6 +2545,15 @@ async fn accept_key(
 /// Brings this device up to date with a member: the group's current key, then the messages it
 /// missed.
 async fn sync_with(receiving: &Receiving, group: GroupId, peer: EndpointId) {
+    // Only members are asked. A removed member can still be on the group's old topic, and
+    // would answer with what it wrote after it was removed.
+    let Ok(row) = row_of(receiving, &group) else {
+        return;
+    };
+    match members_of(receiving, &row).await {
+        Ok(members) if members.is_member(&peer) => {}
+        _ => return,
+    }
     if let Ok(Some(record)) = ask_key(receiving, group, peer, false).await {
         let _ = accept_key(receiving, group, record, false).await;
     }
@@ -2634,8 +2648,22 @@ async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request)
     }
 }
 
+/// How long a group waits before joining its topic again after the subscription ends. It
+/// doubles each time the joining fails, up to `GROUP_REJOIN_MAX`.
+const GROUP_REJOIN_FIRST: Duration = Duration::from_secs(1);
+const GROUP_REJOIN_MAX: Duration = Duration::from_secs(30);
+/// How often a group asks its neighbors for messages it has missed, and how long after a
+/// neighbor leaves.
+const GROUP_CATCH_UP: Duration = Duration::from_secs(60);
+const GROUP_CATCH_UP_AFTER_LEAVE: Duration = Duration::from_secs(1);
+
 /// Runs one group's gossip topic until it is replaced or the node stops. Messages that arrive
 /// are checked and stored, and each member that connects is brought up to date.
+///
+/// Gossip does not promise delivery, so the group also asks its neighbors for what it missed:
+/// when a neighbor leaves, since a message on its way may have gone with it, and every so
+/// often. And gossip closes a subscription that falls behind, so the topic is joined again
+/// whenever its subscription ends.
 async fn run_group(
     receiving: Receiving,
     group: GroupId,
@@ -2645,41 +2673,84 @@ async fn run_group(
     let Some(gossip) = receiving.gossip.clone() else {
         return;
     };
-    let topic = match gossip.subscribe(topic, bootstrap).await {
-        Ok(topic) => topic,
-        Err(error) => {
-            warn!(%error, "could not join a group's topic");
-            return;
+    let mut bootstrap = bootstrap;
+    let mut wait = GROUP_REJOIN_FIRST;
+    loop {
+        match gossip.subscribe(topic, bootstrap.clone()).await {
+            Ok(subscription) => {
+                wait = GROUP_REJOIN_FIRST;
+                follow_group(&receiving, group, subscription).await;
+                info!("a group's subscription ended; joining its topic again");
+            }
+            Err(error) => {
+                warn!(%error, "could not join a group's topic; trying again");
+            }
         }
-    };
-    let (sender, mut receiver) = topic.split();
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(GROUP_REJOIN_MAX);
+        // The members may have changed while the subscription was down.
+        if let Ok(members) = topic_bootstrap(&receiving, group) {
+            bootstrap = members;
+        }
+    }
+}
+
+/// Follows one subscription to a group's topic until it ends.
+async fn follow_group(
+    receiving: &Receiving,
+    group: GroupId,
+    subscription: iroh_gossip::api::GossipTopic,
+) {
+    let (sender, mut receiver) = subscription.split();
     receiving
         .groups
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(group, sender);
-    while let Some(event) = receiver.next().await {
-        match event {
-            Ok(GossipEvent::Received(message)) => {
-                if let Ok(envelope) = postcard::from_bytes::<GroupEnvelope>(&message.content)
-                    && envelope.group == group
-                {
-                    store_group_envelope(&receiving, envelope);
+    let catch_up = |member: EndpointId, delay: Duration| {
+        let syncing = receiving.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            sync_with(&syncing, group, member).await;
+        });
+    };
+    let mut tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + GROUP_CATCH_UP, GROUP_CATCH_UP);
+    loop {
+        tokio::select! {
+            event = receiver.next() => match event {
+                Some(Ok(GossipEvent::Received(message))) => {
+                    if let Ok(envelope) = postcard::from_bytes::<GroupEnvelope>(&message.content)
+                        && envelope.group == group
+                    {
+                        store_group_envelope(receiving, envelope);
+                    }
                 }
-            }
-            Ok(GossipEvent::NeighborUp(member)) => {
-                if let Some(database) = &receiving.database {
-                    let _ = database.add_group_member(group, &member);
+                Some(Ok(GossipEvent::NeighborUp(member))) => {
+                    if let Some(database) = &receiving.database {
+                        let _ = database.add_group_member(group, &member);
+                    }
+                    catch_up(member, Duration::ZERO);
                 }
-                let syncing = receiving.clone();
-                tokio::spawn(async move {
-                    sync_with(&syncing, group, member).await;
-                });
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(%error, "a group's topic stopped");
-                break;
+                Some(Ok(GossipEvent::NeighborDown(_))) => {
+                    for member in receiver.neighbors() {
+                        catch_up(member, GROUP_CATCH_UP_AFTER_LEAVE);
+                    }
+                }
+                Some(Ok(GossipEvent::Lagged)) => {
+                    warn!("a group's subscription fell behind");
+                    return;
+                }
+                Some(Err(error)) => {
+                    warn!(%error, "a group's subscription stopped");
+                    return;
+                }
+                None => return,
+            },
+            _ = tick.tick() => {
+                for member in receiver.neighbors() {
+                    catch_up(member, Duration::ZERO);
+                }
             }
         }
     }
