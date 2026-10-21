@@ -15,7 +15,23 @@ use iroh_blobs::Hash;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Sends the nodes' logs to each test's captured output, which is shown only for a test that
+/// fails. `RUST_LOG` chooses what is logged; without it nothing is. CI sets it, so a failure
+/// there comes with the logs that explain it.
+fn capture_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RUST_LOG").is_some() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_test_writer()
+                .try_init();
+        }
+    });
+}
+
 fn config(secret_key: SecretKey) -> NodeConfig {
+    capture_logs();
     NodeConfig {
         secret_key,
         network: Network::LocalOnly,
