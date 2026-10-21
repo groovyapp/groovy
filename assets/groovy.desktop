@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Groovy
-Exec=groovy
-Icon=groovy
-Terminal=false
-StartupWMClass=groovy
-Categories=Utility;

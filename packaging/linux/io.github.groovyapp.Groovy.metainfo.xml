@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.groovyapp.Groovy</id>
+  <name>Groovy</name>
+  <summary>Share files and messages directly with the people you trust</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="io.github.groovyapp">
+    <name>Daniel Kosgei</name>
+  </developer>
+  <description>
+    <p>
+      Groovy sends files, shares folders and carries messages straight between your devices and
+      the people you pair with. There is no account and no server holding your data: devices
+      connect directly, or through a relay when they cannot.
+    </p>
+    <ul>
+      <li>Send files and folders of any size, with resume</li>
+      <li>Keep shared folders in step between members</li>
+      <li>Direct and group messages, delivered when contacts come back online</li>
+      <li>Link your devices so contacts trust all of them</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.groovyapp.Groovy.desktop</launchable>
+  <url type="homepage">https://github.com/groovyapp/groovy</url>
+  <url type="bugtracker">https://github.com/groovyapp/groovy/issues</url>
+  <provides>
+    <binary>groovy</binary>
+  </provides>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.0.1" date="2026-10-21"/>
+  </releases>
+</component>

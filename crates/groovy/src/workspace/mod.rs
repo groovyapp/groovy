@@ -205,7 +205,7 @@ fn window_options(cx: &App) -> WindowOptions {
         }),
         // Linux only; Windows and macOS ignore this.
         window_decorations: Some(window_decorations()),
-        app_id: Some(APP_NAME.to_lowercase()),
+        app_id: Some(crate::APP_ID.to_owned()),
         window_min_size: Some(MIN_WINDOW_SIZE),
         ..Default::default()
     }

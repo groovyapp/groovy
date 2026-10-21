@@ -1,0 +1,42 @@
+# Flatpak manifest for Groovy. Not built yet; see packaging/README.md.
+app-id: io.github.groovyapp.Groovy
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: groovy
+finish-args:
+  # Peers, relays and discovery.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Notifications, the tray icon, and the OS credential store for the identity.
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.secrets
+  # Received files are saved to the Downloads folder.
+  - --filesystem=xdg-download
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/groovy/cargo
+modules:
+  - name: groovy
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release --locked -p groovy
+      - install -Dm755 target/release/groovy /app/bin/groovy
+      - install -Dm644 assets/io.github.groovyapp.Groovy.desktop /app/share/applications/io.github.groovyapp.Groovy.desktop
+      - install -Dm644 packaging/linux/io.github.groovyapp.Groovy.metainfo.xml /app/share/metainfo/io.github.groovyapp.Groovy.metainfo.xml
+      - install -Dm644 assets/icons/app-icon.svg /app/share/icons/hicolor/scalable/apps/io.github.groovyapp.Groovy.svg
+      - for size in 16 24 32 48 64 128 256 512; do install -Dm644 assets/icons/app-icon-$size.png /app/share/icons/hicolor/${size}x${size}/apps/io.github.groovyapp.Groovy.png; done
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - dist
+      - cargo-sources.json
