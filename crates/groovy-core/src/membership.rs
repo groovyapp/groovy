@@ -69,6 +69,9 @@ pub struct Members {
     pub name: Option<String>,
     /// Every current member, with their role.
     pub roles: BTreeMap<EndpointId, Role>,
+    /// How many removals the records hold. Each removal moves the group to the next key, so a
+    /// key at a later epoch than this means these records do not show every removal yet.
+    pub removals: u32,
 }
 
 impl Members {
@@ -99,6 +102,7 @@ impl Members {
             founder,
             name: None,
             roles: BTreeMap::from([(founder, Role::Admin)]),
+            removals: 0,
         };
         for record in ordered {
             if !members.is_admin(&record.by) {
@@ -116,7 +120,9 @@ impl Members {
                             members.roles.insert(*member, *role);
                         }
                         None => {
-                            members.roles.remove(member);
+                            if members.roles.remove(member).is_some() {
+                                members.removals += 1;
+                            }
                         }
                     }
                 }
@@ -268,6 +274,28 @@ mod tests {
         let members = Members::replay(group(), founder.public(), &records);
         assert!(!members.is_member(&ben.public()));
         assert!(members.is_admin(&founder.public()));
+    }
+
+    #[test]
+    fn only_removals_that_take_effect_are_counted() {
+        let founder = SecretKey::generate();
+        let ben = SecretKey::generate();
+        let cam = SecretKey::generate();
+        let records = [
+            role(ben.public(), Some(Role::Member), &founder, 1),
+            role(cam.public(), Some(Role::Member), &founder, 2),
+            role(ben.public(), None, &founder, 3),
+            // Removing ben again, the founder, or someone never added changes nothing.
+            role(ben.public(), None, &founder, 4),
+            role(founder.public(), None, &founder, 5),
+            // Cam is not an admin, so cam cannot remove anyone.
+            role(founder.public(), None, &cam, 6),
+            // Ben comes back and is removed again: a second removal, and a second new key.
+            role(ben.public(), Some(Role::Member), &founder, 7),
+            role(ben.public(), None, &founder, 8),
+        ];
+        let members = Members::replay(group(), founder.public(), &records);
+        assert_eq!(members.removals, 2);
     }
 
     #[test]

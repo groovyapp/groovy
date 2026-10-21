@@ -5,8 +5,8 @@
 //! when its device acknowledges the message. Until then the message is retried:
 //!
 //! - when the device connects to this node, in either direction, at once;
-//! - every minute, for rows whose retry time has come, which backs off from 30 seconds to 15
-//!   minutes after each failure;
+//! - when a row's retry time comes, which backs off from 5 seconds to 15 minutes after each
+//!   failure;
 //! - at startup, since the rows are in the database and survive a restart.
 //!
 //! A device is dialed at the address it last connected from, and by its id otherwise, so it
@@ -27,8 +27,9 @@ use crate::messages::{self, MESSAGE_VERSION, Message, MessageId, WireMessage};
 use crate::node::PeerGate;
 use crate::protocol::{self, ProtocolError, Reply, Request};
 
-/// The first wait after a failed delivery. It doubles after each failure.
-const RETRY_FIRST_MS: i64 = 30_000;
+/// The first wait after a failed delivery. It doubles after each failure. It is short, since a
+/// first failure is often a moment's trouble reaching a device that is there.
+const RETRY_FIRST_MS: i64 = 5_000;
 /// The longest wait between attempts.
 const RETRY_MAX_MS: i64 = 15 * 60_000;
 /// How long a message is kept trying before it fails.
@@ -93,6 +94,17 @@ impl Database {
                 .into_iter()
                 .filter_map(|bytes| <MessageId>::try_from(bytes.as_slice()).ok())
                 .collect())
+        })
+    }
+
+    /// The earliest retry time after `now`, if a row has one.
+    pub fn next_outbox_attempt(&self, now: i64) -> Result<Option<i64>, DbError> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT MIN(next_attempt) FROM outbox WHERE next_attempt > ?1",
+                [now],
+                |row| row.get::<_, Option<i64>>(0),
+            )
         })
     }
 
@@ -290,6 +302,9 @@ pub async fn deliver_on(
 struct Slot {
     running: bool,
     finished: Option<Instant>,
+    /// A flush asked for while one was running, which runs once that one ends. Without it, a
+    /// message sent while a flush was dialing would wait for its retry time.
+    again: Option<Trigger>,
 }
 
 /// The outbox of a node: the database, the gate that decides who is trusted, and which devices
@@ -299,6 +314,8 @@ pub struct Outbox {
     database: Arc<Database>,
     gate: Arc<dyn PeerGate>,
     slots: Arc<Mutex<HashMap<EndpointId, Slot>>>,
+    /// Woken when a retry time is set, so the periodic check can wake for it.
+    rescheduled: Arc<tokio::sync::Notify>,
 }
 
 impl Outbox {
@@ -307,6 +324,7 @@ impl Outbox {
             database,
             gate,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            rescheduled: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -314,12 +332,22 @@ impl Outbox {
         &self.database
     }
 
-    /// Whether the device may be flushed to now. Only one flush runs for a device at a time.
-    /// A connection-started flush waits out the cooldown after the last one.
+    /// Waits until a retry time is set or changed.
+    pub async fn rescheduled(&self) {
+        self.rescheduled.notified().await;
+    }
+
+    /// Whether the device may be flushed to now. Only one flush runs for a device at a time;
+    /// asking while one runs has another run after it. A connection-started flush waits out
+    /// the cooldown after the last one.
     pub fn claim(&self, device: &EndpointId, trigger: Trigger) -> bool {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = slots.entry(*device).or_default();
         if slot.running {
+            slot.again = Some(match slot.again {
+                Some(earlier) => stronger(earlier, trigger),
+                None => trigger,
+            });
             return false;
         }
         let cooling = slot
@@ -332,12 +360,14 @@ impl Outbox {
         true
     }
 
-    /// Ends a flush started by [`Outbox::claim`].
-    pub fn release(&self, device: &EndpointId) {
+    /// Ends a flush started by [`Outbox::claim`]. Returns the flush asked for while it ran,
+    /// which the caller runs next.
+    pub fn release(&self, device: &EndpointId) -> Option<Trigger> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = slots.entry(*device).or_default();
         slot.running = false;
         slot.finished = Some(Instant::now());
+        slot.again.take()
     }
 
     /// Whether a flush has anything to do, so that it need not dial a device for nothing.
@@ -395,6 +425,7 @@ impl Outbox {
                     let _ = self
                         .database
                         .record_failure(id, &device, &error.to_string(), now);
+                    self.rescheduled.notify_one();
                     break;
                 }
             }
@@ -413,6 +444,17 @@ impl Outbox {
         for id in queued {
             let _ = self.database.record_failure(id, device, error, now);
         }
+        self.rescheduled.notify_one();
+    }
+}
+
+/// Which of two asked-for flushes to run: one that ignores retry times wins over one that
+/// does not.
+fn stronger(a: Trigger, b: Trigger) -> Trigger {
+    match (a, b) {
+        (Trigger::Send, _) | (_, Trigger::Send) => Trigger::Send,
+        (Trigger::Connected, _) | (_, Trigger::Connected) => Trigger::Connected,
+        _ => Trigger::Tick,
     }
 }
 
@@ -421,11 +463,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retries_back_off_from_thirty_seconds_to_fifteen_minutes() {
-        assert_eq!(backoff_ms(0), 30_000);
-        assert_eq!(backoff_ms(1), 60_000);
-        assert_eq!(backoff_ms(2), 120_000);
-        assert_eq!(backoff_ms(5), 900_000);
+    fn retries_back_off_from_five_seconds_to_fifteen_minutes() {
+        assert_eq!(backoff_ms(0), 5_000);
+        assert_eq!(backoff_ms(1), 10_000);
+        assert_eq!(backoff_ms(2), 20_000);
+        assert_eq!(backoff_ms(7), 640_000);
+        assert_eq!(backoff_ms(8), 900_000);
         assert_eq!(backoff_ms(60), 900_000);
+    }
+
+    #[test]
+    fn a_flush_asked_for_while_one_runs_runs_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(&dir.path().join("groovy.db")).unwrap());
+        let outbox = Outbox::new(database, Arc::new(crate::node::AllowAll));
+        let device = iroh::SecretKey::generate().public();
+
+        assert!(outbox.claim(&device, Trigger::Tick));
+        // Asked for twice while the first runs: once is enough, and the stronger one wins.
+        assert!(!outbox.claim(&device, Trigger::Connected));
+        assert!(!outbox.claim(&device, Trigger::Send));
+        assert_eq!(outbox.release(&device), Some(Trigger::Send));
+        // Nothing more was asked for.
+        assert!(outbox.claim(&device, Trigger::Tick));
+        assert_eq!(outbox.release(&device), None);
     }
 }

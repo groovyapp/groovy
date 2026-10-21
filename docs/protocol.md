@@ -145,9 +145,9 @@ Membership is kept in the group's iroh-docs document as signed records: a name, 
 
 Each group has a key that starts at epoch 0. The group's gossip topic is derived from the key, so removing a member changes the topic. The admin who removes a member signs a new key at the next epoch, moves onto the new topic, and pushes the key to each remaining member with `Request::GroupKeyPush`. The key is never written into the document, since every member can read the document, including one who was removed.
 
-A member asks for the current key with `Request::GroupKey`, and only a current member gets an answer. A device that has been invited asks an admin with `Request::GroupJoin`; the admin writes its membership record and answers with the key. A key is accepted only if it is newer, and signed by an admin or the founder.
+A member asks for the current key with `Request::GroupKey`, and only a current member gets an answer. Each removal moves the group to the next epoch, so a key's epoch is the number of removals. A member whose copy of the document shows fewer removals than its key's epoch has the new key before it has seen the removal, and refuses to give the key out until the removal reaches it; otherwise it could give the new key to the member just removed. For the same reason a member asks another for missed messages only if that member's key is at least as new as its own. A device that has been invited asks an admin with `Request::GroupJoin`; the admin writes its membership record and answers with the key. A key is accepted only if it is newer, and signed by an admin or the founder.
 
-Known limits: a member that has not yet seen a removal in the document can still give the removed member the new key, until the removal reaches it. Changing the document's authors and the mutual trust between members are not checked beyond the signatures. Roles can be changed by any admin, not only the founder.
+Known limits: a member still stores a message from a trusted contact whom it knows was removed, if the message reaches it. Changing the document's authors and the mutual trust between members are not checked beyond the signatures. Roles can be changed by any admin, not only the founder.
 
 Groups are not yet on screen (#47).
 
