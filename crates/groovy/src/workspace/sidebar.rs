@@ -61,6 +61,8 @@ impl RenderOnce for Sidebar {
                 .aria_label(screen.label())
                 .track_focus(&focus)
                 .tab_stop(true)
+                .border_1()
+                .border_color(gpui::transparent_black())
                 .focus_visible(|style| style.border_color(focus_ring))
                 .on_key_down(move |event, window, cx| {
                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
