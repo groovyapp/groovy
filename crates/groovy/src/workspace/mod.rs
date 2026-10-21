@@ -24,8 +24,10 @@ use crate::{
     ui::dialog::ConfirmDialog,
     window_frame::{client_side_decorations, set_native_border_color},
 };
+use screen::{
+    FocusNext, FocusPrevious, ShowFiles, ShowMessages, ShowPeers, ShowSettings, ShowStorage,
+};
 pub use screen::{Screen, bind_keys};
-use screen::{ShowFiles, ShowMessages, ShowPeers, ShowSettings, ShowStorage};
 use sidebar::Sidebar;
 use status_bar::StatusBar;
 
@@ -56,7 +58,9 @@ impl Workspace {
         onboarded: bool,
     ) -> Result<WindowHandle<Self>> {
         let database = cx.global::<AppData>().database.clone();
+        let scale = cx.global::<AppData>().config.text_scale;
         cx.open_window(window_options(cx), |window, cx| {
+            window.set_rem_size(gpui::px(16.) * scale);
             set_native_border_color(window, cx);
             cx.new(|cx| Self::new(window, cx, screen, database, onboarded))
         })
@@ -275,6 +279,8 @@ impl Render for Workspace {
             .size_full()
             .bg(theme.editor_background)
             .text_color(theme.text)
+            .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
+            .on_action(|_: &FocusPrevious, window, cx| window.focus_prev(cx))
             .on_action(cx.listener(|this, _: &ShowFiles, _, cx| this.select(Screen::Files, cx)))
             .on_action(
                 cx.listener(|this, _: &ShowMessages, _, cx| this.select(Screen::Messages, cx)),

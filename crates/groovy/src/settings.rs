@@ -223,6 +223,31 @@ impl SettingsScreen {
         cx.notify();
     }
 
+    /// Sets the text size in every open window, and saves it.
+    fn set_text_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        let config = {
+            let data = cx.global_mut::<AppData>();
+            data.config.text_scale = scale;
+            data.config.clone()
+        };
+        let dir: DataDir = cx.global::<AppData>().dir.clone();
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, _| {
+                    window.set_rem_size(gpui::px(16.) * scale);
+                    window.refresh();
+                })
+                .ok();
+        }
+        cx.background_spawn(async move {
+            if let Err(error) = config.save(&dir) {
+                warn!(%error, "could not save the text size");
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Saves the appearance to `config.toml` and applies it straight away.
     fn set_appearance(&mut self, choice: Appearance, cx: &mut Context<Self>) {
         let config = {
@@ -652,6 +677,7 @@ impl Render for SettingsScreen {
         let discovery = data.config.discovery;
         let notifications = data.config.notifications.clone();
         let background = data.config.background.clone();
+        let text_scale = data.config.text_scale;
         let relay = data.config.relay.clone();
         let data_dir: PathBuf = data.dir.root().to_path_buf();
         let logs_dir: PathBuf = data.dir.logs_dir();
@@ -736,6 +762,32 @@ impl Render for SettingsScreen {
                 |settings, on| settings.hide_content = on,
                 cx,
             ))
+            .child(divider(cx))
+            .child(section_heading(
+                "Text size",
+                "Scales the text and controls in every window. Applies at once.",
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .children([100u32, 125, 150, 200].map(|percent| {
+                        let scale = percent as f32 / 100.0;
+                        let selected = (text_scale - scale).abs() < 0.001;
+                        let view = view.clone();
+                        Button::new(("text-size", percent), format!("{percent}%"))
+                            .variant(if selected {
+                                Variant::Primary
+                            } else {
+                                Variant::Secondary
+                            })
+                            .on_click(move |_, cx| {
+                                view.update(cx, |screen, cx| screen.set_text_scale(scale, cx))
+                            })
+                    })),
+            )
             .child(divider(cx))
             .child(section_heading(
                 "Background",

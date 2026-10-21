@@ -46,6 +46,10 @@ pub enum ConfigError {
     Serialize(#[source] toml::ser::Error),
 }
 
+fn text_scale_default() -> f32 {
+    1.0
+}
+
 /// What happens when the window closes, and whether Groovy starts with the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Background {
@@ -174,6 +178,10 @@ pub struct Config {
     /// Missing from older files, which get the default: close to the tray, do not start on login.
     #[serde(default)]
     pub background: Background,
+    /// Scales the text and controls, as a fraction of the default size: 1.0 is the default.
+    /// Missing from older files, which get the default.
+    #[serde(default = "text_scale_default")]
+    pub text_scale: f32,
     /// Keys this build does not know about. They are written back unchanged.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -188,6 +196,7 @@ impl Default for Config {
             relay: RelaySetting::default(),
             notifications: Notifications::default(),
             background: Background::default(),
+            text_scale: text_scale_default(),
             unknown: toml::Table::new(),
         }
     }
