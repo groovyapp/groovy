@@ -45,7 +45,6 @@ use crate::config::{Discovery, RelaySetting};
 use crate::contacts;
 use crate::db::Database;
 use crate::files;
-use crate::folder_sync;
 use crate::folders::{
     self, ExportReport, Folder, FolderAccess, FolderEntry, FolderStatus, Protected,
 };
@@ -65,6 +64,7 @@ use crate::shares::Share;
 use crate::storage::StorageUsage;
 use crate::transfers::{Direction, Transfer, TransferState};
 use crate::user::{DeviceCert, Revocation, UserClaim, UserDevice, UserKeyStore};
+use crate::{folder_peers, folder_sync};
 use iroh::address_lookup::MemoryLookup;
 use iroh_docs::DocTicket;
 use iroh_docs::store::Query;
@@ -725,6 +725,7 @@ async fn run(
                 live: folder_live.clone(),
                 me: endpoint.id(),
                 tasks: Arc::new(Mutex::new(HashMap::new())),
+                peers: Arc::new(Mutex::new(HashMap::new())),
             };
             let verifying = state.clone();
             tokio::spawn(async move {
@@ -745,7 +746,7 @@ async fn run(
                 });
             }
             match database.folders() {
-                Ok(saved) => saved.iter().for_each(|folder| state.sync(folder)),
+                Ok(saved) => saved.iter().for_each(|folder| state.start(folder)),
                 Err(error) => warn!(%error, "could not read the shared folders"),
             }
             Some(state)
@@ -928,7 +929,7 @@ async fn run(
                             .await
                             {
                                 Ok(folder) => {
-                                    state.sync(&folder);
+                                    state.start(&folder);
                                     Ok(folder)
                                 }
                                 Err(error) => Err(folder_error(error)),
@@ -952,7 +953,7 @@ async fn run(
                             .await
                             {
                                 Ok(folder) => {
-                                    state.sync(&folder);
+                                    state.start(&folder);
                                     Ok(folder)
                                 }
                                 Err(error) => Err(folder_error(error)),
@@ -1089,6 +1090,7 @@ async fn run(
                                 {
                                     task.abort();
                                 }
+                                state.disconnect(namespace);
                                 folders::leave(&state.docs, &state.database, namespace)
                                     .await
                                     .map_err(folder_error)
@@ -1552,9 +1554,38 @@ struct FolderState {
     me: EndpointId,
     /// The sync task of each folder this device saves, so leaving a folder can stop it.
     tasks: Arc<Mutex<HashMap<NamespaceId, tokio::task::AbortHandle>>>,
+    /// The task that keeps each folder connected to its members.
+    peers: Arc<Mutex<HashMap<NamespaceId, tokio::task::AbortHandle>>>,
 }
 
 impl FolderState {
+    /// Keeps a folder connected to the other members, and starts keeping its directory in
+    /// step with it, if this device saves it.
+    fn start(&self, folder: &Folder) {
+        let task = folder_peers::spawn(self.docs.clone(), self.database.clone(), folder.namespace);
+        if let Some(old) = self
+            .peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(folder.namespace, task)
+        {
+            old.abort();
+        }
+        self.sync(folder);
+    }
+
+    /// Stops keeping a folder connected, as when it is left.
+    fn disconnect(&self, namespace: NamespaceId) {
+        if let Some(task) = self
+            .peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&namespace)
+        {
+            task.abort();
+        }
+    }
+
     /// Starts keeping a folder's directory in step with it, if this device saves it.
     fn sync(&self, folder: &Folder) {
         if let Some(dir) = folder.path.as_ref().filter(|_| folder.keep_copy) {

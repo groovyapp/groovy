@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
+use iroh::EndpointId;
 use iroh_blobs::{BlobFormat, Hash, api::Store};
 use iroh_docs::DocTicket;
 pub use iroh_docs::NamespaceId;
@@ -158,15 +159,60 @@ impl Database {
         Ok(folders)
     }
 
-    /// Forgets a folder this device was in.
+    /// Forgets a folder this device was in, and the devices it synced with.
     pub fn delete_folder(&self, namespace: NamespaceId) -> Result<(), DbError> {
         self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM folder_peers WHERE namespace = ?1",
+                [namespace.as_bytes().as_slice()],
+            )?;
             conn.execute(
                 "DELETE FROM folders WHERE namespace = ?1",
                 [namespace.as_bytes().as_slice()],
             )
             .map(|_| ())
         })
+    }
+
+    /// Records that a folder synced with another device, at `now` in Unix seconds.
+    pub fn record_folder_peer(
+        &self,
+        namespace: NamespaceId,
+        peer: EndpointId,
+        now: i64,
+    ) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO folder_peers (namespace, peer, seen) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (namespace, peer) DO UPDATE SET seen = excluded.seen",
+                params![
+                    namespace.as_bytes().as_slice(),
+                    peer.as_bytes().as_slice(),
+                    now
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// The devices a folder has synced with, most recently seen first.
+    pub fn folder_peers(&self, namespace: NamespaceId) -> Result<Vec<EndpointId>, DbError> {
+        let rows = self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT peer FROM folder_peers WHERE namespace = ?1 ORDER BY seen DESC, rowid",
+            )?;
+            let rows = statement
+                .query_map([namespace.as_bytes().as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .filter_map(|bytes| EndpointId::from_bytes(&bytes).ok())
+            .collect())
     }
 
     /// Sets the name this device shows for a folder.
@@ -287,6 +333,7 @@ pub async fn join(
         .trim()
         .parse()
         .map_err(|error| FolderError::Replica(format!("not a folder ticket: {error}")))?;
+    let peers: Vec<EndpointId> = ticket.nodes.iter().map(|addr| addr.id).collect();
     let doc = docs.import(ticket).await.map_err(replica)?;
     let folder = Folder {
         namespace: doc.id(),
@@ -296,6 +343,11 @@ pub async fn join(
         keep_copy: true,
     };
     database.insert_folder(&folder)?;
+    // The members in the ticket are the ones to reach again after a restart, even if the
+    // first sync with them did not finish cleanly.
+    for peer in peers {
+        database.record_folder_peer(folder.namespace, peer, now)?;
+    }
     Ok(folder)
 }
 

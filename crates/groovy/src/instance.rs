@@ -12,7 +12,8 @@ use crate::deeplink;
 /// What a launch asked the running app to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
-    /// Bring the window forward, or open it.
+    /// Bring the window forward, or open it. Only another launch asks for it, which needs Unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Show,
     /// A `groovy://` link, as it was given.
     Link(String),
@@ -22,7 +23,8 @@ pub enum Incoming {
 pub enum Claim {
     /// This is the running copy. Its arguments have been queued like any other request.
     First,
-    /// A running copy has the arguments now, so this launch should end.
+    /// A running copy has the arguments now, so this launch should end. Only on Unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Forwarded,
 }
 
@@ -41,6 +43,7 @@ fn push(item: Incoming) {
 }
 
 /// The request one launch sends to the running copy, one line each: `show`, or `link <text>`.
+#[cfg(unix)]
 fn messages(args: &[String]) -> Vec<String> {
     let mut lines = vec!["show".to_owned()];
     lines.extend(
@@ -60,6 +63,7 @@ fn queue_own_links(args: &[String]) {
 }
 
 /// Parses one line from another launch.
+#[cfg(unix)]
 fn parse_line(line: &str) -> Option<Incoming> {
     let line = line.trim_end();
     if line == "show" {
@@ -113,7 +117,8 @@ pub fn claim(_socket: &Path, args: &[String]) -> std::io::Result<Claim> {
     Ok(Claim::First)
 }
 
-#[cfg(test)]
+/// The socket, and the lines sent over it, are Unix only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -127,7 +132,6 @@ mod tests {
         assert_eq!(messages(&args), ["show", "link groovy://groovygroup1abc"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_second_launch_hands_its_link_to_the_first_and_ends() {
         let socket = std::env::temp_dir().join(format!("groovy-test-{}.sock", std::process::id()));
