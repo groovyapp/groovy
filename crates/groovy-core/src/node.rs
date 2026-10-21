@@ -37,7 +37,7 @@ use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::avatar;
 use crate::blobs::{self, SharedHashes, Withdrawn};
@@ -2554,8 +2554,17 @@ async fn sync_with(receiving: &Receiving, group: GroupId, peer: EndpointId) {
         Ok(members) if members.is_member(&peer) => {}
         _ => return,
     }
-    if let Ok(Some(record)) = ask_key(receiving, group, peer, false).await {
-        let _ = accept_key(receiving, group, record, false).await;
+    // Its key must be at least as new as this device's. Every removal moves the group to a
+    // new key, and this device may hold the new key before its copy of the membership shows
+    // the removal; a removed member is left on the old key.
+    let Ok(Some(record)) = ask_key(receiving, group, peer, false).await else {
+        return;
+    };
+    let theirs = record.epoch;
+    let _ = accept_key(receiving, group, record, false).await;
+    match row_of(receiving, &group) {
+        Ok(row) if theirs >= row.key.epoch => {}
+        _ => return,
     }
     let _ = fetch_history(receiving, group, peer).await;
 }
@@ -2606,7 +2615,10 @@ async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request)
             })
         }
         Request::GroupKey { .. } => {
-            if members.is_member(&peer) {
+            // A key at a later epoch than the removals this device's records show comes from
+            // a removal it has not seen yet, and the peer may be the member removed. The key
+            // is given once the records catch up.
+            if members.is_member(&peer) && row.key.epoch <= members.removals {
                 GroupAnswer::Key(Some(row.key))
             } else {
                 GroupAnswer::Refused
@@ -2656,14 +2668,20 @@ const GROUP_REJOIN_MAX: Duration = Duration::from_secs(30);
 /// neighbor leaves.
 const GROUP_CATCH_UP: Duration = Duration::from_secs(60);
 const GROUP_CATCH_UP_AFTER_LEAVE: Duration = Duration::from_secs(1);
+/// How long a group with no neighbors waits before asking its members to let it join again.
+/// It doubles each time, up to `GROUP_REJOIN_MAX`.
+const GROUP_ALONE_FIRST: Duration = Duration::from_secs(5);
 
 /// Runs one group's gossip topic until it is replaced or the node stops. Messages that arrive
 /// are checked and stored, and each member that connects is brought up to date.
 ///
-/// Gossip does not promise delivery, so the group also asks its neighbors for what it missed:
-/// when a neighbor leaves, since a message on its way may have gone with it, and every so
-/// often. And gossip closes a subscription that falls behind, so the topic is joined again
-/// whenever its subscription ends.
+/// Gossip does not promise delivery, so the group also asks its members for what it missed:
+/// each one directly when the subscription starts, since gossip may not bring them back as
+/// neighbors (a member that restarted can find the others still holding its old connection);
+/// its neighbors when one leaves, since a message on its way may have gone with it; and its
+/// neighbors every so often. While it has no neighbors at all, it asks its members to let it
+/// join again, since gossip sends a join only once. And gossip closes a subscription that falls
+/// behind, so the topic is joined again whenever its subscription ends.
 async fn run_group(
     receiving: Receiving,
     group: GroupId,
@@ -2706,7 +2724,7 @@ async fn follow_group(
         .groups
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(group, sender);
+        .insert(group, sender.clone());
     let catch_up = |member: EndpointId, delay: Duration| {
         let syncing = receiving.clone();
         tokio::spawn(async move {
@@ -2714,10 +2732,29 @@ async fn follow_group(
             sync_with(&syncing, group, member).await;
         });
     };
+    for member in topic_bootstrap(receiving, group).unwrap_or_default() {
+        catch_up(member, Duration::ZERO);
+    }
     let mut tick =
         tokio::time::interval_at(tokio::time::Instant::now() + GROUP_CATCH_UP, GROUP_CATCH_UP);
+    let mut alone_wait = GROUP_ALONE_FIRST;
+    let alone = tokio::time::sleep(alone_wait);
+    tokio::pin!(alone);
     loop {
         tokio::select! {
+            () = &mut alone => {
+                if receiver.neighbors().next().is_none()
+                    && let Ok(members) = topic_bootstrap(receiving, group)
+                    && !members.is_empty()
+                {
+                    debug!("a group has no neighbors; asking its members to let it join again");
+                    let _ = sender.join_peers(members).await;
+                    alone_wait = (alone_wait * 2).min(GROUP_REJOIN_MAX);
+                } else {
+                    alone_wait = GROUP_ALONE_FIRST;
+                }
+                alone.as_mut().reset(tokio::time::Instant::now() + alone_wait);
+            }
             event = receiver.next() => match event {
                 Some(Ok(GossipEvent::Received(message))) => {
                     if let Ok(envelope) = postcard::from_bytes::<GroupEnvelope>(&message.content)
