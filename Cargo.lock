@@ -3146,6 +3146,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "groovy-core",
+ "notify-rust",
  "raw-window-handle",
  "tempfile",
  "tracing",

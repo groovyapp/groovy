@@ -372,6 +372,7 @@ pub fn start(cx: &mut App) {
                 network_changes.fetch_add(1, Ordering::SeqCst);
             }
             cx.update(|cx| {
+                crate::notifications::on_event(cx, &event);
                 let state = cx.global_mut::<NodeState>();
                 match event {
                     NodeEvent::Started => state.status = NodeStatus::Online,

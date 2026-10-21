@@ -93,6 +93,22 @@ impl Workspace {
         let folders = cx.new(FoldersView::new);
         let messages = cx.new(|cx| MessagesView::new(database.clone(), cx));
 
+        // Notifications clicked since the last tick take the window to their place.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+                if this
+                    .update(cx, |workspace, cx| workspace.open_notifications(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             current,
             database,
@@ -119,6 +135,24 @@ impl Workspace {
         crate::node::start(cx);
         self.onboarding = None;
         cx.notify();
+    }
+
+    /// Takes the window to the place of each notification that was clicked.
+    fn open_notifications(&mut self, cx: &mut Context<Self>) {
+        for destination in crate::notifications::take_opened() {
+            match destination {
+                crate::notifications::Destination::Contact(_)
+                | crate::notifications::Destination::Group(_) => {
+                    self.select(Screen::Messages, cx);
+                    self.messages.update(cx, |messages, cx| {
+                        messages.open_conversation(destination, cx)
+                    });
+                }
+                crate::notifications::Destination::Files => self.select(Screen::Files, cx),
+                crate::notifications::Destination::Peers => self.select(Screen::Peers, cx),
+            }
+            cx.activate(true);
+        }
     }
 
     fn select(&mut self, screen: Screen, cx: &mut Context<Self>) {

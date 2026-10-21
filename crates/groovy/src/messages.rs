@@ -314,6 +314,20 @@ impl MessagesView {
         .detach();
     }
 
+    /// Opens the conversation a notification was about.
+    pub fn open_conversation(
+        &mut self,
+        destination: crate::notifications::Destination,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match destination {
+            crate::notifications::Destination::Contact(id) => Target::Contact(id),
+            crate::notifications::Destination::Group(id) => Target::Group(id),
+            _ => return,
+        };
+        self.select(target, cx);
+    }
+
     /// Opens a conversation: its newest messages are read, and it counts as read to the newest.
     fn select(&mut self, target: Target, cx: &mut Context<Self>) {
         self.selected = Some(target);
@@ -1124,6 +1138,19 @@ impl MessagesView {
         let header_view = view.clone();
         let clear_view = view.clone();
         let mut header_buttons = div().flex().flex_row().gap_2();
+        let destination = match target {
+            Target::Contact(id) => crate::notifications::Destination::Contact(id),
+            Target::Group(id) => crate::notifications::Destination::Group(id),
+        };
+        let muted = cx.try_global::<crate::data::AppData>().is_some_and(|data| {
+            crate::notifications::is_muted(&data.config.notifications, destination)
+        });
+        header_buttons = header_buttons.child(
+            Button::new("messages-mute", if muted { "Unmute" } else { "Mute" })
+                .variant(Variant::Ghost)
+                .tooltip("Turn this conversation's notifications on or off")
+                .on_click(move |_, cx| crate::notifications::set_muted(cx, destination, muted)),
+        );
         if let Target::Group(group) = target {
             header_buttons = header_buttons.child(
                 Button::new(
