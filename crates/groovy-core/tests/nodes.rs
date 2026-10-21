@@ -993,10 +993,18 @@ async fn transfers_survive_a_restart_and_unfinished_ones_resume() {
         let alice = alice.clone();
         async move { alice.send_files(bob_addr, paths).await }
     });
-    let offer = next_file_offer(&mut bob_events).await;
+    let offer = tokio::time::timeout(TIMEOUT, next_file_offer(&mut bob_events))
+        .await
+        .expect("bob is offered the files");
     bob.answer_offer(alice_key.public(), true).await.unwrap();
-    send.await.unwrap().unwrap();
-    next_file_received(&mut bob_events).await;
+    tokio::time::timeout(TIMEOUT, send)
+        .await
+        .expect("alice's send ends")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, next_file_received(&mut bob_events))
+        .await
+        .expect("bob receives the files");
     let finished = bob.transfers();
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].state, TransferState::Completed);
@@ -1578,6 +1586,41 @@ async fn clearing_the_cache_drops_received_history_and_keeps_folders() {
 
     assert!(alice.shutdown(TIMEOUT));
     assert!(bob.shutdown(TIMEOUT));
+}
+
+#[tokio::test]
+async fn folder_files_survive_collection_that_runs_while_they_are_added() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice_key = SecretKey::generate();
+    let alice_dir = fresh_dir(&tmp, "alice");
+    // Collection runs all the time, so it runs while files are being added.
+    let (alice, _events) =
+        blob_node_collecting(&alice_dir, alice_key, Some(Duration::from_millis(5))).await;
+    let folder = alice.create_folder("busy".into(), None).await.unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    for n in 0..40 {
+        let path = source.join(format!("{n}.txt"));
+        std::fs::write(&path, format!("file {n}")).unwrap();
+        alice
+            .add_to_folder(folder.namespace, format!("{n}.txt"), path)
+            .await
+            .unwrap();
+    }
+    // Let several more runs go by.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let entries = alice.folder_entries(folder.namespace).await.unwrap();
+    assert_eq!(entries.len(), 40);
+    for entry in entries {
+        let n = entry.key.trim_end_matches(".txt");
+        assert_eq!(
+            alice.read_blob(entry.hash).await.unwrap(),
+            Some(format!("file {n}").into_bytes()),
+            "{} was collected",
+            entry.key
+        );
+    }
+    assert!(alice.shutdown(TIMEOUT));
 }
 
 /// The keys of a folder's entries, sorted.
@@ -2468,10 +2511,13 @@ async fn a_device_that_does_not_keep_a_folder_fetches_no_files_and_is_not_counte
     let health = bob.folder_health(folder.namespace).await.unwrap();
     let own = &health.devices[0];
     assert!(!own.keeps_copy && own.files == 1 && own.held == 0);
+    // Bob is not counted. Alice's copy is, once her report reaches him.
+    assert!(!own.complete());
     assert_eq!(
-        health.copies, 0,
-        "bob has nothing, and alice has not reported to him"
+        health.copies,
+        health.devices.iter().filter(|info| info.complete()).count()
     );
+    assert!(health.copies <= 1, "only alice's copy can count");
 
     // Alice's copy is the one copy, and bob's choice shows to her.
     bob.verify_folder(folder.namespace).await.unwrap();
