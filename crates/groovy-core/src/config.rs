@@ -46,6 +46,20 @@ pub enum ConfigError {
     Serialize(#[source] toml::ser::Error),
 }
 
+/// How the user wants to be told about messages and transfers while the window is away.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notifications {
+    /// Turns every notification off.
+    #[serde(default)]
+    pub do_not_disturb: bool,
+    /// Shows that something happened, without who or what it was.
+    #[serde(default)]
+    pub hide_content: bool,
+    /// Conversations whose notifications are off, as `contact:<hex>` or `group:<hex>`.
+    #[serde(default)]
+    pub muted: Vec<String>,
+}
+
 /// Whether the window follows the system's light or dark setting, or is fixed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +144,9 @@ pub struct Config {
     /// Missing from older files, which get the default: n0's public relays.
     #[serde(default)]
     pub relay: RelaySetting,
+    /// Missing from older files, which get the default: notifications on, content shown.
+    #[serde(default)]
+    pub notifications: Notifications,
     /// Keys this build does not know about. They are written back unchanged.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -142,6 +159,7 @@ impl Default for Config {
             appearance: Appearance::default(),
             discovery: Discovery::default(),
             relay: RelaySetting::default(),
+            notifications: Notifications::default(),
             unknown: toml::Table::new(),
         }
     }

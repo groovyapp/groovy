@@ -371,6 +371,43 @@ fn relay_row(
 }
 
 /// A switch for one way of finding peers. Takes effect the next time Groovy starts.
+/// A row with an On/Off switch for one notification setting, saved as soon as it changes.
+fn notification_row(
+    label: &'static str,
+    detail: &'static str,
+    id: &'static str,
+    on: bool,
+    set: fn(&mut groovy_core::Notifications, bool),
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let button = Button::new(id, if on { "On" } else { "Off" })
+        .variant(if on {
+            Variant::Primary
+        } else {
+            Variant::Secondary
+        })
+        .on_click(move |_, cx| {
+            crate::notifications::update(cx, |settings| set(settings, !on));
+        });
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(label))
+                .child(div().text_xs().text_color(theme.text_muted).child(detail)),
+        )
+        .child(button)
+}
+
 fn discovery_row(
     label: &'static str,
     detail: &'static str,
@@ -538,6 +575,7 @@ impl Render for SettingsScreen {
         let data = cx.global::<AppData>();
         let current = data.config.appearance;
         let discovery = data.config.discovery;
+        let notifications = data.config.notifications.clone();
         let relay = data.config.relay.clone();
         let data_dir: PathBuf = data.dir.root().to_path_buf();
         let logs_dir: PathBuf = data.dir.logs_dir();
@@ -600,6 +638,28 @@ impl Render for SettingsScreen {
                     .child(appearance_button(Appearance::Light, "Light"))
                     .child(appearance_button(Appearance::Dark, "Dark")),
             )
+            .child(divider(cx))
+            .child(section_heading(
+                "Notifications",
+                "Told about messages, pairing requests and files while the window is away.",
+                cx,
+            ))
+            .child(notification_row(
+                "Do not disturb",
+                "Turn every notification off.",
+                "settings-dnd",
+                notifications.do_not_disturb,
+                |settings, on| settings.do_not_disturb = on,
+                cx,
+            ))
+            .child(notification_row(
+                "Hide content",
+                "Say that something happened, without who or what.",
+                "settings-hide-content",
+                notifications.hide_content,
+                |settings, on| settings.hide_content = on,
+                cx,
+            ))
             .child(divider(cx))
             .child(section_heading(
                 "Network",

@@ -8,6 +8,7 @@ mod files;
 mod folders;
 mod messages;
 mod node;
+mod notifications;
 mod onboarding;
 mod peers;
 mod settings;
