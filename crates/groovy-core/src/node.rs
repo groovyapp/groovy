@@ -37,7 +37,7 @@ use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::avatar;
 use crate::blobs::{self, SharedHashes, Withdrawn};
@@ -597,9 +597,10 @@ async fn run(
     let gate = config.gate.clone();
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let offers: PendingOffers = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    // Hashes that shared folders reference. Collection keeps them, so it is refreshed from
-    // the folders, and grows as files are added.
-    let folder_live: Protected = Arc::new(Mutex::new(HashSet::new()));
+    // What shared folders reference, which collection keeps: it reads the folders' entries
+    // at the start of each run, once they can be read, and holds the files just added.
+    let folder_source: FolderSource = Arc::new(std::sync::OnceLock::new());
+    let held_adds = folders::HeldAdds::new(config.garbage_interval.is_some());
     let withdrawn: Withdrawn = Arc::new(Mutex::new(HashSet::new()));
     // The content of downloads in progress, so collection leaves it alone.
     let in_flight: Protected = Arc::new(Mutex::new(HashSet::new()));
@@ -608,10 +609,11 @@ async fn run(
             let mut options = iroh_blobs::store::fs::options::Options::new(dir);
             options.gc = config.garbage_interval.map(|interval| GcConfig {
                 interval,
-                add_protected: Some(protect_folder_content(vec![
-                    folder_live.clone(),
+                add_protected: Some(protect_content(
+                    folder_source.clone(),
+                    held_adds.clone(),
                     in_flight.clone(),
-                ])),
+                )),
             });
             match FsStore::load_with_opts(dir.join("blobs.db"), options).await {
                 Ok(store) => Some(store),
@@ -722,7 +724,7 @@ async fn run(
                 docs: docs.clone(),
                 store: store.clone(),
                 database: database.clone(),
-                live: folder_live.clone(),
+                held: held_adds.clone(),
                 me: endpoint.id(),
                 tasks: Arc::new(Mutex::new(HashMap::new())),
                 peers: Arc::new(Mutex::new(HashMap::new())),
@@ -735,16 +737,7 @@ async fn run(
                     tokio::time::sleep(VERIFY_INTERVAL).await;
                 }
             });
-            if config.garbage_interval.is_some() {
-                let refreshing = state.clone();
-                let live = folder_live.clone();
-                tokio::spawn(async move {
-                    loop {
-                        refresh_folder_live(&refreshing, &live).await;
-                        tokio::time::sleep(FOLDER_REFRESH).await;
-                    }
-                });
-            }
+            let _ = folder_source.set((docs.clone(), database.clone()));
             match database.folders() {
                 Ok(saved) => saved.iter().for_each(|folder| state.start(folder)),
                 Err(error) => warn!(%error, "could not read the shared folders"),
@@ -977,13 +970,13 @@ async fn run(
                 }
                 Some(Command::AddToFolder(namespace, key, source, seen, reply)) => {
                     let folders = folders.clone();
-                    let live = folder_live.clone();
                     tokio::spawn(async move {
                         let outcome = match folder_state(&folders) {
                             Ok(state) => {
                                 match folders::add_file_seeing(
                                     &state.docs,
                                     &state.store,
+                                    &state.held,
                                     namespace,
                                     &key,
                                     &source,
@@ -991,10 +984,7 @@ async fn run(
                                 )
                                 .await
                                 {
-                                    Ok(hash) => {
-                                        lock_live(&live).insert(hash);
-                                        Ok(())
-                                    }
+                                    Ok(_) => Ok(()),
                                     Err(error) => Err(folder_error(error)),
                                 }
                             }
@@ -1549,7 +1539,8 @@ struct FolderState {
     docs: Docs,
     store: FsStore,
     database: Arc<Database>,
-    live: Protected,
+    /// Files just added, held until collection has read the entries that name them.
+    held: folders::HeldAdds,
     /// This device, which names its copy in the folder's replica reports.
     me: EndpointId,
     /// The sync task of each folder this device saves, so leaving a folder can stop it.
@@ -1594,7 +1585,7 @@ impl FolderState {
                 std::ops::Deref::deref(&self.store).clone(),
                 folder.namespace,
                 dir.clone(),
-                self.live.clone(),
+                self.held.clone(),
             );
             if let Some(old) = self
                 .tasks
@@ -1698,19 +1689,43 @@ fn folder_error(error: folders::FolderError) -> NodeError {
     NodeError::Folder(error.to_string())
 }
 
-/// How often the hashes shared folders reference are read again.
-const FOLDER_REFRESH: Duration = Duration::from_secs(2);
+/// The folders' replicas and the database that lists the folders, once both are open.
+/// Collection reads the folders' entries through it.
+type FolderSource = Arc<std::sync::OnceLock<(Docs, Arc<Database>)>>;
 
-/// Lets collection keep what shared folders reference. The protection is read at the
-/// start of each collection, so a file is protected from the moment it is in a folder.
-/// Lets collection also keep the content of downloads in progress, which no tag holds until
-/// their file list has arrived.
-fn protect_folder_content(sets: Vec<Protected>) -> ProtectCb {
+/// Tells collection what to keep beyond the store's tags: the content of downloads in
+/// progress, which no tag holds until their file list has arrived; what the shared folders'
+/// entries name, read at the start of each run; and the files just added to folders, which
+/// may not show in the entries yet. A run that cannot read the entries is skipped.
+fn protect_content(
+    folders: FolderSource,
+    held: folders::HeldAdds,
+    in_flight: Protected,
+) -> ProtectCb {
     Arc::new(move |protected: &mut HashSet<Hash>| {
-        for live in &sets {
-            protected.extend(lock_live(live).iter().copied());
-        }
-        Box::pin(std::future::ready(ProtectOutcome::Continue))
+        protected.extend(lock_live(&in_flight).iter().copied());
+        // The files held now stay protected this run, whatever the entries show.
+        protected.extend(held.held());
+        let folders = folders.clone();
+        let held = held.clone();
+        // Read on its own task, since collection needs a future it can share between threads.
+        let reading = tokio::spawn(async move {
+            match folders.get() {
+                Some((docs, database)) => folder_hashes(docs, database).await,
+                None => Ok(HashSet::new()),
+            }
+        });
+        Box::pin(async move {
+            match reading.await {
+                Ok(Ok(hashes)) => {
+                    // Held files the entries now name are kept by the entries from here on.
+                    held.release_seen(&hashes);
+                    protected.extend(hashes);
+                    ProtectOutcome::Continue
+                }
+                _ => ProtectOutcome::Abort,
+            }
+        })
     })
 }
 
@@ -1718,25 +1733,26 @@ fn lock_live(live: &Protected) -> std::sync::MutexGuard<'_, HashSet<Hash>> {
     live.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Reads every hash the folders reference, and makes that the protected set.
-async fn refresh_folder_live(state: &FolderState, live: &Protected) {
-    let Ok(folders) = state.database.folders() else {
-        return;
-    };
+/// Every hash the folders reference: the files of each folder this device keeps, and every
+/// folder's own records, which are small and always kept.
+async fn folder_hashes(docs: &Docs, database: &Database) -> Result<HashSet<Hash>, NodeError> {
     let mut hashes = HashSet::new();
+    let folders = database
+        .folders()
+        .map_err(|error| NodeError::Folder(error.to_string()))?;
     for folder in folders {
-        // A device that does not keep a folder lets its files go. The folder's own records
-        // are small, and always kept.
-        if folder.keep_copy
-            && let Ok(entries) = folders::entries(&state.docs, folder.namespace).await
-        {
+        if folder.keep_copy {
+            let entries = folders::entries(docs, folder.namespace)
+                .await
+                .map_err(folder_error)?;
             hashes.extend(entries.iter().map(|entry| entry.hash));
         }
-        if let Ok(records) = replicas::record_hashes(&state.docs, folder.namespace).await {
-            hashes.extend(records);
-        }
+        let records = replicas::record_hashes(docs, folder.namespace)
+            .await
+            .map_err(folder_error)?;
+        hashes.extend(records);
     }
-    *lock_live(live) = hashes;
+    Ok(hashes)
 }
 
 /// What `start` hands the node thread: the transfer book, the next free transfer id,
@@ -1914,16 +1930,8 @@ async fn send_attachment(
     path: PathBuf,
 ) -> Result<Message, NodeError> {
     let store = receiving.store.clone().ok_or(NodeError::BlobsDisabled)?;
-    let imported = files::import(&store, std::slice::from_ref(&path), |_, _| {})
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
-    // Keeps the file while a message refers to it, as a send does.
-    store
-        .tags()
-        .set(
-            format!("attachment-{}", imported.root),
-            HashAndFormat::hash_seq(imported.root),
-        )
+    // Tagged so the file is kept while a message refers to it, as a send does.
+    let imported = files::import(&store, std::slice::from_ref(&path), "attachment", |_, _| {})
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
     let preview = attachment_preview(path).await;
@@ -2110,14 +2118,7 @@ fn row_of(receiving: &Receiving, group: &GroupId) -> Result<GroupRow, NodeError>
 /// decides the topic, so this is called whenever the key changes.
 fn start_topic(receiving: &Receiving, group: GroupId) -> Result<(), NodeError> {
     let row = row_of(receiving, &group)?;
-    let database = group_database(receiving)?;
-    let own = receiving.endpoint.id();
-    let members = database
-        .group_members(&group)
-        .map_err(group_error)?
-        .into_iter()
-        .filter(|member| *member != own)
-        .collect();
+    let members = topic_bootstrap(receiving, group)?;
     // The old topic's sender goes first, so nothing is sent on it once the key has changed.
     receiving
         .groups
@@ -2139,6 +2140,18 @@ fn start_topic(receiving: &Receiving, group: GroupId) -> Result<(), NodeError> {
         previous.abort();
     }
     Ok(())
+}
+
+/// The other members a group's topic is joined through.
+fn topic_bootstrap(receiving: &Receiving, group: GroupId) -> Result<Vec<EndpointId>, NodeError> {
+    let database = group_database(receiving)?;
+    let own = receiving.endpoint.id();
+    Ok(database
+        .group_members(&group)
+        .map_err(group_error)?
+        .into_iter()
+        .filter(|member| *member != own)
+        .collect())
 }
 
 /// Makes a new group, with this device as its founder and an admin. Returns its id.
@@ -2540,8 +2553,26 @@ async fn accept_key(
 /// Brings this device up to date with a member: the group's current key, then the messages it
 /// missed.
 async fn sync_with(receiving: &Receiving, group: GroupId, peer: EndpointId) {
-    if let Ok(Some(record)) = ask_key(receiving, group, peer, false).await {
-        let _ = accept_key(receiving, group, record, false).await;
+    // Only members are asked. A removed member can still be on the group's old topic, and
+    // would answer with what it wrote after it was removed.
+    let Ok(row) = row_of(receiving, &group) else {
+        return;
+    };
+    match members_of(receiving, &row).await {
+        Ok(members) if members.is_member(&peer) => {}
+        _ => return,
+    }
+    // Its key must be at least as new as this device's. Every removal moves the group to a
+    // new key, and this device may hold the new key before its copy of the membership shows
+    // the removal; a removed member is left on the old key.
+    let Ok(Some(record)) = ask_key(receiving, group, peer, false).await else {
+        return;
+    };
+    let theirs = record.epoch;
+    let _ = accept_key(receiving, group, record, false).await;
+    match row_of(receiving, &group) {
+        Ok(row) if theirs >= row.key.epoch => {}
+        _ => return,
     }
     let _ = fetch_history(receiving, group, peer).await;
 }
@@ -2592,7 +2623,10 @@ async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request)
             })
         }
         Request::GroupKey { .. } => {
-            if members.is_member(&peer) {
+            // A key at a later epoch than the removals this device's records show comes from
+            // a removal it has not seen yet, and the peer may be the member removed. The key
+            // is given once the records catch up.
+            if members.is_member(&peer) && row.key.epoch <= members.removals {
                 GroupAnswer::Key(Some(row.key))
             } else {
                 GroupAnswer::Refused
@@ -2634,8 +2668,28 @@ async fn answer_group(receiving: &Receiving, peer: EndpointId, request: Request)
     }
 }
 
+/// How long a group waits before joining its topic again after the subscription ends. It
+/// doubles each time the joining fails, up to `GROUP_REJOIN_MAX`.
+const GROUP_REJOIN_FIRST: Duration = Duration::from_secs(1);
+const GROUP_REJOIN_MAX: Duration = Duration::from_secs(30);
+/// How often a group asks its neighbors for messages it has missed, and how long after a
+/// neighbor leaves.
+const GROUP_CATCH_UP: Duration = Duration::from_secs(60);
+const GROUP_CATCH_UP_AFTER_LEAVE: Duration = Duration::from_secs(1);
+/// How long a group with no neighbors waits before asking its members to let it join again.
+/// It doubles each time, up to `GROUP_REJOIN_MAX`.
+const GROUP_ALONE_FIRST: Duration = Duration::from_secs(5);
+
 /// Runs one group's gossip topic until it is replaced or the node stops. Messages that arrive
 /// are checked and stored, and each member that connects is brought up to date.
+///
+/// Gossip does not promise delivery, so the group also asks its members for what it missed:
+/// each one directly when the subscription starts, since gossip may not bring them back as
+/// neighbors (a member that restarted can find the others still holding its old connection);
+/// its neighbors when one leaves, since a message on its way may have gone with it; and its
+/// neighbors every so often. While it has no neighbors at all, it asks its members to let it
+/// join again, since gossip sends a join only once. And gossip closes a subscription that falls
+/// behind, so the topic is joined again whenever its subscription ends.
 async fn run_group(
     receiving: Receiving,
     group: GroupId,
@@ -2645,41 +2699,103 @@ async fn run_group(
     let Some(gossip) = receiving.gossip.clone() else {
         return;
     };
-    let topic = match gossip.subscribe(topic, bootstrap).await {
-        Ok(topic) => topic,
-        Err(error) => {
-            warn!(%error, "could not join a group's topic");
-            return;
+    let mut bootstrap = bootstrap;
+    let mut wait = GROUP_REJOIN_FIRST;
+    loop {
+        match gossip.subscribe(topic, bootstrap.clone()).await {
+            Ok(subscription) => {
+                wait = GROUP_REJOIN_FIRST;
+                follow_group(&receiving, group, subscription).await;
+                info!("a group's subscription ended; joining its topic again");
+            }
+            Err(error) => {
+                warn!(%error, "could not join a group's topic; trying again");
+            }
         }
-    };
-    let (sender, mut receiver) = topic.split();
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(GROUP_REJOIN_MAX);
+        // The members may have changed while the subscription was down.
+        if let Ok(members) = topic_bootstrap(&receiving, group) {
+            bootstrap = members;
+        }
+    }
+}
+
+/// Follows one subscription to a group's topic until it ends.
+async fn follow_group(
+    receiving: &Receiving,
+    group: GroupId,
+    subscription: iroh_gossip::api::GossipTopic,
+) {
+    let (sender, mut receiver) = subscription.split();
     receiving
         .groups
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(group, sender);
-    while let Some(event) = receiver.next().await {
-        match event {
-            Ok(GossipEvent::Received(message)) => {
-                if let Ok(envelope) = postcard::from_bytes::<GroupEnvelope>(&message.content)
-                    && envelope.group == group
+        .insert(group, sender.clone());
+    let catch_up = |member: EndpointId, delay: Duration| {
+        let syncing = receiving.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            sync_with(&syncing, group, member).await;
+        });
+    };
+    for member in topic_bootstrap(receiving, group).unwrap_or_default() {
+        catch_up(member, Duration::ZERO);
+    }
+    let mut tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + GROUP_CATCH_UP, GROUP_CATCH_UP);
+    let mut alone_wait = GROUP_ALONE_FIRST;
+    let alone = tokio::time::sleep(alone_wait);
+    tokio::pin!(alone);
+    loop {
+        tokio::select! {
+            () = &mut alone => {
+                if receiver.neighbors().next().is_none()
+                    && let Ok(members) = topic_bootstrap(receiving, group)
+                    && !members.is_empty()
                 {
-                    store_group_envelope(&receiving, envelope);
+                    debug!("a group has no neighbors; asking its members to let it join again");
+                    let _ = sender.join_peers(members).await;
+                    alone_wait = (alone_wait * 2).min(GROUP_REJOIN_MAX);
+                } else {
+                    alone_wait = GROUP_ALONE_FIRST;
                 }
+                alone.as_mut().reset(tokio::time::Instant::now() + alone_wait);
             }
-            Ok(GossipEvent::NeighborUp(member)) => {
-                if let Some(database) = &receiving.database {
-                    let _ = database.add_group_member(group, &member);
+            event = receiver.next() => match event {
+                Some(Ok(GossipEvent::Received(message))) => {
+                    if let Ok(envelope) = postcard::from_bytes::<GroupEnvelope>(&message.content)
+                        && envelope.group == group
+                    {
+                        store_group_envelope(receiving, envelope);
+                    }
                 }
-                let syncing = receiving.clone();
-                tokio::spawn(async move {
-                    sync_with(&syncing, group, member).await;
-                });
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(%error, "a group's topic stopped");
-                break;
+                Some(Ok(GossipEvent::NeighborUp(member))) => {
+                    if let Some(database) = &receiving.database {
+                        let _ = database.add_group_member(group, &member);
+                    }
+                    catch_up(member, Duration::ZERO);
+                }
+                Some(Ok(GossipEvent::NeighborDown(_))) => {
+                    for member in receiver.neighbors() {
+                        catch_up(member, GROUP_CATCH_UP_AFTER_LEAVE);
+                    }
+                }
+                Some(Ok(GossipEvent::Lagged)) => {
+                    warn!("a group's subscription fell behind");
+                    return;
+                }
+                Some(Err(error)) => {
+                    warn!(%error, "a group's subscription stopped");
+                    return;
+                }
+                None => return,
+            },
+            _ = tick.tick() => {
+                for member in receiver.neighbors() {
+                    catch_up(member, Duration::ZERO);
+                }
             }
         }
     }
@@ -2820,10 +2936,16 @@ const MAX_PAGE_MEMBERS: usize = 16;
 /// check for messages whose retry time has come. The check also runs once at startup.
 fn spawn_outbox(receiving: Receiving, outbox: Outbox, mut events: broadcast::Receiver<NodeEvent>) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(OUTBOX_TICK);
+        // The first check runs at once.
+        let mut wake = tokio::time::Instant::now();
         loop {
             tokio::select! {
-                _ = tick.tick() => {
+                // A retry time was set; wake for it if it comes before the next check.
+                _ = outbox.rescheduled() => {
+                    wake = wake.min(next_outbox_check(&outbox));
+                }
+                _ = tokio::time::sleep_until(wake) => {
+                    wake = next_outbox_check(&outbox);
                     let now = messages::now_millis();
                     if let Err(error) = outbox.database().expire_outbox(now) {
                         warn!(%error, "could not expire the outbox");
@@ -2913,8 +3035,19 @@ async fn sync_user_contacts(receiving: Receiving, peer: EndpointId) {
     }
 }
 
-/// How often the outbox is checked for messages whose retry time has come.
+/// How often the outbox is checked for messages whose retry time has come, at the longest. It
+/// is checked sooner when a retry time comes first.
 const OUTBOX_TICK: Duration = Duration::from_secs(60);
+
+/// When the outbox should next be checked: at the next retry time, or after `OUTBOX_TICK`.
+fn next_outbox_check(outbox: &Outbox) -> tokio::time::Instant {
+    let now = messages::now_millis();
+    let wait = match outbox.database().next_outbox_attempt(now) {
+        Ok(Some(due)) => Duration::from_millis(u64::try_from(due - now).unwrap_or(0)),
+        _ => OUTBOX_TICK,
+    };
+    tokio::time::Instant::now() + wait.min(OUTBOX_TICK)
+}
 
 /// Writes the messages waiting for a device, dialing it first. Only one flush runs for a device
 /// at a time, and a flush with nothing due does not dial.
@@ -2922,9 +3055,23 @@ async fn flush_by_dial(receiving: Receiving, device: EndpointId, trigger: Trigge
     let Some(outbox) = receiving.outbox.clone() else {
         return;
     };
-    if !outbox.claim(&device, trigger) {
-        return;
+    let mut trigger = trigger;
+    loop {
+        if !outbox.claim(&device, trigger) {
+            return;
+        }
+        flush_once(&receiving, &outbox, device, trigger).await;
+        // A flush asked for while this one ran, as when a message was sent while it was
+        // dialing, runs now rather than at the message's retry time.
+        match outbox.release(&device) {
+            Some(again) => trigger = again,
+            None => return,
+        }
     }
+}
+
+/// Dials a device and writes what is waiting for it, if anything is.
+async fn flush_once(receiving: &Receiving, outbox: &Outbox, device: EndpointId, trigger: Trigger) {
     if outbox.has_work(&device, trigger) {
         let addr = outbox
             .database()
@@ -2932,24 +3079,28 @@ async fn flush_by_dial(receiving: Receiving, device: EndpointId, trigger: Trigge
             .ok()
             .flatten()
             .unwrap_or_else(|| EndpointAddr::from(device));
-        match open_peer(
+        let dial = open_peer(
             &receiving.endpoint,
             addr,
             &receiving.profile,
             &receiving.events,
             &receiving.gate,
-        )
-        .await
-        {
-            Ok((connection, _peer)) => {
+        );
+        match tokio::time::timeout(OUTBOX_DIAL_TIMEOUT, dial).await {
+            Ok(Ok((connection, _peer))) => {
                 outbox.flush_on(&connection, device, trigger).await;
                 connection.close(0u32.into(), b"flushed");
             }
-            Err(error) => outbox.unreachable(&device, &error.to_string(), trigger),
+            Ok(Err(error)) => outbox.unreachable(&device, &error.to_string(), trigger),
+            Err(_) => outbox.unreachable(&device, "the device did not answer in time", trigger),
         }
     }
-    outbox.release(&device);
 }
+
+/// How long the outbox waits for a device to answer a dial. A device that is there answers in
+/// a few seconds, even through a relay. A dial to an address the device has left would
+/// otherwise hold up a flush that a fresh connection from it asked for.
+const OUTBOX_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Offers `paths` to a trusted peer, as transfer `id`, and waits for its answer. An accepted
 /// offer is fetched by the peer from this node's store. The send can be cancelled while it
@@ -2975,7 +3126,7 @@ async fn offer_files(
 ) -> Result<(), NodeError> {
     let store = receiving.store.clone().ok_or(NodeError::BlobsDisabled)?;
     let progress = receiving.events.clone();
-    let imported = match files::import(&store, &paths, |done, total| {
+    let imported = match files::import(&store, &paths, "send", |done, total| {
         let _ = progress.send(NodeEvent::ImportProgress { done, total });
     })
     .await
@@ -2992,14 +3143,6 @@ async fn offer_files(
             return Err(error);
         }
     };
-    store
-        .tags()
-        .set(
-            format!("send-{}", imported.root),
-            HashAndFormat::hash_seq(imported.root),
-        )
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
     // Sending the same content again makes it available again.
     let hashes = hashes_of_collection(&store, imported.root).await?;
     for hash in &hashes {
@@ -3646,15 +3789,7 @@ async fn create_share(
 ) -> Result<ShareTicket, NodeError> {
     let store = receiving.store.as_ref().ok_or(NodeError::BlobsDisabled)?;
     let database = receiving.database.as_ref().ok_or(NodeError::NoDatabase)?;
-    let imported = files::import(store, &paths, |_, _| {})
-        .await
-        .map_err(|error| NodeError::Files(error.to_string()))?;
-    store
-        .tags()
-        .set(
-            format!("share-{}", imported.root),
-            HashAndFormat::hash_seq(imported.root),
-        )
+    let imported = files::import(store, &paths, "share", |_, _| {})
         .await
         .map_err(|error| NodeError::Files(error.to_string()))?;
     // The root's links are the metadata and every file, all of which the share serves.

@@ -52,6 +52,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+        env:
+          # The node tests print these only for a test that fails.
+          RUST_LOG: groovy_core=debug,iroh_docs=debug,iroh_gossip=info,warn
 
       - name: Build
         run: cargo build --release --workspace
