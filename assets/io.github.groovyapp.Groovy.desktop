@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Groovy
+GenericName=File sharing and chat
+Comment=Share files and messages directly with the people you trust
+Exec=groovy %u
+Icon=io.github.groovyapp.Groovy
+Terminal=false
+StartupWMClass=io.github.groovyapp.Groovy
+Categories=Network;FileTransfer;InstantMessaging;
+Keywords=share;files;chat;peer;
+MimeType=x-scheme-handler/groovy;

@@ -12,7 +12,9 @@ pub fn set_enabled(enabled: bool) -> io::Result<()> {
             return Ok(());
         };
         if enabled {
-            let exe = std::env::current_exe()?;
+            let Some(exe) = crate::launch::program()? else {
+                return Ok(());
+            };
             let exe = exe
                 .display()
                 .to_string()

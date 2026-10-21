@@ -1,0 +1,48 @@
+name: Release
+
+# A tag like v0.1.0 builds the Linux AppImage and attaches it to a GitHub release for the tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux AppImage
+    # The oldest supported Ubuntu, so the AppImage runs on older distributions too: it links to
+    # the system's glibc and graphics libraries.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev libvulkan-dev libssl-dev libzstd-dev libdbus-1-dev pkg-config \
+            xvfb mesa-vulkan-drivers libfuse2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the AppImage
+        run: scripts/package-appimage.sh
+
+      # Starts the AppImage on a virtual X display with a software GPU. Not yet proven on
+      # GitHub's runners, so it reports without blocking the release.
+      - name: Smoke test
+        continue-on-error: true
+        run: xvfb-run -a scripts/smoke-test-linux.sh dist/*.AppImage
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.AppImage
+          generate_release_notes: true

@@ -8,7 +8,7 @@ default-members = ["crates/groovy"]
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/thenewkenya/groovy"
+repository = "https://github.com/groovyapp/groovy"
 
 [workspace.dependencies]
 # Pinned to a Zed commit rather than a crates.io release, for the latest GPUI.

@@ -8,7 +8,7 @@
 
 **A peer-to-peer platform for private file sharing, storage, and messaging, built on [iroh](https://iroh.computer).**
 
-[![CI](https://github.com/thenewkenya/groovy/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/thenewkenya/groovy/actions/workflows/ci.yml)
+[![CI](https://github.com/groovyapp/groovy/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/groovyapp/groovy/actions/workflows/ci.yml)
 [![Status](https://img.shields.io/badge/status-pre--alpha-red?style=flat-square)](#roadmap)
 [![Version](https://img.shields.io/badge/version-0.0.1-blue?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/tools/install)
@@ -117,7 +117,7 @@ To run your own relay, and point Groovy at it, see [docs/relay.md](docs/relay.md
 ### Build and run
 
 ```bash
-git clone https://github.com/thenewkenya/groovy.git
+git clone https://github.com/groovyapp/groovy.git
 cd groovy
 cargo build
 cargo run
@@ -212,7 +212,7 @@ crates/
 assets/
   icons/                 App icon: app-icon.svg (source), PNG sizes and app-icon.ico
   icons/tabler/          Tabler outline icons used by the UI (MIT, see its LICENSE)
-  groovy.desktop         Linux desktop entry
+  io.github.groovyapp.Groovy.desktop   Linux desktop entry (also handles groovy:// links)
 scripts/
   generate_icons.py      Regenerates the PNGs and .ico from app-icon.svg
 .github/workflows/       CI: fmt, clippy and release build on Windows and Linux
@@ -227,11 +227,13 @@ docs/
 
 ### Linux desktop entry
 
-To show the icon in your launcher and taskbar, install the desktop entry and icon:
+Packages for Linux are built with `scripts/package-appimage.sh` (an AppImage in `dist/`) and the Flatpak manifest in `packaging/flatpak/`. See `packaging/README.md`.
+
+To run a build from source with its icon in your launcher and taskbar, install the desktop entry and icon:
 
 ```bash
-install -Dm644 assets/groovy.desktop ~/.local/share/applications/groovy.desktop
-install -Dm644 assets/icons/app-icon.svg ~/.local/share/icons/hicolor/scalable/apps/groovy.svg
+install -Dm644 assets/io.github.groovyapp.Groovy.desktop ~/.local/share/applications/io.github.groovyapp.Groovy.desktop
+install -Dm644 assets/icons/app-icon.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.groovyapp.Groovy.svg
 ```
 
 The desktop entry runs `groovy`, so put `target/release/groovy` on your `PATH`. To force client-side decorations on a compositor that draws its own:
@@ -247,10 +249,10 @@ GROOVY_WINDOW_DECORATIONS=client cargo run
 The app name comes from the `name` field in `Cargo.toml`. `APP_NAME` in `src/main.rs` reads it at build time, and the Windows resource strings in `build.rs` use it too. To rename the app:
 
 1. Change `name` in `Cargo.toml`.
-2. Rename `assets/groovy.desktop` to match, and update its `Name`, `Exec`, `Icon` and `StartupWMClass` fields.
-3. Update the install paths in this README.
+2. Change `APP_ID` in `src/main.rs`, rename `assets/io.github.groovyapp.Groovy.desktop` and `packaging/linux/io.github.groovyapp.Groovy.metainfo.xml` to match, and update the desktop entry's `Name`, `Exec`, `Icon` and `StartupWMClass` fields.
+3. Update the install paths in this README and the packaging files.
 
-The Linux app ID is `APP_NAME` in lowercase, and must match the desktop entry's file name.
+The Linux app ID is `APP_ID`, and must match the desktop entry's file name. The data directory is named after `APP_NAME`.
 
 ### Changing the icon
 

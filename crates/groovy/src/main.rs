@@ -9,6 +9,7 @@ mod devices;
 mod files;
 mod folders;
 mod instance;
+mod launch;
 mod messages;
 mod node;
 mod notifications;
@@ -37,6 +38,9 @@ use workspace::Workspace;
 /// The package name from `Cargo.toml`, used for the window title, app ID and
 /// desktop entry matching.
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The app's ID on Linux: the window's app ID, and the name of its desktop entry and metadata.
+pub const APP_ID: &str = "io.github.groovyapp.Groovy";
 
 fn main() -> ExitCode {
     match run() {
