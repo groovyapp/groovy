@@ -130,7 +130,7 @@ async fn main() {
     let large_bytes = sizes.large_mb * CHUNK as u64;
     let store = open_store(&root.join("import-store")).await;
     let started = Instant::now();
-    files::import(&store, std::slice::from_ref(&large), |_, _| {})
+    files::import(&store, std::slice::from_ref(&large), "bench", |_, _| {})
         .await
         .expect("the large file imports");
     let elapsed = started.elapsed();
@@ -148,7 +148,7 @@ async fn main() {
     let small_total = sizes.small_files * sizes.small_bytes as u64;
     let store = open_store(&root.join("small-store")).await;
     let started = Instant::now();
-    let imported = files::import(&store, std::slice::from_ref(&small), |_, _| {})
+    let imported = files::import(&store, std::slice::from_ref(&small), "bench", |_, _| {})
         .await
         .expect("the small files import");
     let elapsed = started.elapsed();
