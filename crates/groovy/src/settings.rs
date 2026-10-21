@@ -406,9 +406,12 @@ fn link_row(on: bool, cx: &App) -> impl IntoElement {
             Variant::Secondary
         })
         .on_click(move |_, cx| {
-            if let Err(error) = crate::url_scheme::set_registered(!on) {
-                tracing::warn!(%error, "could not change the groovy:// handler");
-            }
+            crate::tray::update_background(cx, |settings| settings.open_links = !on);
+            std::thread::spawn(move || {
+                if let Err(error) = crate::url_scheme::sync(!on) {
+                    tracing::warn!(%error, "could not change the groovy:// handler");
+                }
+            });
             cx.refresh_windows();
         });
     div()
@@ -795,7 +798,7 @@ impl Render for SettingsScreen {
                 cx,
             ))
             .when(cfg!(target_os = "linux"), |d| {
-                d.child(link_row(crate::url_scheme::is_registered(), cx))
+                d.child(link_row(background.open_links, cx))
                 .child(background_row(
                     "Close to tray",
                     "Closing the window keeps Groovy running. Without a tray icon, closing quits as before.",

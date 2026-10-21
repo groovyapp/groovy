@@ -38,7 +38,9 @@ impl RenderOnce for Sidebar {
         let focus_handles: Vec<gpui::FocusHandle> = (0..Screen::ALL.len())
             .map(|index| {
                 window
-                    .use_keyed_state(("nav-focus", index), cx, |_, cx| cx.focus_handle())
+                    .use_keyed_state(("nav-focus", index), cx, |_, cx| {
+                        cx.focus_handle().tab_stop(true)
+                    })
                     .read(cx)
                     .clone()
             })

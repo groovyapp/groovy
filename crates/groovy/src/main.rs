@@ -92,6 +92,7 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
             quit_when_last_window_closes(cx);
 
             spawn_instance_poll(cx);
+            sync_link_handler(cx);
             // With a tray, `--background` (the login entry's flag) starts without a window.
             let tray_running = tray::start(cx);
             let background = std::env::args().any(|arg| arg == "--background");
@@ -105,9 +106,12 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Windows already exits when the last window closes; macOS and Linux don't. With a tray and
-/// close-to-tray on, closing the last window keeps Groovy running, and the node with it.
+/// Quits when the last window closes, unless the tray is up and close-to-tray is on: then
+/// Groovy keeps running, and the node with it.
 fn quit_when_last_window_closes(cx: &mut App) {
+    // GPUI quits on its own when the last window closes, except on macOS. That runs after this
+    // handler and would undo close-to-tray, so the decision is left to this handler alone.
+    cx.set_quit_mode(gpui::QuitMode::Explicit);
     cx.on_window_closed(|cx, _window_id| {
         let keeps_running =
             tray::running(cx) && cx.global::<data::AppData>().config.background.close_to_tray;
@@ -175,4 +179,18 @@ fn route_link(cx: &mut App, link: deeplink::Link) {
             .update(cx, |workspace, _, cx| workspace.open_link(link, cx))
             .ok();
     }
+}
+
+/// Keeps the `groovy://` registration in step with the setting. A run with the data directory
+/// overridden is a test or second copy, so it leaves the registration to the real one.
+fn sync_link_handler(cx: &mut App) {
+    if std::env::var_os(groovy_core::override_env_var(APP_NAME)).is_some() {
+        return;
+    }
+    let on = cx.global::<data::AppData>().config.background.open_links;
+    std::thread::spawn(move || {
+        if let Err(error) = url_scheme::sync(on) {
+            tracing::warn!(%error, "could not register for groovy:// links");
+        }
+    });
 }
