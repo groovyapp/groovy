@@ -13,7 +13,10 @@ use iroh::endpoint::presets::Minimal;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh_blobs::Hash;
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a test waits for a node to stop, or for one step. A clean stop flushes the stores,
+/// which takes several seconds on a slow CI disk; a node that has not stopped still holds its
+/// files, and a test that starts it again on the same directory would wait on them.
+const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Sends the nodes' logs to each test's captured output, which is shown only for a test that
 /// fails. `RUST_LOG` chooses what is logged; without it nothing is. CI sets it, so a failure
@@ -510,7 +513,9 @@ async fn a_contact_that_drops_off_is_unreachable_and_reachable_again_when_it_ret
 
     // Bob goes away: the check fails, and does not hang.
     assert!(bob.shutdown(TIMEOUT));
-    let down = tokio::time::timeout(TIMEOUT, alice.check_presence(first_address)).await;
+    // Giving up is fine too: the check only must not hang.
+    let down =
+        tokio::time::timeout(Duration::from_secs(5), alice.check_presence(first_address)).await;
     assert!(
         !matches!(down, Ok(Ok(_))),
         "an offline contact answered: {down:?}"
