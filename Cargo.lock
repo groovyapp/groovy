@@ -3140,7 +3140,7 @@ dependencies = [
 
 [[package]]
 name = "groovy"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "groovy-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3168,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "groovy-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "age",
  "blake3",
