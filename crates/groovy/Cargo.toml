@@ -13,6 +13,7 @@ gpui_platform.workspace = true
 groovy-core = { path = "../groovy-core" }
 tracing = "0.1"
 notify-rust = "4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
@@ -24,3 +25,7 @@ winresource = "0.1"
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
+
+# The tray icon speaks the freedesktop StatusNotifierItem protocol over D-Bus.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }

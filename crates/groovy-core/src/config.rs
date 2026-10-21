@@ -46,6 +46,30 @@ pub enum ConfigError {
     Serialize(#[source] toml::ser::Error),
 }
 
+/// What happens when the window closes, and whether Groovy starts with the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Background {
+    /// Closing the last window keeps Groovy running in the tray. Without a tray it quits.
+    #[serde(default = "close_to_tray_default")]
+    pub close_to_tray: bool,
+    /// Starts Groovy when the session starts, in the background.
+    #[serde(default)]
+    pub start_on_login: bool,
+}
+
+fn close_to_tray_default() -> bool {
+    true
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        Self {
+            close_to_tray: close_to_tray_default(),
+            start_on_login: false,
+        }
+    }
+}
+
 /// How the user wants to be told about messages and transfers while the window is away.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notifications {
@@ -147,6 +171,9 @@ pub struct Config {
     /// Missing from older files, which get the default: notifications on, content shown.
     #[serde(default)]
     pub notifications: Notifications,
+    /// Missing from older files, which get the default: close to the tray, do not start on login.
+    #[serde(default)]
+    pub background: Background,
     /// Keys this build does not know about. They are written back unchanged.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -160,6 +187,7 @@ impl Default for Config {
             discovery: Discovery::default(),
             relay: RelaySetting::default(),
             notifications: Notifications::default(),
+            background: Background::default(),
             unknown: toml::Table::new(),
         }
     }

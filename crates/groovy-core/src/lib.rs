@@ -35,8 +35,8 @@ pub mod user;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
 pub use config::{
-    Appearance, CURRENT_VERSION, Config, ConfigError, Discovery, Notifications, RelaySetting,
-    parse_relay_urls,
+    Appearance, Background, CURRENT_VERSION, Config, ConfigError, Discovery, Notifications,
+    RelaySetting, parse_relay_urls,
 };
 pub use contacts::{Contact, ContactGate, Trust};
 pub use db::{Database, DbError, SCHEMA_VERSION};

@@ -371,6 +371,43 @@ fn relay_row(
 }
 
 /// A switch for one way of finding peers. Takes effect the next time Groovy starts.
+/// A row with an On/Off switch for one background setting, saved as soon as it changes.
+fn background_row(
+    label: &'static str,
+    detail: &'static str,
+    id: &'static str,
+    on: bool,
+    set: fn(&mut groovy_core::Background, bool),
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let button = Button::new(id, if on { "On" } else { "Off" })
+        .variant(if on {
+            Variant::Primary
+        } else {
+            Variant::Secondary
+        })
+        .on_click(move |_, cx| {
+            crate::tray::update_background(cx, |settings| set(settings, !on));
+        });
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(label))
+                .child(div().text_xs().text_color(theme.text_muted).child(detail)),
+        )
+        .child(button)
+}
+
 /// A row with an On/Off switch for one notification setting, saved as soon as it changes.
 fn notification_row(
     label: &'static str,
@@ -576,6 +613,7 @@ impl Render for SettingsScreen {
         let current = data.config.appearance;
         let discovery = data.config.discovery;
         let notifications = data.config.notifications.clone();
+        let background = data.config.background.clone();
         let relay = data.config.relay.clone();
         let data_dir: PathBuf = data.dir.root().to_path_buf();
         let logs_dir: PathBuf = data.dir.logs_dir();
@@ -660,6 +698,30 @@ impl Render for SettingsScreen {
                 |settings, on| settings.hide_content = on,
                 cx,
             ))
+            .child(divider(cx))
+            .child(section_heading(
+                "Background",
+                "Keep Groovy running in the tray when its window closes, so files and messages keep arriving.",
+                cx,
+            ))
+            .when(cfg!(target_os = "linux"), |d| {
+                d.child(background_row(
+                    "Close to tray",
+                    "Closing the window keeps Groovy running. Without a tray icon, closing quits as before.",
+                    "settings-close-to-tray",
+                    background.close_to_tray,
+                    |settings, on| settings.close_to_tray = on,
+                    cx,
+                ))
+                .child(background_row(
+                    "Start when I sign in",
+                    "Start Groovy in the background when the session starts, with its tray icon.",
+                    "settings-start-on-login",
+                    background.start_on_login,
+                    |settings, on| settings.start_on_login = on,
+                    cx,
+                ))
+            })
             .child(divider(cx))
             .child(section_heading(
                 "Network",

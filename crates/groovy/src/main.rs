@@ -1,6 +1,7 @@
 // Release builds are GUI-only; debug builds keep a console for logs (same as Zed).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod backup;
 mod data;
 mod devices;
@@ -16,6 +17,7 @@ mod settings_profile;
 mod theme;
 mod tickets;
 mod title_bar;
+mod tray;
 mod ui;
 mod window_frame;
 mod workspace;
@@ -80,19 +82,48 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
             }
             quit_when_last_window_closes(cx);
 
-            // Failing to open the first window leaves nothing to show, so it stays a hard failure.
-            Workspace::open_window(cx, last_screen, onboarded).expect("failed to open main window");
-            cx.activate(true);
+            // With a tray, `--background` (the login entry's flag) starts without a window.
+            let tray_running = tray::start(cx);
+            let background = std::env::args().any(|arg| arg == "--background");
+            if !(background && tray_running) {
+                // Failing to open the first window leaves nothing to show, so it stays a hard failure.
+                Workspace::open_window(cx, last_screen, onboarded)
+                    .expect("failed to open main window");
+                cx.activate(true);
+            }
         });
     Ok(())
 }
 
-/// Windows already exits when the last window closes; macOS and Linux don't.
+/// Windows already exits when the last window closes; macOS and Linux don't. With a tray and
+/// close-to-tray on, closing the last window keeps Groovy running, and the node with it.
 fn quit_when_last_window_closes(cx: &mut App) {
     cx.on_window_closed(|cx, _window_id| {
-        if cx.windows().is_empty() {
+        let keeps_running =
+            tray::running(cx) && cx.global::<data::AppData>().config.background.close_to_tray;
+        if cx.windows().is_empty() && !keeps_running {
             cx.quit();
         }
     })
     .detach();
+}
+
+/// Brings the main window forward, or opens it if it was closed.
+pub fn show_main_window(cx: &mut App) {
+    match cx.windows().first().copied() {
+        Some(window) => {
+            window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        }
+        None => {
+            let database = cx.global::<data::AppData>().database.clone();
+            let screen = workspace::Screen::load(&database);
+            let onboarded = onboarding::is_completed(&database);
+            if let Err(error) = Workspace::open_window(cx, screen, onboarded) {
+                tracing::error!(%error, "could not open the main window");
+            }
+        }
+    }
+    cx.activate(true);
 }
