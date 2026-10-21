@@ -88,3 +88,7 @@ Search is a full-text index (SQLite FTS5) over the body of every direct and grou
 Deleting is local. A message deleted here is removed with its attachment records and any delivery still waiting for it, and the contact keeps its copy. Clearing a conversation or a group removes every message in it from this device. Files already fetched are kept until collection releases them.
 
 The benchmark is `cargo run --release -p groovy-core --example search_bench`. It writes 100,000 messages and times searches: the slowest of five runs was 50 ms against a 200 ms target.
+
+## Access to a shared folder
+
+Access is set by each invitation: a read-only ticket, or one that lets the member edit. It cannot be changed afterwards. iroh-docs gives an editor the folder's write capability, and a capability once given cannot be taken back. To change someone's access, share a new folder and invite them with the access they should have.
