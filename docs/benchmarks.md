@@ -69,3 +69,17 @@ Result at 5 GiB, with the release CLI: the receive had 470,941,782 bytes when it
 An earlier version of this section said the 5 GiB case failed with `encode error` because of the unclean stop. That was wrong. The cause was garbage collection: a transfer that took longer than the collection interval (60 s) had its partly downloaded files removed, and failed when it was saved. A plain 2 GiB transfer with no kill hit it too. A debug build is slow enough to be affected, and a release build usually finishes first. A transfer now takes out its tag when it starts, and protects every file in it before any data arrives.
 
 The check does not cover a dropped network connection.
+
+## Scrolling a long conversation
+
+`cargo run -p groovy-core --example fill_conversation -- <data dir> <own endpoint id> 10000` fills a database with a 10,000-message conversation. The chat loads the newest 100 messages, and the page before the oldest one shown each time the list reaches the top.
+
+Measured on the release build (Intel UHD 620 laptop, X11), scrolling up continuously for about 30 seconds, with the time from the start of a frame's render to the end of its paint:
+
+| Messages loaded | Frames | Median | 95th percentile | Slowest |
+| --- | --- | --- | --- | --- |
+| 0 to 999 | 218 | 16.5 ms | 19.4 ms | 20.9 ms |
+| 1,000 to 2,999 | 444 | 16.4 ms | 19.1 ms | 48.5 ms |
+| 3,000 to 5,999 | 259 | 16.3 ms | 18.9 ms | 22.4 ms |
+
+The cost of a frame does not grow with the conversation: the list draws only the messages on screen. An idle frame of the same screen, with no conversation open, costs about 6 to 13 ms, so most of a frame is the screen around the chat. A debug build is about five times slower.
