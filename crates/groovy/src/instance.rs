@@ -117,11 +117,11 @@ pub fn claim(_socket: &Path, args: &[String]) -> std::io::Result<Claim> {
     Ok(Claim::First)
 }
 
-#[cfg(test)]
+/// The socket, and the lines sent over it, are Unix only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn a_launch_sends_show_and_any_links_it_was_given() {
         let args = vec![
@@ -132,7 +132,6 @@ mod tests {
         assert_eq!(messages(&args), ["show", "link groovy://groovygroup1abc"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_second_launch_hands_its_link_to_the_first_and_ends() {
         let socket = std::env::temp_dir().join(format!("groovy-test-{}.sock", std::process::id()));
