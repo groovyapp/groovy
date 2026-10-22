@@ -331,3 +331,94 @@ mod tests {
         assert_ne!(avatar_hash(b"png"), avatar_hash(b"jpg"));
     }
 }
+
+#[cfg(test)]
+mod decoding_tests {
+    //! Peers send these bytes, so any of them can be arbitrary. Decoding must return an error or
+    //! a value for every input, and never panic. This runs a fixed, seeded set of inputs: random
+    //! bytes, and valid messages with bytes changed. It is a stand-in for a fuzzer, which needs
+    //! nightly Rust; the same inputs can be run under one later.
+    use super::*;
+    use crate::groups::{GroupEnvelope, GroupPage, ReceivedPage};
+    use crate::membership::{KeyRecord, Record};
+    use crate::messages::WireMessage;
+    use crate::user::DeviceCert;
+
+    /// A small seeded generator, so a failure can be run again.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+            let len = (self.next() as usize) % (max_len + 1);
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// Decodes `bytes` as every type a peer can send. Each result is discarded: the test is only
+    /// that none of them panics.
+    fn decode_everything(bytes: &[u8]) {
+        let _ = postcard::from_bytes::<Request>(bytes);
+        let _ = postcard::from_bytes::<Reply>(bytes);
+        let _ = postcard::from_bytes::<Hello>(bytes);
+        let _ = postcard::from_bytes::<FileOffer>(bytes);
+        let _ = postcard::from_bytes::<WireMessage>(bytes);
+        let _ = postcard::from_bytes::<GroupEnvelope>(bytes);
+        let _ = postcard::from_bytes::<GroupPage>(bytes);
+        let _ = postcard::from_bytes::<ReceivedPage>(bytes);
+        let _ = postcard::from_bytes::<KeyRecord>(bytes);
+        let _ = postcard::from_bytes::<Record>(bytes);
+        let _ = postcard::from_bytes::<DeviceCert>(bytes);
+    }
+
+    #[test]
+    fn random_bytes_never_panic_a_decoder() {
+        let mut rng = Lcg(0x5eed);
+        for _ in 0..20_000 {
+            decode_everything(&rng.bytes(2048));
+        }
+    }
+
+    #[test]
+    fn changed_bytes_of_valid_messages_never_panic_a_decoder() {
+        let valid = [
+            postcard::to_stdvec(&Request::Ping).unwrap(),
+            postcard::to_stdvec(&Request::GroupReceived {
+                group: [3; 32],
+                after: 7,
+            })
+            .unwrap(),
+            postcard::to_stdvec(&Request::GroupHistory {
+                group: [3; 32],
+                after: Some((9, [4; 16])),
+            })
+            .unwrap(),
+        ];
+        let mut rng = Lcg(0xfeed);
+        for original in &valid {
+            for _ in 0..5_000 {
+                let mut bytes = original.clone();
+                // Change, cut or lengthen the bytes at random.
+                match rng.next() % 3 {
+                    0 => {
+                        let at = (rng.next() as usize) % bytes.len();
+                        bytes[at] = rng.next() as u8;
+                    }
+                    1 => {
+                        let keep = (rng.next() as usize) % (bytes.len() + 1);
+                        bytes.truncate(keep);
+                    }
+                    _ => bytes.extend(rng.bytes(64)),
+                }
+                decode_everything(&bytes);
+            }
+        }
+    }
+}
