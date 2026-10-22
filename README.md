@@ -9,14 +9,14 @@
 **A peer-to-peer platform for private file sharing, storage, and messaging, built on [iroh](https://iroh.computer).**
 
 [![CI](https://github.com/groovyapp/groovy/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/groovyapp/groovy/actions/workflows/ci.yml)
-[![Status](https://img.shields.io/badge/status-pre--alpha-red?style=flat-square)](#roadmap)
-[![Version](https://img.shields.io/badge/version-0.0.1-blue?style=flat-square)](Cargo.toml)
+[![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](#roadmap)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue?style=flat-square)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-1.99%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/tools/install)
 [![Edition](https://img.shields.io/badge/edition-2024-orange?style=flat-square)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 [![Built on iroh](https://img.shields.io/badge/built%20on-iroh%201.3-7c3aed?style=flat-square)](https://iroh.computer)
 [![License](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-lightgrey?style=flat-square)](#license)
 
-[Overview](#overview) · [Features](#features) · [Architecture](#architecture) · [Getting started](#getting-started) · [Roadmap](#roadmap) · [Contributing](#contributing)
+[Overview](#overview) · [Features](#features) · [Install](#install) · [Getting started](#getting-started) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 </div>
 
@@ -35,22 +35,26 @@ The goals are:
 - **Integrity.** Content is addressed by hash, so every received byte can be verified.
 - **Simplicity.** One tool covers sharing, storage, and messaging.
 
-> **Project status:** Groovy is in **pre-alpha**. The repository currently contains the project scaffold. The features below are design targets and are not yet implemented. See the [Roadmap](#roadmap).
+> **Project status:** Groovy is in **alpha**. The first release, [0.1.0](CHANGELOG.md), works between people who trust each other. Local data is protected only by your operating system's disk encryption, so turn that on. The [threat model](docs/threat-model.md) says what Groovy does and does not protect. See the [Roadmap](#roadmap) for what is still open.
 
 ## Features
 
-| Capability | How it is built | Status |
+| Capability | How it works | Status |
 | --- | --- | --- |
-| **Peer-to-peer file sharing** | Content-addressed transfer with [`iroh-blobs`](https://docs.rs/iroh-blobs) over direct QUIC connections | 🚧 Planned |
-| **Storage and replication** | Blobs held by peers, with replication policy implemented in Groovy | 🚧 Planned |
-| **Direct messaging** | Custom ALPN protocol on iroh connections | 🚧 Planned |
-| **Group messaging** | Topic-based broadcast with [`iroh-gossip`](https://docs.rs/iroh-gossip) | 🚧 Planned |
-| **Shared state** | Multi-writer CRDT documents with [`iroh-docs`](https://docs.rs/iroh-docs) | 🚧 Planned |
-| **Identity** | Ed25519 endpoint identities, used for both authentication and encryption | 🚧 Planned |
-| **Peer discovery** | iroh address lookup via DNS, DHT, and local network (mDNS) | 🚧 Planned |
-| **Connection sharing** | Shareable tickets via [`iroh-tickets`](https://docs.rs/iroh-tickets) | 🚧 Planned |
-| **NAT traversal** | Direct hole-punched paths, with relay fallback provided by iroh | 🚧 Planned |
-| **Cross-platform clients** | Command-line and desktop clients on a shared Rust core | 🚧 Planned |
+| **File sharing** | Send files and folders to a peer, with verified and resumable downloads, a transfer queue, and share links for one-off sharing | ✅ Built |
+| **Shared folders** | Folders synced between members, with a choice of which devices keep a full copy and conflict copies when files are edited apart | ✅ Built |
+| **Storage** | Replica status for each folder, storage quotas, and garbage collection that keeps what folders and messages need | ✅ Built |
+| **Direct messaging** | Messages between contacts, with delivery states, an outbox that retries offline delivery, and attachments | ✅ Built |
+| **Group chat** | Groups over gossip, with signed membership, admins and roles, and removal with a new group key | ✅ Built |
+| **Search** | Search over your own message history, kept on the device | ✅ Built |
+| **Identity and devices** | An Ed25519 identity, an encrypted backup, linking several devices to one user, and revoking a device | ✅ Built |
+| **Contacts and pairing** | Pairing with a six-digit code both sides check, trust, blocking, and presence | ✅ Built |
+| **Connectivity** | Address lookup that is private by default, self-hosted relays, and reconnection after network changes | ✅ Built |
+| **Desktop app** | Notifications, a system tray with background mode, `groovy://` links, and keyboard navigation | ✅ Built |
+| **Command line** | `groovy-cli` to send and receive files | ✅ Built |
+| **Linux** | AppImage with launcher integration; Flatpak manifest, not yet built | 🟡 Partly |
+| **Windows** | Unsigned zip, without an installer or link registration | 🟡 Partly |
+| **macOS** | Not packaged yet | ⬜ Not started |
 
 ## Architecture
 
@@ -72,7 +76,7 @@ Groovy is a layered system. The lower layers come from iroh, and Groovy builds t
 
 | Layer | Responsibility | Provided by |
 | --- | --- | --- |
-| **Infrastructure** | Relay fallback for connections that cannot go direct, and address lookup for finding peers. | iroh (self-hosted relays planned for Groovy) |
+| **Infrastructure** | Relay fallback for connections that cannot go direct, and address lookup for finding peers. | iroh, with Groovy's own relay settings |
 | **Transport** | Authenticated, end-to-end encrypted QUIC connections. Incoming connections are routed to protocol handlers by ALPN. | iroh |
 | **Data protocols** | Content transfer, shared documents, and broadcast messaging. | iroh-blobs, iroh-docs, iroh-gossip |
 | **Services** | Groovy's file sharing, storage and replication policy, and messaging rules. | Groovy |
@@ -91,7 +95,6 @@ These follow from [iroh's security model](https://docs.iroh.computer/concepts/se
 - **Relays forward ciphertext only.** A relay cannot read file contents, file names, or message contents. It can see the source and destination IP addresses, connection times, and the amount of data relayed, along with which device identities talk to each other.
 - **Direct connections reveal IP addresses.** When two peers connect directly, they exchange their public IP addresses. Internal IP addresses are not published by default.
 - **Public relays have no access control.** Any application that knows a public relay's URL can connect to it. n0 does not recommend public relays for production systems.
-- **Tor is supported as a custom transport,** but both endpoints must support the same transport, so both need Tor configured.
 
 ### How peers find each other
 
@@ -105,16 +108,26 @@ Tickets carry the addresses at the time they are made, whatever the settings abo
 
 To run your own relay, and point Groovy at it, see [docs/relay.md](docs/relay.md).
 
+## Install
+
+Download the latest release from the [releases page](https://github.com/groovyapp/groovy/releases):
+
+- **Linux:** `Groovy-<version>-x86_64.AppImage`. Make it executable (`chmod +x`) and run it. The first run adds Groovy to your app launcher and registers `groovy://` links.
+- **Windows:** `Groovy-<version>-windows-x86_64.zip`. Unzip it and run `groovy.exe`. Windows will warn that the app is from an unknown publisher, because releases are not code signed yet.
+- **macOS:** not packaged yet.
+
+Releases do not yet carry signatures, so there is nothing to check a download against. Download only from the releases page of this repository.
+
 ## Getting started
 
 ### Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install) **1.99.0 or newer**, with edition 2024 support. The pinned GPUI needs a recent toolchain: its `gpui_util` crate uses `slice_as_array`, which is not stable on 1.92. CI checks this exact version. iroh 1.3 alone needs only 1.91.
-- Windows or Linux. CI builds both.
+- Windows or Linux. CI builds and tests both.
 - `git`, because GPUI is pulled from the [Zed repository](https://github.com/zed-industries/zed) at a pinned commit.
 - On Linux, the system libraries listed in [CI](.github/workflows/ci.yml) (ALSA, fontconfig, Wayland, X11/xcb, xkbcommon, Vulkan, OpenSSL, zstd, D-Bus and pkg-config).
 
-### Build and run
+### Build from source
 
 ```bash
 git clone https://github.com/groovyapp/groovy.git
@@ -154,20 +167,9 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-### Planned dependencies
+### Dependencies
 
-The following crates are the intended dependencies. They are not yet in `Cargo.toml`; they will be added in Phase 1.
-
-| Crate | Version | Purpose |
-| --- | --- | --- |
-| [`iroh`](https://crates.io/crates/iroh) | 1.3 | Endpoints, connections, relays, address lookup |
-| [`iroh-blobs`](https://crates.io/crates/iroh-blobs) | 0.103 | Content-addressed file transfer and storage |
-| [`iroh-docs`](https://crates.io/crates/iroh-docs) | 0.101 | Multi-writer shared documents |
-| [`iroh-gossip`](https://crates.io/crates/iroh-gossip) | 0.101 | Topic-based group messaging |
-| [`iroh-tickets`](https://crates.io/crates/iroh-tickets) | 1.0 | Shareable connection tickets |
-| [`iroh-relay`](https://crates.io/crates/iroh-relay) | 1.3 | Self-hosted relay server |
-
-> **Note:** iroh's protocol crates (`iroh-blobs`, `iroh-docs`, `iroh-gossip`) are versioned independently of `iroh`. Pin exact versions in `Cargo.toml` once they are added.
+The networking comes from [iroh](https://iroh.computer): `iroh` for endpoints, relays and address lookup, and the `iroh-blobs`, `iroh-docs` and `iroh-gossip` protocol crates. The exact versions are pinned in `Cargo.toml` and in `Cargo.lock`. Groovy's dependency licences and advisories are checked by `cargo deny check`, configured in `deny.toml`.
 
 ## Project layout
 
@@ -215,14 +217,18 @@ assets/
   io.github.groovyapp.Groovy.desktop   Linux desktop entry (also handles groovy:// links)
 scripts/
   generate_icons.py      Regenerates the PNGs and .ico from app-icon.svg
-.github/workflows/       CI: fmt, clippy and release build on Windows and Linux
+.github/                 CI and release workflows, issue and pull request templates
+CHANGELOG.md             Release history
+CONTRIBUTING.md          How to contribute, and the rules for code that touches data
+SECURITY.md              How to report a security problem privately
 docs/
   decisions/             Architecture decision records (0001: SQLite for local state; 0002: encryption at rest relies on the OS)
   benchmarks.md          How to run the benchmarks, and the results
-  storage.md             Storage model: shared folders, replication, garbage collection (proposal)
-  identity.md            One user across several devices, linking and revoking (proposal)
+  storage.md             Storage model: shared folders, replication, garbage collection
+  identity.md            One user across several devices, linking and revoking
   protocol.md            Groovy protocol: handshake, trust, pairing, presence, files, shares
   relay.md               Running your own relay
+  threat-model.md        What Groovy protects, against whom, and what it does not protect
 ```
 
 ### Linux desktop entry
@@ -275,12 +281,14 @@ GPUI is pinned to a commit of [Zed](https://github.com/zed-industries/zed) in `C
 | Phase | Milestone | Status |
 | --- | --- | --- |
 | **0** | Project scaffold, build, and tooling | ✅ Complete |
-| **1** | Identity and endpoints: persistent keys, endpoint creation, ticket exchange | ⬜ Not started |
-| **2** | Connectivity: custom ALPN protocol with `Router`, self-hosted relay, discovery configuration | ⬜ Not started |
-| **3** | File sharing: `iroh-blobs` integration, CLI send and receive with verified transfer | ⬜ Not started |
-| **4** | Storage and replication: placement and replication policy on top of blobs | ⬜ Not started |
-| **5** | Messaging: direct messages over a custom ALPN, group chat over `iroh-gossip`, shared state over `iroh-docs` | ⬜ Not started |
-| **6** | Desktop client and public alpha | ⬜ Not started |
+| **1** | Identity and endpoints: persistent keys, endpoint creation, ticket exchange | ✅ Complete |
+| **2** | Connectivity: the Groovy protocol, relays, discovery settings, pairing and presence | ✅ Complete |
+| **3** | File sharing: verified transfers, shares, and the CLI | ✅ Complete |
+| **4** | Storage and replication: shared folders, replica status, and garbage collection | ✅ Complete |
+| **5** | Messaging: direct messages, group chat, attachments, and search | ✅ Complete |
+| **6** | Desktop release and public alpha: packaging, updates, security review, and the alpha checklist | 🟡 In progress |
+
+Phase 6 is open on these issues: [Windows installer](https://github.com/groovyapp/groovy/issues/53), [macOS](https://github.com/groovyapp/groovy/issues/54), [update checks](https://github.com/groovyapp/groovy/issues/55), [security review](https://github.com/groovyapp/groovy/issues/57) and the [alpha checklist](https://github.com/groovyapp/groovy/issues/58). Release history is in the [changelog](CHANGELOG.md).
 
 ## Security
 
@@ -288,16 +296,11 @@ Groovy handles sensitive data, so security is a core requirement. Please **do no
 
 Groovy depends on iroh for transport security. Vulnerabilities in iroh itself should be reported to the iroh maintainers, n0 computer, through their channels.
 
-The [threat model](docs/threat-model.md) says what Groovy protects, against whom, and what it does not protect. The [protocol design](docs/protocol.md) describes the messages between devices. This is still an alpha: **do not use Groovy to protect data you cannot afford to lose or expose.**
+Report security problems privately, through [SECURITY.md](SECURITY.md). The [threat model](docs/threat-model.md) says what Groovy protects, against whom, and what it does not protect. The [protocol design](docs/protocol.md) describes the messages between devices. This is still an alpha: **do not use Groovy to protect data you cannot afford to lose or expose.**
 
 ## Contributing
 
-Contributions are welcome once the core architecture is in place. Until then, the most helpful contributions are design discussion, and issues describing use cases, threat scenarios, or requirements.
-
-1. Fork the repository and create a feature branch.
-2. Make your change, with tests where applicable.
-3. Ensure `cargo fmt --check`, `cargo test` and `cargo clippy --all-targets -- -D warnings` pass.
-4. Open a pull request describing the change and its motivation.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: it covers the checks to run, the rules for code that touches data, and how releases are cut. Use the issue templates for bugs and ideas.
 
 ## License
 
