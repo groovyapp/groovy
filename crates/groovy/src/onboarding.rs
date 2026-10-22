@@ -190,7 +190,7 @@ impl Render for Onboarding {
                          No central server holds your data.",
                     ))
                     .child(paragraph(
-                        "Groovy is pre-alpha. Don't rely on it to protect data you can't afford to lose.",
+                        "Groovy is in alpha. Don't rely on it to protect data you can't afford to lose.",
                     ))
                     .child(
                         div()
