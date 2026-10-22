@@ -123,12 +123,6 @@ Each side keeps its copy with a delivery state: `sending` (queued, not yet writt
 
 A message is queued for each device that must have it: the contact's own endpoint, and each of the contact's linked devices that has not been revoked. A queued message is retried when the device connects to this node, at startup, and every minute as its retry time comes. Retries back off from 30 seconds to 15 minutes. A device is dialed at the address it last connected from, and by its id when none is known. The state becomes `delivered` as soon as any one device acknowledges it.
 
-## Not yet specified
-
-### Attachments
-
-A message can carry up to eight attachments. Each names a file, gives the root of the collection holding it, its size, and an optional preview: a small PNG for an image, at most 32 KiB, so a preview travels inside the message. The file itself is not sent with the message. The recipient fetches it on request, as a transfer from the sender, which shows progress and can be paused like any other receive. The sender keeps the collection tagged while the message refers to it.
-
 ## Group chat
 
 A group has a random 32-byte id, and its gossip topic is that id. A group message is a `GroupEnvelope`: version, group, a random id, the author's endpoint id, timestamp, body, optional `reply_to`, and a signature by the author's key over every other field. A member accepts a message only if its signature verifies and its author is the member or a trusted contact. A relayed message therefore still shows its real author.
@@ -149,8 +143,10 @@ A member asks for the current key with `Request::GroupKey`, and only a current m
 
 Known limits: a member still stores a message from a trusted contact whom it knows was removed, if the message reaches it. Changing the document's authors and the mutual trust between members are not checked beyond the signatures. Roles can be changed by any admin, not only the founder.
 
-Groups are not yet on screen (#47).
+## Attachments
 
-## Not yet specified
+A message can carry up to eight attachments. Each names a file, gives the root of the collection holding it, its size, and an optional preview: a small PNG for an image, at most 32 KiB, so a preview travels inside the message. The file itself is not sent with the message. The recipient fetches it on request, as a transfer from the sender, which shows progress and can be paused like any other receive. The sender keeps the collection tagged while the message refers to it.
 
-Attachments (#45) and search (#46) are not built. Each will get a section here when it is.
+## Search
+
+Search is local. Each device indexes the messages it has, and nothing about a search is sent to a peer.

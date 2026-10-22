@@ -288,7 +288,7 @@ Groovy handles sensitive data, so security is a core requirement. Please **do no
 
 Groovy depends on iroh for transport security. Vulnerabilities in iroh itself should be reported to the iroh maintainers, n0 computer, through their channels.
 
-The project will publish its threat model and protocol design before the first public release. Until then, **do not use Groovy to protect data you cannot afford to lose or expose.**
+The [threat model](docs/threat-model.md) says what Groovy protects, against whom, and what it does not protect. The [protocol design](docs/protocol.md) describes the messages between devices. This is still an alpha: **do not use Groovy to protect data you cannot afford to lose or expose.**
 
 ## Contributing
 
