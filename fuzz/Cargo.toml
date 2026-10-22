@@ -1,0 +1,23 @@
+[package]
+name = "groovy-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+groovy-core = { path = "../crates/groovy-core" }
+libfuzzer-sys = "0.4"
+postcard = "1"
+
+# Not part of the main workspace: it needs nightly Rust to run.
+[workspace]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
