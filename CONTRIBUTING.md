@@ -74,3 +74,14 @@ Releases are tags of the form `vX.Y.Z` on `master`. The release workflow in `.gi
 ## Licence
 
 Groovy is dual licensed under MIT and Apache-2.0. By contributing, you agree that your contribution is licensed the same way, as described in the README.
+
+## Fuzzing
+
+The decoders that read peer data are fuzzed with [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html). It needs nightly Rust, and it lives in `fuzz/`, outside the main workspace:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run decode -- -max_total_time=600
+```
+
+A crash is written to `fuzz/artifacts/`. Fix the bug, and add the input as a regression test where the decoder is tested. Don't commit the corpus or the artifacts.

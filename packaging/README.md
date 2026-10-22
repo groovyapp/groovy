@@ -33,17 +33,27 @@ it to the GitHub release.
 
 ### Flatpak
 
-`packaging/flatpak/io.github.groovyapp.Groovy.yml` is a manifest for a Flatpak build. **It has
-not been built yet**: flatpak-builder was not available where it was written. Before building,
-generate the offline sources for the Rust dependencies:
+`packaging/flatpak/io.github.groovyapp.Groovy.yml` builds the app against the Freedesktop runtime 25.08 and its Rust extension. It builds offline, from the sources listed in `packaging/flatpak/cargo-sources.json`, which must be regenerated whenever `Cargo.lock` changes:
 
 ```bash
-python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
-flatpak-builder --user --install --force-clean target/flatpak packaging/flatpak/io.github.groovyapp.Groovy.yml
+scripts/generate-flatpak-sources.sh
+flatpak install --user flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 org.freedesktop.Sdk.Extension.rust-stable//25.08
+flatpak-builder --user --force-clean --disable-rofiles-fuse target/flatpak-build packaging/flatpak/io.github.groovyapp.Groovy.yml
 ```
 
-`flatpak-cargo-generator.py` is in
-[flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo).
+The generator script needs Python with `aiohttp`, `PyYAML` and `tomlkit`. It pins Flathub's `flatpak-cargo-generator.py` by hash, and applies two fixes to it: Zed's lint test fixture has a crate named `gpui` that would replace the real one, and cargo's config is named `config.toml`.
+
+The build was tested on this machine, with flatpak-builder 1.4 and the 25.08 runtime. The app starts in the sandbox, selects the GPU and uses X11. Under a Wayland session it hasn't been run yet.
+
+The build runs `cargo build` with `--offline` but not `--locked`. The generated vendor manifests don't match `Cargo.lock` exactly, so cargo may adjust the lock file inside the build. The sources are still exactly those in `Cargo.lock`.
+
+To install a built copy locally, export it to a repository and install from there:
+
+```bash
+flatpak build-export target/flatpak-repo target/flatpak-build
+flatpak remote-add --user --no-gpg-verify groovy-local target/flatpak-repo
+flatpak install --user groovy-local io.github.groovyapp.Groovy
+```
 
 Inside a Flatpak, links are handled by the package's own desktop entry, and Groovy does not write
 a login entry: starting with the session will need the background portal.
