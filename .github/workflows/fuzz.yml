@@ -1,0 +1,57 @@
+name: Fuzz
+
+# Runs the decoder fuzzer on a schedule and on demand. It is not part of the pull request checks:
+# it needs nightly Rust and takes longer than they should. A crash fails the run, and the input
+# that caused it is uploaded as an artifact.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  decode:
+    name: Decoders
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      # The corpus carries over between runs, so each week explores further than the last.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz for five minutes
+        working-directory: fuzz
+        run: cargo fuzz run decode -- -max_total_time=300
+
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
