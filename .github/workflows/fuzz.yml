@@ -46,7 +46,8 @@ jobs:
 
       - name: Fuzz for five minutes
         working-directory: fuzz
-        run: cargo fuzz run decode -- -max_total_time=300
+        # The prebuilt cargo-fuzz defaults to the musl target, which the sanitizer cannot use here.
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu decode -- -max_total_time=300
 
       - name: Keep any crashing input
         if: failure()
