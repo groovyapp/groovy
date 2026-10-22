@@ -56,6 +56,16 @@ The goals are:
 | **Windows** | Unsigned zip, without an installer or link registration | 🟡 Partly |
 | **macOS** | Not packaged yet | ⬜ Not started |
 
+## Screenshots
+
+A conversation with a contact, showing both sides and each message's delivery state:
+
+![A conversation with a contact](docs/screenshots/conversation.png)
+
+The settings screen, with the profile, appearance and notification choices:
+
+![The settings screen](docs/screenshots/settings.png)
+
 ## Architecture
 
 Groovy is a layered system. The lower layers come from iroh, and Groovy builds the services and clients on top.
