@@ -1,7 +1,7 @@
 name: Release
 
 # A tag like v0.1.0 builds the Linux AppImage and an unsigned Windows zip, and attaches both to a
-# GitHub release for the tag.
+# GitHub release for the tag, each with a SHA-256 checksum file. The builds are not signed.
 on:
   push:
     tags: ["v*"]
@@ -42,10 +42,17 @@ jobs:
         continue-on-error: true
         run: xvfb-run -a scripts/smoke-test-linux.sh dist/*.AppImage
 
+      # Lets people check a download against the release, since the files aren't signed.
+      - name: Write the checksum
+        working-directory: dist
+        run: sha256sum *.AppImage > "$(ls *.AppImage).sha256"
+
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.AppImage
+          files: |
+            dist/*.AppImage
+            dist/*.AppImage.sha256
           generate_release_notes: true
 
   windows:
@@ -72,8 +79,17 @@ jobs:
           Copy-Item LICENSE-MIT, LICENSE-APACHE $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
+      - name: Write the checksum
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($zip.Name)" | Set-Content -NoNewline -Encoding ascii "$($zip.FullName).sha256"
+
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
           generate_release_notes: true

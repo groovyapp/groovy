@@ -127,7 +127,13 @@ Download the latest release from the [releases page](https://github.com/groovyap
 - **Flatpak:** not on Flathub yet. To build it yourself, follow [packaging/README.md](packaging/README.md).
 - **macOS:** not packaged yet.
 
-Releases do not yet carry signatures, so there is nothing to check a download against. Download only from the releases page of this repository.
+Each file comes with a SHA-256 checksum, in a `.sha256` file next to it. Groovy's releases are not code signed, so check a download against its checksum before running it:
+
+```bash
+sha256sum -c Groovy-<version>-x86_64.AppImage.sha256
+```
+
+On Windows, compare the output of `certutil -hashfile Groovy-<version>-windows-x86_64.zip SHA256` with the value in the `.sha256` file. Download only from the releases page of this repository.
 
 ## Getting started
 
