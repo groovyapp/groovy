@@ -23,6 +23,9 @@ postcard = { version = "1", features = ["alloc"] }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+semver = "1"
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 toml = "1"
 tracing = "0.1"

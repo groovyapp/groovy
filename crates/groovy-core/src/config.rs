@@ -62,9 +62,17 @@ pub struct Background {
     /// Opens `groovy://` links in Groovy. Registered with the desktop at startup.
     #[serde(default = "open_links_default")]
     pub open_links: bool,
+    /// Looks on GitHub for a newer release at startup, and says so in a banner. Sends nothing
+    /// but this build's version.
+    #[serde(default = "check_updates_default")]
+    pub check_updates: bool,
 }
 
 fn open_links_default() -> bool {
+    true
+}
+
+fn check_updates_default() -> bool {
     true
 }
 
@@ -78,6 +86,7 @@ impl Default for Background {
             close_to_tray: close_to_tray_default(),
             start_on_login: false,
             open_links: open_links_default(),
+            check_updates: check_updates_default(),
         }
     }
 }

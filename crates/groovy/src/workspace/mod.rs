@@ -21,7 +21,11 @@ use crate::{
     settings::SettingsScreen,
     theme::{self, ActiveTheme},
     title_bar::TitleBar,
-    ui::dialog::ConfirmDialog,
+    ui::{
+        button::{Button, Variant},
+        dialog::ConfirmDialog,
+    },
+    updates::UpdateState,
     window_frame::{client_side_decorations, set_native_border_color},
 };
 use screen::{
@@ -190,6 +194,45 @@ impl Workspace {
     }
 }
 
+/// A bar under the title, saying a newer release is out, with a link to it and a way to close it.
+fn update_banner(update: groovy_core::updates::Update, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let page = update.page.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_4()
+        .py_2()
+        .bg(theme.accent)
+        .text_color(theme.on_accent)
+        .child(div().text_sm().child(format!(
+            "Groovy {} is out. Download it from its release page.",
+            update.version
+        )))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    Button::new("update-open", "Open release page")
+                        .variant(Variant::Primary)
+                        .on_click(move |_, cx| cx.open_url(&page)),
+                )
+                .child(
+                    Button::new("update-dismiss", "Not now")
+                        .variant(Variant::Secondary)
+                        .on_click(|_, cx| {
+                            cx.global_mut::<UpdateState>().dismissed = true;
+                            cx.refresh_windows();
+                        }),
+                ),
+        )
+}
+
 fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -268,6 +311,7 @@ impl Render for Workspace {
             Some((onboarding, _)) => div().flex_1().min_h_0().child(onboarding.clone()),
             None => self.shell_body(cx),
         };
+        let update = crate::updates::banner(cx);
         let theme = cx.theme();
 
         let content = div()
@@ -293,6 +337,7 @@ impl Render for Workspace {
             .when(TitleBar::is_visible(window), |d| {
                 d.child(TitleBar::new(APP_NAME))
             })
+            .children(update.map(|update| update_banner(update, cx)))
             .child(body)
             // The status bar is part of the shell, not onboarding.
             .when(self.onboarding.is_none(), |d| d.child(StatusBar))

@@ -22,6 +22,7 @@ mod tickets;
 mod title_bar;
 mod tray;
 mod ui;
+mod updates;
 mod url_scheme;
 mod window_frame;
 mod workspace;
@@ -97,6 +98,7 @@ fn start_app(dir: DataDir) -> anyhow::Result<()> {
 
             spawn_instance_poll(cx);
             sync_link_handler(cx);
+            updates::start(cx);
             // With a tray, `--background` (the login entry's flag) starts without a window.
             let tray_running = tray::start(cx);
             let background = std::env::args().any(|arg| arg == "--background");
