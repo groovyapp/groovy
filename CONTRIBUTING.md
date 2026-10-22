@@ -33,3 +33,14 @@ Use `tracing` macros. Log files are written to the data directory's `logs/` fold
 - **The app uses `anyhow` at its edges.** Add context with `.context("…")` as errors cross a boundary, so the message says what was being attempted.
 - **No `unwrap()` or `expect()` on fallible I/O or network work,** outside tests. The exceptions are startup invariants that cannot be recovered from, and lock poisoning, which only happens after an earlier panic.
 - **Show short messages to people.** `{error:#}` prints the whole chain on one line. Don't show raw `Debug` output in the UI.
+
+## Fuzzing
+
+The decoders that read peer data are fuzzed with [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html). It needs nightly Rust, and it lives in `fuzz/`, outside the main workspace:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run decode -- -max_total_time=600
+```
+
+A crash is written to `fuzz/artifacts/`. Fix the bug, and add the input as a regression test where the decoder is tested. Don't commit the corpus or the artifacts.
