@@ -20,7 +20,7 @@ The first alpha. Groovy is for trying out with people you trust. Local data is n
 - **Group chat.** Groups over gossip, signed membership records, admins and roles, and removal with a new group key.
 - **Desktop app.** Onboarding, a sidebar with Files, Messages, Peers, Storage and Settings, desktop notifications, a system tray with background mode, and keyboard navigation.
 - **Command line.** `groovy-cli` to send and receive files.
-- **Linux.** An AppImage with launcher integration, `groovy://` links, and a Flatpak manifest. The Flatpak has not been built yet.
+- **Linux.** An AppImage with launcher integration and `groovy://` links. A Flatpak builds and runs locally, but is not on Flathub yet.
 - **Windows.** A zip with the program. There is no installer, and the program is not code signed, so Windows shows a warning on first run.
 - **Update check.** A check against GitHub Releases at startup, with a banner and an opt-out.
 

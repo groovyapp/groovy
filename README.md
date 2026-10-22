@@ -52,7 +52,7 @@ The goals are:
 | **Connectivity** | Address lookup that is private by default, self-hosted relays, and reconnection after network changes | ✅ Built |
 | **Desktop app** | Notifications, a system tray with background mode, `groovy://` links, and keyboard navigation | ✅ Built |
 | **Command line** | `groovy-cli` to send and receive files | ✅ Built |
-| **Linux** | AppImage with launcher integration; Flatpak manifest, not yet built | 🟡 Partly |
+| **Linux** | AppImage with launcher integration, and a Flatpak that builds and runs locally; neither is on Flathub yet | 🟡 Partly |
 | **Windows** | Unsigned zip, without an installer or link registration | 🟡 Partly |
 | **macOS** | Not packaged yet | ⬜ Not started |
 
@@ -124,6 +124,7 @@ Download the latest release from the [releases page](https://github.com/groovyap
 
 - **Linux:** `Groovy-<version>-x86_64.AppImage`. Make it executable (`chmod +x`) and run it. The first run adds Groovy to your app launcher and registers `groovy://` links.
 - **Windows:** `Groovy-<version>-windows-x86_64.zip`. Unzip it and run `groovy.exe`. Windows will warn that the app is from an unknown publisher, because releases are not code signed yet.
+- **Flatpak:** not on Flathub yet. To build it yourself, follow [packaging/README.md](packaging/README.md).
 - **macOS:** not packaged yet.
 
 Releases do not yet carry signatures, so there is nothing to check a download against. Download only from the releases page of this repository.
