@@ -816,6 +816,14 @@ impl Render for SettingsScreen {
                     cx,
                 ))
             })
+            .child(background_row(
+                "Check for new releases",
+                "Look on GitHub at startup for a newer version, and say so in a banner. Only this version is sent.",
+                "settings-check-updates",
+                background.check_updates,
+                |settings, on| settings.check_updates = on,
+                cx,
+            ))
             .child(divider(cx))
             .child(section_heading(
                 "Network",

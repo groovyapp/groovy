@@ -32,6 +32,7 @@ pub mod shares;
 pub mod storage;
 pub mod ticket;
 pub mod transfers;
+pub mod updates;
 pub mod user;
 
 pub use avatar::{AvatarError, thumbnail, thumbnail_from_file};
